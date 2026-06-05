@@ -678,6 +678,52 @@ async def retrieve_current_tax_due(p: PropertyInput) -> TaxResult:
 def retrieve_current_tax_due_sync(p: PropertyInput) -> TaxResult:
     return asyncio.run(retrieve_current_tax_due(p))
 
+# --------------------------------------------------------------------------- #
+# Batch retrieval (concurrent)
+#
+# With a paid Skyvern plan you can run several browser sessions at once. This
+# runs many lookups concurrently, bounded by a semaphore so you never exceed
+# your plan's concurrent-session cap. Each lookup still opens its own isolated
+# session, so one slow or stuck portal does not block the others.
+# --------------------------------------------------------------------------- #
+
+# Keep this at or below your Skyvern plan's concurrent browser-session limit.
+MAX_CONCURRENCY = 5
+
+
+async def retrieve_many(
+    props: list[PropertyInput],
+    concurrency: int = MAX_CONCURRENCY,
+    on_result=None,
+) -> list[TaxResult]:
+    """Run many retrievals concurrently.
+
+    `on_result(index, result)` is invoked as each lookup finishes (in completion
+    order, not input order) so a caller can stream progress / write output. It
+    may be a plain function or a coroutine function.
+    """
+    sem = asyncio.Semaphore(max(1, concurrency))
+    results: list[Optional[TaxResult]] = [None] * len(props)
+
+    async def worker(i: int, p: PropertyInput) -> None:
+        async with sem:
+            res = await retrieve_current_tax_due(p)
+        results[i] = res
+        if on_result is not None:
+            out = on_result(i, res)
+            if asyncio.iscoroutine(out):
+                await out
+
+    await asyncio.gather(*(worker(i, p) for i, p in enumerate(props)))
+    return results  # type: ignore[return-value]
+
+
+def retrieve_many_sync(
+    props: list[PropertyInput],
+    concurrency: int = MAX_CONCURRENCY,
+) -> list[TaxResult]:
+    return asyncio.run(retrieve_many(props, concurrency=concurrency))
+
 
 # --------------------------------------------------------------------------- #
 # Example
