@@ -19,9 +19,11 @@ Flow
    -> (pick the matching result if a list appears) -> read current amount due.
    Login is handled in the same task only when credentials are supplied.
 3. Hand the raw extraction to Claude, which canonicalizes it and judges whether
-   the matched property actually corresponds to the requested address.
-4. If Claude is not confident there was a match, retry the Skyvern task using a
-   fallback search term (owner, then parcel id). Cap the number of attempts.
+   the matched property actually corresponds to the requested address. Claude
+   answers through a forced tool call, so the result is always structured JSON.
+4. If Claude is not confident there was a match (or confidence is below the
+   floor), retry the Skyvern task using a fallback search term (owner, then
+   parcel id). Cap the number of attempts.
 
 Target value
 ------------
@@ -31,7 +33,7 @@ account is fully paid, the correct answer is 0.00.
 
 Requirements
 ------------
-    pip install skyvern anthropic
+    pip install skyvern anthropic python-dotenv
 
 Environment
 -----------
@@ -45,14 +47,22 @@ import asyncio
 import json
 import logging
 import os
-from dotenv import load_dotenv
-load_dotenv()
-from dataclasses import dataclass, field, asdict
+import re
+from dataclasses import dataclass, asdict
 from typing import Any, Optional
 
 from anthropic import AsyncAnthropic
 from skyvern import Skyvern
 from skyvern.client.core.api_error import ApiError
+
+# Optional: load a local .env if python-dotenv is installed. Guarded so the
+# module still imports cleanly without the dependency.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ModuleNotFoundError:
+    pass
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("tax_retriever")
@@ -62,10 +72,12 @@ log = logging.getLogger("tax_retriever")
 # Config
 # --------------------------------------------------------------------------- #
 
-# Anthropic model used for the validation / normalization pass. Sonnet is a good
-# cost/quality fit for this kind of structured judgment. Swap if you prefer.
-# Current model strings: https://docs.claude.com/en/docs/about-claude/models
-NORMALIZER_MODEL = "claude-opus-4-8"
+# Anthropic model for the validation / normalization pass. This is structured
+# JSON judgment plus a lenient address comparison, so Sonnet is the right
+# cost/quality fit. Haiku ("claude-haiku-4-5-20251001") also works and is
+# cheaper if you are running many lookups. Current model strings:
+# https://docs.claude.com/en/docs/about-claude/models
+NORMALIZER_MODEL = "claude-sonnet-4-6"
 
 # Skyvern agent engine. skyvern-2.0 is the default and handles multi-step
 # navigate -> search -> select -> read flows well.
@@ -75,12 +87,18 @@ SKYVERN_ENGINE = "skyvern-2.0"
 MAX_STEPS = 25
 
 # Route through a residential IP. Many production county portals sit behind WAFs
-# that block datacenter IPs. The public demos work without it; set to None to
-# disable, or to a country code per Skyvern's proxy docs.
-PROXY_LOCATION: Optional[str] = "RESIDENTIAL"
+# that block datacenter IPs. "RESIDENTIAL" is Skyvern's default random US
+# residential pool. For a stubborn in-state portal you can instead pass a
+# GeoTarget, e.g. {"country": "US", "subdivision": "FL"}. Set to "NONE" to
+# disable.
+PROXY_LOCATION: Any = "RESIDENTIAL"
 
 # How many search terms to try before giving up (address, then fallbacks).
 MAX_ATTEMPTS = 3
+
+# Minimum confidence Claude must report before we trust a match as a final
+# answer. Below this we treat the attempt as a retry if a fallback term remains.
+CONFIDENCE_FLOOR = 0.7
 
 # Statuses Skyvern returns that mean the run will not produce more output.
 TERMINAL_FAILURE = {"failed", "terminated", "timed_out", "canceled"}
@@ -89,6 +107,34 @@ TERMINAL_FAILURE = {"failed", "terminated", "timed_out", "canceled"}
 # endpoint occasionally returns 504 when their browser pool is warming. If all
 # attempts fail we fall back to running each task without a shared session.
 SESSION_CREATE_BACKOFFS = (2, 5, 10)
+
+
+# --------------------------------------------------------------------------- #
+# Small helpers
+# --------------------------------------------------------------------------- #
+
+def _clean_address(s: str) -> str:
+    """Turn tab/newline-separated address fields into one comma-separated line.
+
+    The inputs often arrive pasted from a spreadsheet, e.g.
+    '950 Evernia St\\tWest Palm Beach\\tFL\\t33401\\tPalm Beach'. Feeding tabs
+    into a search box hurts match rates, so collapse them into a clean string.
+    """
+    parts = [seg.strip() for seg in re.split(r"[\t\n]+", s) if seg.strip()]
+    if not parts:
+        return s.strip()
+    return ", ".join(parts)
+
+
+def _coerce_output(raw: Any) -> Any:
+    """Skyvern output can be a dict, a list, or a JSON string. Normalize to a
+    Python object so downstream field access does not silently fail."""
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return {"raw_text": raw}
+    return raw
 
 
 # --------------------------------------------------------------------------- #
@@ -107,9 +153,20 @@ class PropertyInput:
     username: Optional[str] = None
     password: Optional[str] = None
 
+    def __post_init__(self) -> None:
+        # Keep a clean, comma-separated full address for matching and prompts.
+        self.property_address = _clean_address(self.property_address)
+
+    def _street_search_value(self) -> str:
+        """Primary search term: the street portion before the first comma.
+        Most portals search on the street address, not the full city/state/zip
+        blob. The full address is still used for matching in the prompt."""
+        street = self.property_address.split(",")[0].strip()
+        return street or self.property_address
+
     def search_terms(self) -> list[tuple[str, str]]:
         """Ordered (label, value) search terms to try."""
-        terms = [("property address", self.property_address)]
+        terms = [("property address", self._street_search_value())]
         if self.owner_name:
             terms.append(("owner name", self.owner_name))
         if self.parcel_id:
@@ -134,6 +191,8 @@ class TaxResult:
     attempts: int = 0
     reasoning: Optional[str] = None
     page_outcome: Optional[str] = None
+    recording_url: Optional[str] = None       # Skyvern run video, for audit
+    screenshot_urls: Optional[list] = None    # last screenshots, for audit
     raw_extract: Any = None                   # full Skyvern output, for audit
     error: Optional[str] = None
 
@@ -322,8 +381,9 @@ return the data described by the extraction schema.
 # Claude validation / normalization
 #
 # Skyvern's raw output is free-form and varies by site. Claude turns it into one
-# canonical record AND decides whether the page actually matched the request. If
-# it did not match, Claude signals a retry and suggests a better search term.
+# canonical record AND decides whether the page actually matched the request. We
+# force a tool call so the answer is always a structured dict, with no markdown
+# fences or stray prose to parse around.
 # --------------------------------------------------------------------------- #
 
 NORMALIZER_SYSTEM = """\
@@ -331,33 +391,58 @@ You validate and normalize property-tax data scraped from county websites.
 You are given (a) the property the user asked about and (b) the raw fields a
 browser agent extracted from whatever page it ended up on.
 
-Your job:
-1. Decide whether the page the agent read actually corresponds to the requested
-   property. Compare addresses leniently (abbreviations, suffixes, casing, unit
-   formatting differ across sites) and use owner name / parcel id if present.
-2. Parse the current amount due into a plain number (strip "$" and commas). A
-   correctly read, fully-paid account is amount_due = 0.0 and matched = true.
-3. If the page did NOT match, or no due figure was found, set needs_retry true
-   and suggest the most useful next search term, if any.
-
-Respond with ONLY a JSON object, no prose, no markdown fences:
-{
-  "amount_due": <number or null>,
-  "raw_amount_string": <string or null>,
-  "currency": "USD",
-  "amount_label": <string or null>,
-  "as_of_date": <string or null>,
-  "parcel_id": <string or null>,
-  "property_address_on_page": <string or null>,
-  "owner_on_page": <string or null>,
-  "matched": <true|false>,
-  "match_basis": <short string: what you matched on>,
-  "confidence": <0.0-1.0>,
-  "needs_retry": <true|false>,
-  "suggested_search_term": <"owner name"|"parcel id"|null>,
-  "reasoning": <one or two sentences>
-}
+Decide whether the page the agent read actually corresponds to the requested
+property. Compare addresses leniently (abbreviations, suffixes, casing, and unit
+formatting differ across sites) and use owner name and parcel id when present.
+Parse the current amount due into a plain number (strip "$" and commas); a
+correctly read, fully-paid account is amount_due = 0.0 with matched = true. If
+the page did NOT match, if no due figure was found, or if your confidence is low,
+set needs_retry true and suggest the most useful next search term when there is
+one. Report your judgment by calling the report_validation tool.
 """
+
+VALIDATION_TOOL: dict[str, Any] = {
+    "name": "report_validation",
+    "description": "Report the normalized, validated property-tax result.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "amount_due": {
+                "type": ["number", "null"],
+                "description": "Current balance owed as a plain number; 0.0 if fully paid.",
+            },
+            "raw_amount_string": {
+                "type": ["string", "null"],
+                "description": "The amount exactly as shown on the page.",
+            },
+            "currency": {"type": "string"},
+            "amount_label": {"type": ["string", "null"]},
+            "as_of_date": {"type": ["string", "null"]},
+            "parcel_id": {"type": ["string", "null"]},
+            "property_address_on_page": {"type": ["string", "null"]},
+            "owner_on_page": {"type": ["string", "null"]},
+            "matched": {
+                "type": "boolean",
+                "description": "True if the page corresponds to the requested property.",
+            },
+            "match_basis": {
+                "type": ["string", "null"],
+                "description": "Short note on what you matched on (address, owner, parcel).",
+            },
+            "confidence": {
+                "type": "number",
+                "description": "0.0-1.0 confidence in the match and the amount.",
+            },
+            "needs_retry": {"type": "boolean"},
+            "suggested_search_term": {
+                "type": ["string", "null"],
+                "enum": ["owner name", "parcel id", None],
+            },
+            "reasoning": {"type": "string"},
+        },
+        "required": ["amount_due", "matched", "confidence", "needs_retry"],
+    },
+}
 
 
 async def normalize_with_claude(
@@ -378,17 +463,25 @@ async def normalize_with_claude(
         model=NORMALIZER_MODEL,
         max_tokens=700,
         system=NORMALIZER_SYSTEM,
+        tools=[VALIDATION_TOOL],
+        tool_choice={"type": "tool", "name": "report_validation"},
         messages=[{"role": "user", "content": json.dumps(user_payload, default=str)}],
     )
 
-    text = "".join(block.text for block in resp.content if block.type == "text").strip()
-    # Strip accidental code fences just in case.
-    if text.startswith("```"):
-        text = text.strip("`")
-        text = text.split("\n", 1)[1] if "\n" in text else text
-        if text.endswith("json"):
-            text = text[:-4]
-    return json.loads(text)
+    for block in resp.content:
+        if getattr(block, "type", None) == "tool_use" and block.name == "report_validation":
+            return dict(block.input)
+
+    # Forcing tool_choice should prevent this, but stay defensive: if no tool
+    # call came back, signal a low-confidence retry rather than crashing.
+    log.warning("Normalizer returned no tool_use block; treating as a retry.")
+    return {
+        "amount_due": None,
+        "matched": False,
+        "confidence": 0.0,
+        "needs_retry": True,
+        "reasoning": "Validator returned no structured output.",
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -400,7 +493,7 @@ async def open_session_with_retry(skyvern: Skyvern) -> Optional[str]:
 
     Returns the session id on success, or None if all attempts hit a 5xx (in
     which case the caller should fall back to running each task without a
-    persistent session — Skyvern will provision an ephemeral browser per task).
+    persistent session - Skyvern will provision an ephemeral browser per task).
     """
     attempts = len(SESSION_CREATE_BACKOFFS) + 1
     for i in range(attempts):
@@ -431,7 +524,7 @@ async def run_skyvern_attempt(
     session_id: Optional[str],
     search_label: str,
     search_value: str,
-) -> Any:
+) -> dict[str, Any]:
     prompt = build_prompt(p, search_label, search_value)
     log.info("Skyvern attempt: searching by %s = %r", search_label, search_value)
 
@@ -442,11 +535,6 @@ async def run_skyvern_attempt(
         engine=SKYVERN_ENGINE,
         max_steps=MAX_STEPS,
         proxy_location=PROXY_LOCATION,
-        # Classify common recoverable failures so retry logic can react.
-        error_code_mapping={
-            "no_property_found": "The search returned no matching property.",
-            "session_blocked": "Session expired, CAPTCHA, WAF, or access denied.",
-        },
         wait_for_completion=True,
     )
     if session_id is not None:
@@ -454,15 +542,26 @@ async def run_skyvern_attempt(
 
     run = await skyvern.run_task(**task_kwargs)
 
-    log.info("  -> status=%s", getattr(run, "status", "unknown"))
-    if getattr(run, "status", None) in TERMINAL_FAILURE:
-        return {
+    status = getattr(run, "status", None)
+    log.info("  -> status=%s", status or "unknown")
+
+    if status in TERMINAL_FAILURE:
+        output: Any = {
             "page_outcome": "error",
             "current_amount_due": None,
-            "notes": f"Skyvern run ended with status={run.status}; "
+            "notes": f"Skyvern run ended with status={status}; "
                      f"reason={getattr(run, 'failure_reason', None)}",
         }
-    return run.output
+    else:
+        output = getattr(run, "output", None)
+
+    return {
+        "output": output,
+        "status": status,
+        # Audit trail. For a money tool you want a receipt you can eyeball later.
+        "recording_url": getattr(run, "recording_url", None),
+        "screenshot_urls": getattr(run, "screenshot_urls", None),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -493,8 +592,12 @@ async def retrieve_current_tax_due(p: PropertyInput) -> TaxResult:
             attempt += 1
             label, value = terms[idx]
 
-            raw = await run_skyvern_attempt(skyvern, p, session_id, label, value)
+            attempt_result = await run_skyvern_attempt(skyvern, p, session_id, label, value)
+            raw = _coerce_output(attempt_result["output"])
+
             result.raw_extract = raw
+            result.recording_url = attempt_result.get("recording_url")
+            result.screenshot_urls = attempt_result.get("screenshot_urls")
             result.attempts = attempt
 
             verdict = await normalize_with_claude(anthropic, p, raw)
@@ -515,18 +618,24 @@ async def retrieve_current_tax_due(p: PropertyInput) -> TaxResult:
             result.match_basis = verdict.get("match_basis")
             result.confidence = float(verdict.get("confidence", 0.0))
             result.reasoning = verdict.get("reasoning")
-            result.page_outcome = (raw or {}).get("page_outcome") if isinstance(raw, dict) else None
+            result.page_outcome = raw.get("page_outcome") if isinstance(raw, dict) else None
 
-            # Success: matched the right parcel and we have a numeric balance.
-            if result.matched and result.amount_due is not None:
+            have_amount = result.amount_due is not None
+
+            # Success: right parcel, a numeric balance, and enough confidence.
+            if result.matched and have_amount and result.confidence >= CONFIDENCE_FLOOR:
                 result.success = True
                 break
 
-            # Decide whether to retry with the next fallback search term.
-            if verdict.get("needs_retry"):
+            # A matched, numeric, but low-confidence read is not trustworthy on
+            # its own; retry with a more specific term if one remains.
+            low_confidence = result.matched and have_amount and result.confidence < CONFIDENCE_FLOOR
+            should_retry = bool(verdict.get("needs_retry")) or low_confidence
+
+            if should_retry:
                 suggested = (verdict.get("suggested_search_term") or "").lower()
                 # Jump to the suggested term if we have it; else just go to the
-                # next available fallback in order.
+                # next available fallback in order. Never move backwards.
                 next_idx = idx + 1
                 if "owner" in suggested:
                     next_idx = next((i for i, (l, _) in enumerate(terms)
@@ -543,7 +652,8 @@ async def retrieve_current_tax_due(p: PropertyInput) -> TaxResult:
         if not result.success and result.error is None:
             result.error = (
                 f"Could not confirm a matching property balance after "
-                f"{result.attempts} attempt(s). Last outcome: {result.page_outcome}."
+                f"{result.attempts} attempt(s). Last outcome: {result.page_outcome}; "
+                f"matched={result.matched}; confidence={result.confidence:.2f}."
             )
 
     except Exception as exc:  # noqa: BLE001 - surface anything to the caller
@@ -577,7 +687,7 @@ if __name__ == "__main__":
     # Palm Beach County example from the uploaded account page (fully paid -> 0.00).
     prop = PropertyInput(
         url="https://pbctax.publicaccessnow.com/PropertyTax/Account.aspx?p=74-43-43-21-01-043-0050&a=1418360",
-        property_address="950 Evernia St	West Palm Beach	FL	33401	Palm Beach",
+        property_address="950 Evernia St\tWest Palm Beach\tFL\t33401\tPalm Beach",
         owner_name="EHC Palm Beach",
         parcel_id="74-43-43-21-01-043-0050",
     )
