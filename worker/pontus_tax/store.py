@@ -404,18 +404,16 @@ class FirestoreStore:
 
     # -- playbooks ----------------------------------------------------------
     def load_playbooks(self) -> list[Playbook]:
+        # Seeds are code-versioned: refresh them every run so hint updates
+        # ship with deploys. Discovered entries (§4.7) are left untouched.
         col = self.db().collection(self.PLAYBOOKS)
-        docs = list(col.stream())
-        if not docs:
-            batch = self.db().batch()
-            for pb in SEED_PLAYBOOKS:
-                d = pb.to_dict()
-                d["created_at"] = self._ts()
-                d["updated_at"] = self._ts()
-                batch.set(col.document(pb.key), d)
-            batch.commit()
-            return list(SEED_PLAYBOOKS)
-        return [Playbook.from_dict(d.to_dict() or {}) for d in docs]
+        batch = self.db().batch()
+        for pb in SEED_PLAYBOOKS:
+            d = pb.to_dict()
+            d["updated_at"] = self._ts()
+            batch.set(col.document(pb.key), d, merge=True)
+        batch.commit()
+        return [Playbook.from_dict(d.to_dict() or {}) for d in col.stream()]
 
     def upsert_playbook(self, pb: Playbook) -> bool:
         ref = self.db().collection(self.PLAYBOOKS).document(pb.key)

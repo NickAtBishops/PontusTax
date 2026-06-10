@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .canonical import (
-    DELINQUENT, NEEDS_REVIEW, PAID, PARTIAL, UNPAID, UNREACHABLE,
+    DELINQUENT, NEEDS_REVIEW, PARTIAL, UNPAID, UNREACHABLE,
     HIGH, MEDIUM, LOW,
     AccountRecord, RowOutcome, aggregate_status, min_confidence,
 )
@@ -33,7 +33,7 @@ from .prompts import PromptContext, build_prompt
 from .skyvern_runner import SkyvernRunner, coerce_output
 from .store import RunStore, row_key
 from .taxonomy import TYPE_A, TYPE_B, TYPE_D, classify_url, domain_of
-from .validate import build_account_record, build_row_note, parse_money
+from .validate import build_account_record, build_row_note
 from .verify import MatchVerdict, adjudicate_with_claude, assess_match
 from .writeback import output_filename, write_output
 from . import pdf_bill
@@ -70,14 +70,6 @@ def _roll_type_for(row: RowIntake) -> str:
         if ":business" in decoded:
             return "business"
     return "real_estate"
-
-
-def _sheet_stale_amount(row: RowIntake) -> float | None:
-    """The sheet's existing figure for the delinquent-growth check (§7)."""
-    candidates = [parse_money(row.total_existing)]
-    candidates += [parse_money(v) for v in row.amounts_existing]
-    nums = [c for c in candidates if c is not None and c > 0]
-    return max(nums) if nums else None
 
 
 def _needs_review_record(account: str, reason: str) -> AccountRecord:
@@ -169,7 +161,6 @@ class RowProcessor:
             )
 
         records: list[AccountRecord] = []
-        corrections: list[str] = []
         portal_dead = False
 
         for group in groups:
@@ -178,12 +169,11 @@ class RowProcessor:
                     _needs_review_record(group.display, "portal blocked earlier in this row")
                 )
                 continue
-            rec, corr, dead = await self._check_account(
+            rec, dead = await self._check_account(
                 job, group, url, domain, taxonomy, roll_type, playbook,
                 multi_note, outcome,
             )
             records.append(rec)
-            corrections.extend(corr)
             portal_dead = dead
 
         # ---- aggregate (§5.6) ------------------------------------------
@@ -199,21 +189,15 @@ class RowProcessor:
                 None,
             )
         outcome.status_note = build_row_note(
-            records, outcome.row_status, corrections, self.today
+            records, outcome.row_status, self.today
         )
         if outcome.discovered_url:
             outcome.status_note += f" | portal: {outcome.discovered_url}"
 
-        # ---- values eligible for data cells (§10.2, gated by §7) --------
+        # ---- the Amount Due cell (gated by §7: verified rows only) ------
         if outcome.confidence != LOW and outcome.row_status not in (
             NEEDS_REVIEW, UNREACHABLE,
         ):
-            if len(records) == 1:
-                rec = records[0]
-                if rec.status == PAID:
-                    outcome.write_date_paid = rec.date_paid
-                    outcome.write_receipt = rec.receipt
-                outcome.write_assessed_value = rec.assessed_value
             dues = [r.amount_due for r in records if r.amount_due]
             if outcome.row_status in (UNPAID, PARTIAL, DELINQUENT) and dues:
                 outcome.write_amount_due = round(sum(dues), 2)
@@ -232,9 +216,9 @@ class RowProcessor:
         playbook: Playbook | None,
         multi_note: str | None,
         outcome: RowOutcome,
-    ) -> tuple[AccountRecord, list[str], bool]:
+    ) -> tuple[AccountRecord, bool]:
         """Run the attempt ladder for ONE account. Returns
-        (record, corrections, portal_dead)."""
+        (record, portal_dead)."""
         row = job.row
 
         # §4B input ladder: account candidates → street address → owner.
@@ -249,7 +233,7 @@ class RowProcessor:
         if not terms:
             return (
                 _needs_review_record(group.display, "row has no account, address or owner to search by"),
-                [], False,
+                False,
             )
         terms = terms[: self.cfg.max_attempts_per_account + 1]
 
@@ -267,7 +251,6 @@ class RowProcessor:
                 county=row.county,
                 state=row.state,
                 owner_entity=row.owner_entity,
-                target_year=row.tax_year,
                 roll_type=roll_type,
                 search_label=label,
                 search_value=value,
@@ -314,7 +297,7 @@ class RowProcessor:
                         group.display,
                         "portal requires an account login — humans only (§ Type E)",
                     ),
-                    [], True,
+                    True,
                 )
             if page_outcome == "blocked":
                 return (
@@ -322,11 +305,11 @@ class RowProcessor:
                         group.display,
                         "portal blocked automated access (CAPTCHA/WAF held)",
                     ),
-                    [], True,
+                    True,
                 )
             if page_outcome == "pdf_only":
-                rec, corr = await self._pdf_path(job, group, url, domain, extraction)
-                return rec, corr, False
+                rec = await self._pdf_path(job, group, url, domain)
+                return rec, False
 
             if page_outcome == "landed_on_search" and current_type in (TYPE_A, TYPE_D):
                 # Stale deep link/token (§ Type A) → re-run as a search.
@@ -345,14 +328,7 @@ class RowProcessor:
                 continue
 
             if page_outcome == "ambiguous_multiple_matches":
-                cands = extraction.get("candidate_matches") or []
-                last_reason = (
-                    f"multiple results for {label}={value!r}: "
-                    + "; ".join(
-                        f"{c.get('parcel_id') or '?'} {c.get('address') or ''}".strip()
-                        for c in cands[:4]
-                    )
-                )
+                last_reason = f"multiple results for {label}={value!r}"
                 idx += 1
                 continue
 
@@ -379,33 +355,10 @@ class RowProcessor:
                 idx += 1
                 continue
 
-            # §5.4 roll-type check when the match didn't come via account #
-            page_roll = extraction.get("roll_type_on_page") or "unknown"
-            if (
-                "account" not in verdict.basis
-                and page_roll not in ("unknown", None)
-                and page_roll != roll_type
-            ):
-                last_reason = (
-                    f"roll type mismatch: page shows {page_roll}, row intends "
-                    f"{roll_type}"
-                )
-                idx += 1
-                continue
+            rec = build_account_record(group.display, extraction, verdict)
+            return rec, False
 
-            self._learn_vendor(url, extraction, current_type)
-            rec, corrections = build_account_record(
-                account_display=group.display,
-                extraction=extraction,
-                verdict=verdict,
-                target_year=row.tax_year,
-                sheet_stale_amount=_sheet_stale_amount(row),
-                sheet_date_paid=row.date_paid_existing,
-                today=self.today,
-            )
-            return rec, corrections, False
-
-        return _needs_review_record(group.display, last_reason), [], False
+        return _needs_review_record(group.display, last_reason), False
 
     # ------------------------------------------------------------------
     async def _pdf_path(
@@ -414,10 +367,10 @@ class RowProcessor:
         group: AccountCandidates,
         url: str,
         domain: str,
-        extraction: dict[str, Any],
-    ) -> tuple[AccountRecord, list[str]]:
+    ) -> AccountRecord:
+        # (kept signature minimal — fast mode needs no page extraction here)
         """§4F — bill exists only as a PDF: download it (the one permitted
-        artifact), parse text, NEEDS_REVIEW when unparseable."""
+        artifact), parse the amount due, NEEDS_REVIEW when unparseable."""
         row = job.row
         goal = (
             f"Download the {row.tax_year or 'most recent'} property tax bill "
@@ -428,13 +381,9 @@ class RowProcessor:
         try:
             result = await self.runner.download_bill_pdf(domain, url, goal)
         except Exception as exc:  # noqa: BLE001
-            return _needs_review_record(
-                group.display, f"PDF download failed: {exc}"
-            ), []
+            return _needs_review_record(group.display, f"PDF download failed: {exc}")
         if result.run_id:
-            outcome_ids = result.run_id
-            job_key = job.key
-            self.store.log_event("info", f"pdf download run {outcome_ids}", job_key)
+            self.store.log_event("info", f"pdf download run {result.run_id}", job.key)
 
         file_url = None
         for f in result.downloaded_files or []:
@@ -450,7 +399,7 @@ class RowProcessor:
         if not file_url:
             return _needs_review_record(
                 group.display, "portal is PDF-only and no bill PDF could be downloaded"
-            ), []
+            )
 
         data = await pdf_bill.fetch_pdf(file_url)
         parsed = pdf_bill.parse_bill_pdf(data, row.tax_year) if data else None
@@ -458,10 +407,20 @@ class RowProcessor:
             return _needs_review_record(
                 group.display,
                 f"bill PDF unparseable (likely scanned) — saved as evidence: {file_url}",
-            ), []
+            )
 
+        bill = (parsed.get("bills") or [{}])[0]
+        fast_extraction = {
+            "page_outcome": "account_found",
+            "amount_due_now": bill.get("amount_due"),
+            "includes_delinquency": None,
+            "owner_on_page": parsed.get("owner_on_page"),
+            "situs_address_on_page": parsed.get("situs_address_on_page"),
+            "parcel_or_account_on_page": parsed.get("parcel_or_account_on_page"),
+            "final_url": file_url,
+        }
         verdict = assess_match(
-            group.candidates, row.owner_entity, row.address, parsed
+            group.candidates, row.owner_entity, row.address, fast_extraction
         )
         if not verdict.matched:
             verdict = MatchVerdict(
@@ -470,19 +429,11 @@ class RowProcessor:
                 owner_mismatch=False,
                 confidence_hint=MEDIUM,
             )
-        rec, corr = build_account_record(
-            account_display=group.display,
-            extraction=parsed,
-            verdict=verdict,
-            target_year=row.tax_year,
-            sheet_stale_amount=_sheet_stale_amount(row),
-            sheet_date_paid=row.date_paid_existing,
-            today=self.today,
-        )
+        rec = build_account_record(group.display, fast_extraction, verdict)
         rec.evidence = (rec.evidence or "") + f"; PDF: {file_url}"
         if rec.confidence == HIGH:
             rec.confidence = MEDIUM
-        return rec, corr
+        return rec
 
     # ------------------------------------------------------------------
     def _learn_vendor(self, url: str, extraction: dict[str, Any], taxonomy: str) -> None:

@@ -397,6 +397,16 @@ Live facts:
 - `MAX_CONCURRENCY` = concurrent PORTALS (same-portal rows stay sequential +
   polite — never raise the per-domain rate). Currently 10 in `.env.local`.
 
+**FAST-MODE PIVOT (2026-06-10, user decision — overrides §3/§5 detail):**
+the product question is ONE number per property — “amount left to pay now.”
+The Skyvern schema/prompts extract only amount_due_now (+ owner/situs/parcel
+for §6 verification + delinquency flag); receipts, payment history, per-year
+bills, dates, payers, assessed values are NOT collected (too slow on real
+portals). Statuses collapse to PAID / UNPAID / DELINQUENT / NEEDS_REVIEW /
+UNREACHABLE. Read-only guardrails and wrong-property verification are
+unchanged and non-negotiable. Do not re-add the rich extraction without the
+user asking.
+
 Engineering invariants learned the hard way — keep them:
 - Row-doc IDs are zero-padded (`s00_r0003`) so `documentId()` order == sheet
   order; the UI sorts by it. NO composite indexes by design — query

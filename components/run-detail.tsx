@@ -268,9 +268,6 @@ function OutstandingCard({
     .map((row) => ({
       row,
       due: (row.accounts ?? []).reduce((s, a) => s + (a.amount_due ?? 0), 0),
-      nextDue:
-        (row.accounts ?? []).find((a) => a.next_due_date)?.next_due_date ??
-        null,
     }))
     .filter((x) => x.due > 0.005)
     .sort((a, b) => b.due - a.due);
@@ -299,13 +296,12 @@ function OutstandingCard({
               <TableHead>County</TableHead>
               <TableHead>Account</TableHead>
               <TableHead className="text-right">Year</TableHead>
-              <TableHead>Next due</TableHead>
               <TableHead>Status</TableHead>
               <TableHead className="text-right">Amount due</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
-            {owed.map(({ row, due, nextDue }) => (
+            {owed.map(({ row, due }) => (
               <TableRow
                 key={row.id}
                 className="cursor-pointer"
@@ -327,9 +323,6 @@ function OutstandingCard({
                 <TableCell className="text-right font-mono text-xs tabular-nums">
                   {row.input?.tax_year ?? "—"}
                 </TableCell>
-                <TableCell className="text-sm whitespace-nowrap text-muted-foreground">
-                  {nextDue ?? "—"}
-                </TableCell>
                 <TableCell>
                   <StatusBadge status={row.row_status ?? row.state} />
                 </TableCell>
@@ -339,7 +332,7 @@ function OutstandingCard({
               </TableRow>
             ))}
             <TableRow className="bg-red-50/40 hover:bg-red-50/40">
-              <TableCell colSpan={6} className="text-sm font-semibold">
+              <TableCell colSpan={5} className="text-sm font-semibold">
                 Total still owed
               </TableCell>
               <TableCell className="text-right font-mono text-base font-bold tabular-nums text-red-700">
@@ -356,11 +349,9 @@ function OutstandingCard({
 function rowAmount(row: RowDoc): string {
   const accounts = row.accounts ?? [];
   if (accounts.length === 0) return "—";
+  if (row.row_status === "PAID") return fmtMoney(0);
   const due = accounts.reduce((s, a) => s + (a.amount_due ?? 0), 0);
-  if (due > 0) return fmtMoney(due);
-  const paid = accounts.reduce((s, a) => s + (a.amount_paid ?? 0), 0);
-  if (paid > 0 && row.row_status === "PAID") return fmtMoney(paid);
-  return "—";
+  return due > 0 ? fmtMoney(due) : "—";
 }
 
 function RowsTable({
@@ -384,7 +375,7 @@ function RowsTable({
             <TableHead>Account</TableHead>
             <TableHead className="text-right">Year</TableHead>
             <TableHead>Status</TableHead>
-            <TableHead className="text-right">Amount</TableHead>
+            <TableHead className="text-right">Left to pay</TableHead>
             <TableHead className="text-right">Conf.</TableHead>
           </TableRow>
         </TableHeader>
@@ -454,55 +445,38 @@ function Field({ label, value }: { label: string; value: React.ReactNode }) {
 }
 
 function AccountBlock({ acc }: { acc: AccountRecord }) {
+  const due = acc.status === "PAID" ? 0 : acc.amount_due;
   return (
-    <div className="space-y-3 rounded-lg border p-4">
-      <div className="flex items-center justify-between gap-2">
-        <p className="font-mono text-sm font-medium tabular-nums">
+    <div className="flex items-center justify-between gap-3 rounded-lg border p-3.5">
+      <div className="min-w-0 space-y-1">
+        <p className="truncate font-mono text-sm font-medium tabular-nums">
           {acc.account_searched}
         </p>
+        {acc.source_url && (
+          <a
+            href={acc.source_url}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
+          >
+            Portal page <ExternalLink className="h-3 w-3" />
+          </a>
+        )}
+      </div>
+      <div className="flex items-center gap-3 text-right">
         <StatusBadge status={acc.status} />
-      </div>
-      <div className="grid grid-cols-2 gap-3">
-        <Field label="Tax year" value={acc.tax_year} />
-        <Field
-          label="Confidence"
-          value={acc.confidence}
-        />
-        <Field label="Billed" value={fmtMoney(acc.amount_billed)} />
-        <Field label="Paid" value={fmtMoney(acc.amount_paid)} />
-        <Field label="Due now" value={fmtMoney(acc.amount_due)} />
-        <Field label="Date paid" value={acc.date_paid} />
-        <Field label="Receipt" value={acc.receipt} />
-        <Field label="Paid by" value={acc.paid_by} />
-        <Field label="Assessed value" value={fmtMoney(acc.assessed_value)} />
-        <Field label="Next due" value={acc.next_due_date} />
-        <Field
-          label="Prior-year balance"
-          value={
-            acc.prior_year_balance === null
-              ? "—"
-              : acc.prior_year_balance
-                ? "YES — earlier year owes"
-                : "none"
-          }
-        />
-        <Field label="Page timestamp" value={acc.page_timestamp} />
-      </div>
-      {acc.source_url && (
-        <a
-          href={acc.source_url}
-          target="_blank"
-          rel="noreferrer"
-          className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
+        <p
+          className={`font-mono text-lg font-semibold tabular-nums ${
+            due === null || due === undefined
+              ? "text-muted-foreground"
+              : due > 0
+                ? "text-red-600"
+                : "text-emerald-600"
+          }`}
         >
-          Source page <ExternalLink className="h-3 w-3" />
-        </a>
-      )}
-      {acc.evidence && (
-        <p className="rounded-md bg-muted p-2.5 font-mono text-xs leading-relaxed text-muted-foreground">
-          {acc.evidence}
+          {fmtMoney(due)}
         </p>
-      )}
+      </div>
     </div>
   );
 }
@@ -602,20 +576,6 @@ function RowSheet({
                     ))
                   )}
                 </div>
-
-                {row.evidence && (
-                  <>
-                    <Separator />
-                    <div>
-                      <h3 className="mb-2 text-xs font-semibold tracking-wide text-muted-foreground uppercase">
-                        Match evidence
-                      </h3>
-                      <p className="rounded-md bg-muted p-2.5 font-mono text-xs leading-relaxed text-muted-foreground">
-                        {row.evidence}
-                      </p>
-                    </div>
-                  </>
-                )}
 
                 {row.skyvern && row.skyvern.recording_urls.length > 0 && (
                   <div>

@@ -54,12 +54,13 @@ class Config:
     skyvern_engine: str = field(
         default_factory=lambda: os.environ.get("SKYVERN_ENGINE", "skyvern-2.0")
     )
-    max_steps: int = field(default_factory=lambda: _int("SKYVERN_MAX_STEPS", 25))
+    # Fast mode: one number per property — fewer steps, shorter timeout.
+    max_steps: int = field(default_factory=lambda: _int("SKYVERN_MAX_STEPS", 15))
     proxy_location: str = field(
         default_factory=lambda: os.environ.get("SKYVERN_PROXY_LOCATION", "RESIDENTIAL")
     )
     attempt_timeout: float = field(
-        default_factory=lambda: _float("SKYVERN_ATTEMPT_TIMEOUT", 900.0)
+        default_factory=lambda: _float("SKYVERN_ATTEMPT_TIMEOUT", 480.0)
     )
 
     # Anthropic adjudication layer (optional — deterministic checks always run)

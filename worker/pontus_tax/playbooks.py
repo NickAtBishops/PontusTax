@@ -58,12 +58,7 @@ SEED_PLAYBOOKS: list[Playbook] = [
         footer_signatures=["grant street group", "billexpress"],
         default_taxonomy="A",
         hints=(
-            "Deep links contain base64 tokens that decode to "
-            "county:roll_type:parents:<uuid> — the token pins the roll type "
-            "(real estate vs tangible). A bare domain root is a SEARCH page. "
-            "Bills appear as a per-year 'Annual Bill' list: each year shows "
-            "Paid status, amount, date and a Receipt number — open/expand the "
-            "target year's bill to read the receipt and payment details."
+            "A bare domain root is a SEARCH page; deep links use opaque tokens that can go stale. The current total due is shown on the account page."
         ),
         quirks=["stale tokens redirect to search — fall back to account search"],
     ),
@@ -74,10 +69,7 @@ SEED_PLAYBOOKS: list[Playbook] = [
         footer_signatures=["publicaccessnow"],
         default_taxonomy="A",
         hints=(
-            "Deep link shape Account.aspx?p=<parcel>&a=<account>. The page "
-            "shows a 'Total Payable' banner — '$0.00' is NOT proof of "
-            "payment. The proof (amount, date, receipt) hides in a collapsed "
-            "'Recently Paid Bills' section: click the (+) toggle and read it."
+            "Deep link shape Account.aspx?p=<parcel>&a=<account>. The 'Total Payable' banner at the top IS the current amount due — read it and stop."
         ),
         quirks=["always expand 'Recently Paid Bills' before concluding"],
     ),
@@ -88,12 +80,7 @@ SEED_PLAYBOOKS: list[Playbook] = [
         footer_signatures=["pacific blue software"],
         default_taxonomy="B",
         hints=(
-            "Either a deep 'action=detail&propertyId=…' link or a bare search "
-            "form. The bill detail page is DENSE: per-authority ad-valorem "
-            "lines, NON AD VALOREM assessments, GROSS, PAYMENTS, REFUND. The "
-            "PAYMENTS table (posted date, receipt, paid-by, amount) is ground "
-            "truth; GROSS is the amount billed; ignore per-authority/millage "
-            "lines; note any non-empty REFUND."
+            "Either a deep 'action=detail&propertyId=…' link or a bare search form. Read the balance/total due figure on the bill detail page — ignore the per-authority line items."
         ),
     ),
     Playbook(
@@ -103,9 +90,7 @@ SEED_PLAYBOOKS: list[Playbook] = [
         footer_signatures=["aumentum technologies", "aumentum"],
         default_taxonomy="A",
         hints=(
-            "Same pattern as PublicAccessNow: a current-balance banner plus a "
-            "collapsed recently-paid section that holds the actual payment "
-            "proof — expand it before concluding paid/unpaid."
+            "Same as PublicAccessNow: the current-balance banner IS the answer — read it and stop."
         ),
     ),
     Playbook(
