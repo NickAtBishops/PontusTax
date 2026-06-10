@@ -1,0 +1,689 @@
+> ## Documentation Index
+> Fetch the complete documentation index at: https://skyvern.com/docs/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Complete Reference (For LLMs)
+
+> Complete reference for every method, parameter, and type in the Skyvern Python SDK. Includes tasks, workflows, browser sessions, browser profiles, credentials, helper methods, browser control, and error handling in a single page.
+
+## Install and initialize
+
+<CodeGroup>
+  ```bash Python theme={null}
+  # Requires Python 3.11+
+  pip install skyvern
+  ```
+
+  ```bash TypeScript theme={null}
+  # Requires Node.js 18+
+  npm install @skyvern/client
+  ```
+</CodeGroup>
+
+<Note>
+  `pip install skyvern` is the lightweight SDK for Skyvern Cloud and remote API calls. Embedded local SDK features such as `Skyvern.local()` and local browser control require `pip install "skyvern[local]"`. Local server and local stdio MCP commands require `pip install "skyvern[server]"`. Guided quickstart and migrations currently require Docker Compose or a source checkout.
+</Note>
+
+<CodeGroup>
+  ```python Python theme={null}
+  import asyncio
+  from skyvern import Skyvern
+
+  async def main():
+      client = Skyvern(api_key="YOUR_API_KEY")
+      result = await client.run_task(
+          prompt="Get the title of the top post on Hacker News",
+          url="https://news.ycombinator.com",
+          wait_for_completion=True,
+      )
+      print(result.output)
+
+  asyncio.run(main())
+  ```
+
+  ```typescript TypeScript theme={null}
+  import { Skyvern } from "@skyvern/client";
+
+  const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+
+  const result = await skyvern.runTask({
+    body: {
+      prompt: "Get the title of the top post on Hacker News",
+      url: "https://news.ycombinator.com",
+    },
+    waitForCompletion: true,
+  });
+  console.log(result.output);
+  ```
+</CodeGroup>
+
+**Constructor:**
+
+<CodeGroup>
+  ```python Python theme={null}
+  Skyvern(
+      api_key: str,                          # Required
+      base_url: str | None = None,           # Override for self-hosted deployments
+      environment: SkyvernEnvironment = CLOUD,# CLOUD, STAGING, or LOCAL
+      timeout: float | None = None,          # HTTP request timeout (seconds)
+  )
+
+  # Local mode (Python only - requires pip install "skyvern[local]")
+  # For local browser control, also run: python -m playwright install chromium
+  client = Skyvern.local()
+  ```
+
+  ```typescript TypeScript theme={null}
+  new Skyvern({
+    apiKey: string,                              // Required
+    baseUrl?: string,                            // Override for self-hosted deployments
+    environment?: SkyvernEnvironment | string,   // Cloud (default), Staging, or Local
+    timeoutInSeconds?: number,                   // HTTP request timeout (default: 60)
+    maxRetries?: number,                         // Retry count (default: 2)
+    headers?: Record<string, string>,            // Additional headers
+  })
+  ```
+</CodeGroup>
+
+***
+
+## Browser Automation
+
+### SkyvernBrowser
+
+<CodeGroup>
+  ```python Python theme={null}
+  # Launch / connect
+  browser = await client.launch_cloud_browser(timeout=60, proxy_location=None)
+  browser = await client.use_cloud_browser(timeout=60, proxy_location=None)
+  browser = await client.connect_to_cloud_browser_session("pbs_abc123")
+  browser = await client.connect_to_browser_over_cdp("http://localhost:9222")
+  browser = await client.launch_local_browser(headless=False, port=9222)  # Python only
+
+  # Get pages
+  page = await browser.get_working_page()   # Most recent page, or creates one
+  page = await browser.new_page()            # Always creates a new tab
+  page = await browser.get_page_for(pw_page) # Wrap existing Playwright Page (Python only)
+  await browser.close()                      # Close browser and cloud session
+  ```
+
+  ```typescript TypeScript theme={null}
+  // Launch / connect
+  const browser = await skyvern.launchCloudBrowser({ timeout: 60 });
+  const browser = await skyvern.useCloudBrowser({ timeout: 60 });
+  const browser = await skyvern.connectToCloudBrowserSession("pbs_abc123");
+  const browser = await skyvern.connectToBrowserOverCdp("http://localhost:9222");
+  // launch_local_browser - Python only, no TS equivalent
+
+  // Get pages
+  const page = await browser.getWorkingPage();   // Most recent page, or creates one
+  const page = await browser.newPage();           // Always creates a new tab
+  // get_page_for - Python only, no TS equivalent
+  await browser.close();                          // Close browser and cloud session
+  ```
+</CodeGroup>
+
+### SkyvernPage
+
+AI-enhanced Playwright methods - pass a selector for standard Playwright, add a prompt for AI fallback, or use prompt alone for pure AI.
+
+<CodeGroup>
+  ```python Python theme={null}
+  # act - freeform AI action
+  await page.act("Click the login button")
+
+  # extract - structured data extraction
+  data = await page.extract("Extract all products", schema={...})
+
+  # validate - page state assertion, returns bool
+  ok = await page.validate("User is logged in")
+
+  # prompt - ask LLM about the page
+  result = await page.prompt("What is the heading?", schema={...})
+
+  # locator - AI element locator returning chainable AILocator (Python only)
+  locator = page.locator(prompt="the submit button")
+  await locator.click()
+
+  # click - selector, AI, or both with fallback
+  await page.click("#submit-btn")
+  await page.click(prompt="Click the submit button")
+  await page.click("#submit-btn", prompt="Click submit")
+
+  # fill - selector, AI, or both with fallback
+  await page.fill("#email", value="user@example.com")
+  await page.fill(prompt="Fill email with user@example.com")
+
+  # select_option - selector, AI, or both with fallback
+  await page.select_option("#country", value="us")
+  await page.select_option(prompt="Select United States")
+
+  # type - character-by-character input (Python only)
+  await page.type("#search", value="query")
+
+  # hover (Python only)
+  await page.hover("#menu-item", intention="Hover over the menu")
+
+  # scroll (Python only)
+  await page.scroll(0, 500)
+
+  # upload_file (Python only)
+  await page.upload_file("#file-input", files="/path/to/file.pdf")
+
+  # fill_form - AI full form fill (Python only)
+  await page.fill_form(data={"name": "John", "email": "john@example.com"})
+
+  # fill_multipage_form - across page transitions (Python only)
+  await page.fill_multipage_form(data={...}, max_pages=5)
+
+  # fill_from_mapping - explicit field→value mapping (Python only)
+  await page.fill_from_mapping(form_fields=fields, mapping={0: "John"}, data={...})
+
+  # extract_form_fields - get all fields with metadata (Python only)
+  fields = await page.extract_form_fields()
+
+  # validate_mapping - verify mapping works (Python only)
+  is_valid = await page.validate_mapping(form_fields=fields, mapping={...}, prompt="Validate fields")
+
+  # fill_autocomplete - typeahead handling (Python only)
+  await page.fill_autocomplete(selector="#city", value="San Francisco")
+
+  # frame_switch - switch iframe context (Python only)
+  await page.frame_switch(selector="#payment-iframe")
+  page.frame_main()                    # back to main frame
+  frames = await page.frame_list()     # list all frames
+  ```
+
+  ```typescript TypeScript theme={null}
+  // act - freeform AI action
+  await page.act("Click the login button");
+
+  // extract - structured data extraction
+  const data = await page.extract({ prompt: "Extract all products", schema: {...} });
+
+  // validate - page state assertion, returns boolean
+  const ok = await page.validate("User is logged in");
+
+  // prompt - ask LLM about the page
+  const result = await page.prompt("What is the heading?", { heading: { type: "string" } });
+
+  // find / AILocator - Python only, no TS equivalent
+
+  // click - selector, AI, or both with fallback
+  await page.click("#submit-btn");
+  await page.click({ prompt: "Click the submit button" });
+  await page.click("#submit-btn", { prompt: "Click submit" });
+
+  // fill - selector, AI, or both with fallback
+  await page.fill("#email", "user@example.com");
+  await page.fill({ prompt: "Fill email with user@example.com" });
+
+  // selectOption - selector, AI, or both with fallback
+  await page.selectOption("#country", "us");
+  await page.selectOption({ prompt: "Select United States" });
+
+  // type, hover, scroll, upload_file - Python only
+  // fill_form, fill_multipage_form, fill_from_mapping - Python only
+  // extract_form_fields, validate_mapping, fill_autocomplete - Python only
+  // frame_switch, frame_main, frame_list - Python only
+  ```
+</CodeGroup>
+
+### Page Agent
+
+Full task/workflow execution in the context of the current page. Always waits for completion.
+
+<CodeGroup>
+  ```python Python theme={null}
+  # run_task
+  result = await page.agent.run_task("Fill out the form", data_extraction_schema={...}, max_steps=10, timeout=1800)
+
+  # login - supports skyvern, bitwarden, onepassword, azure_vault
+  await page.agent.login(credential_type=CredentialType.skyvern, credential_id="cred_123")
+
+  # download_files
+  result = await page.agent.download_files("Download the invoice PDF", download_suffix=".pdf")
+
+  # run_workflow
+  result = await page.agent.run_workflow("wpid_abc123", parameters={"key": "value"})
+  ```
+
+  ```typescript TypeScript theme={null}
+  // runTask
+  const result = await page.agent.runTask("Fill out the form", {
+    dataExtractionSchema: {...}, maxSteps: 10, timeout: 1800,
+  });
+
+  // login - supports skyvern, bitwarden, 1password, azure_vault
+  await page.agent.login("skyvern", { credentialId: "cred_123" });
+
+  // downloadFiles
+  const result = await page.agent.downloadFiles("Download the invoice PDF", {
+    downloadSuffix: ".pdf",
+  });
+
+  // runWorkflow
+  const result = await page.agent.runWorkflow("wpid_abc123", {
+    parameters: { key: "value" },
+  });
+  ```
+</CodeGroup>
+
+***
+
+## Tasks
+
+### run\_task
+
+<CodeGroup>
+  ```python Python theme={null}
+  result = await client.run_task(
+      prompt: str,                                # Required
+      url: str | None = None,
+      engine: RunEngine = RunEngine.skyvern_v1,
+      wait_for_completion: bool = False,
+      timeout: float = 1800,
+      max_steps: int | None = None,
+      data_extraction_schema: dict | str | None = None,
+      browser_session_id: str | None = None,
+      publish_workflow: bool = False,
+      proxy_location: ProxyLocation | None = None,
+      webhook_url: str | None = None,
+      error_code_mapping: dict[str, str] | None = None,
+      totp_identifier: str | None = None,
+      totp_url: str | None = None,
+      title: str | None = None,
+      model: dict | None = None,
+      user_agent: str | None = None,
+      extra_http_headers: dict[str, str] | None = None,
+      include_action_history_in_verification: bool | None = None,
+      max_screenshot_scrolls: int | None = None,
+      browser_address: str | None = None,
+      run_with: str | None = None,
+  ) -> TaskRunResponse
+  ```
+
+  ```typescript TypeScript theme={null}
+  const result = await skyvern.runTask({
+    body: {
+      prompt: string,                              // Required
+      url?: string,
+      engine?: RunEngine,                          // "skyvern-1.0" default
+      max_steps?: number,
+      data_extraction_schema?: Record<string, unknown> | string,
+      browser_session_id?: string,
+      publish_workflow?: boolean,
+      proxy_location?: ProxyLocation,
+      webhook_url?: string,
+      error_code_mapping?: Record<string, string>,
+      totp_identifier?: string,
+      totp_url?: string,
+      title?: string,
+      model?: Record<string, unknown>,
+      user_agent?: string,
+      extra_http_headers?: Record<string, string>,
+      browser_address?: string,
+      run_with?: string,
+    },
+    waitForCompletion?: boolean,
+    timeout?: number,                              // Default: 1800
+  }): Promise<TaskRunResponse>
+  ```
+</CodeGroup>
+
+**TaskRunResponse:** `run_id`, `status`, `output`, `failure_reason`, `downloaded_files`, `recording_url`, `screenshot_urls`, `app_url`, `step_count`, `script_run`, `created_at`, `finished_at`
+
+### get\_run
+
+```
+get_run(run_id) → GetRunResponse
+```
+
+### cancel\_run
+
+```
+cancel_run(run_id)
+```
+
+### get\_run\_timeline
+
+```
+get_run_timeline(run_id) → list[WorkflowRunTimeline]
+```
+
+### get\_run\_artifacts
+
+```
+get_run_artifacts(run_id, artifact_type?) → list[Artifact]
+```
+
+### get\_artifact
+
+```
+get_artifact(artifact_id) → Artifact
+```
+
+### get\_runs\_v2
+
+```
+get_runs_v2(page?, page_size?, status?, search_key?) → list[TaskRunListItem]
+```
+
+### retry\_run\_webhook
+
+```
+retry_run_webhook(run_id, webhook_url?)
+```
+
+***
+
+## Workflows
+
+### run\_workflow
+
+<CodeGroup>
+  ```python Python theme={null}
+  result = await client.run_workflow(
+      workflow_id: str,                       # Required. Permanent ID (wpid_...).
+      parameters: dict | None = None,
+      wait_for_completion: bool = False,
+      timeout: float = 1800,
+      run_with: str | None = None,            # "code" or "agent"
+      ai_fallback: bool | None = None,
+      browser_session_id: str | None = None,
+      browser_profile_id: str | None = None,
+      proxy_location: ProxyLocation | None = None,
+      max_steps_override: int | None = None,
+      webhook_url: str | None = None,
+      title: str | None = None,
+      template: bool | None = None,
+      totp_identifier: str | None = None,
+      totp_url: str | None = None,
+      user_agent: str | None = None,
+      extra_http_headers: dict[str, str] | None = None,
+      max_screenshot_scrolls: int | None = None,
+      browser_address: str | None = None,
+  ) -> WorkflowRunResponse
+  ```
+
+  ```typescript TypeScript theme={null}
+  const result = await skyvern.runWorkflow({
+    body: {
+      workflow_id: string,                       // Required
+      parameters?: Record<string, unknown>,
+      browser_session_id?: string,
+      browser_profile_id?: string,
+      proxy_location?: ProxyLocation,
+      webhook_url?: string,
+      title?: string,
+      totp_identifier?: string,
+      totp_url?: string,
+      user_agent?: string,
+      extra_http_headers?: Record<string, string>,
+      browser_address?: string,
+      ai_fallback?: boolean,
+      run_with?: string,
+    },
+    template?: boolean,
+    waitForCompletion?: boolean,
+    timeout?: number,                            // Default: 1800
+  }): Promise<WorkflowRunResponse>
+  ```
+</CodeGroup>
+
+**WorkflowRunResponse:** Same as TaskRunResponse plus `run_with`, `ai_fallback`, `script_run`.
+
+### create\_workflow
+
+```
+create_workflow(json_definition?, yaml_definition?, folder_id?) → Workflow
+```
+
+### get\_workflow
+
+```
+get_workflow(workflow_permanent_id, version?, template?) → Workflow
+```
+
+### get\_workflows
+
+```
+get_workflows(page?, page_size?, only_saved_tasks?, only_workflows?, only_templates?, title?, search_key?, folder_id?, status?, template?) → list[Workflow]
+```
+
+### get\_workflow\_versions
+
+```
+get_workflow_versions(workflow_permanent_id, template?) → list[Workflow]
+```
+
+### update\_workflow
+
+```
+update_workflow(workflow_id, json_definition?, yaml_definition?) → Workflow
+```
+
+### delete\_workflow
+
+```
+delete_workflow(workflow_id)
+```
+
+### get\_workflow\_runs
+
+```
+get_workflow_runs(page?, page_size?, status?, search_key?, error_code?) → list[WorkflowRun]
+```
+
+### update\_workflow\_folder
+
+```
+update_workflow_folder(workflow_permanent_id, folder_id?) → Workflow
+```
+
+**Workflow fields:** `workflow_id`, `workflow_permanent_id`, `version`, `title`, `workflow_definition`, `status`, `created_at`
+
+***
+
+## Browser Sessions
+
+### create\_browser\_session
+
+```
+create_browser_session(timeout?, proxy_location?, extensions?, browser_type?, browser_profile_id?) → BrowserSessionResponse
+```
+
+### get\_browser\_session
+
+```
+get_browser_session(browser_session_id) → BrowserSessionResponse
+```
+
+### get\_browser\_sessions
+
+```
+get_browser_sessions() → list[BrowserSessionResponse]
+```
+
+### close\_browser\_session
+
+```
+close_browser_session(browser_session_id)
+```
+
+**BrowserSessionResponse fields:** `browser_session_id`, `status`, `browser_address`, `app_url`, `timeout`, `started_at`, `created_at`
+
+***
+
+## Browser Profiles
+
+### create\_browser\_profile
+
+```
+create_browser_profile(name, description?, workflow_run_id?, browser_session_id?) → BrowserProfile
+```
+
+### list\_browser\_profiles
+
+```
+list_browser_profiles(include_deleted?) → list[BrowserProfile]
+```
+
+### get\_browser\_profile
+
+```
+get_browser_profile(profile_id) → BrowserProfile
+```
+
+### delete\_browser\_profile
+
+```
+delete_browser_profile(profile_id)
+```
+
+**BrowserProfile fields:** `browser_profile_id`, `name`, `description`, `created_at`
+
+***
+
+## Credentials
+
+### create\_credential
+
+```
+create_credential(name, credential_type, credential, vault_type?) → CredentialResponse
+```
+
+### get\_credential
+
+```
+get_credential(credential_id) → CredentialResponse
+```
+
+### get\_credentials
+
+```
+get_credentials(page?, page_size?, vault_type?) → list[CredentialResponse]
+```
+
+### update\_credential
+
+```
+update_credential(credential_id, name, credential_type, credential, vault_type?) → CredentialResponse
+```
+
+### delete\_credential
+
+```
+delete_credential(credential_id)
+```
+
+### send\_totp\_code
+
+```
+send_totp_code(totp_identifier, content, task_id?, workflow_id?, workflow_run_id?, source?, expired_at?, type?) → TotpCode
+```
+
+***
+
+## Helpers
+
+### login
+
+```
+login(credential_type, url?, credential_id?, prompt?, browser_session_id?, browser_profile_id?, browser_address?, proxy_location?, webhook_url?, totp_identifier?, totp_url?, extra_http_headers?, max_screenshot_scrolling_times?, wait_for_completion?, timeout?) → WorkflowRunResponse
+```
+
+Credential-specific parameters: `bitwarden_collection_id`, `bitwarden_item_id`, `onepassword_vault_id`, `onepassword_item_id`, `azure_vault_name`, `azure_vault_username_key`, `azure_vault_password_key`, `azure_vault_totp_secret_key`.
+
+### download\_files
+
+```
+download_files(navigation_goal, url?, browser_session_id?, browser_profile_id?, proxy_location?, webhook_url?, download_suffix?, download_timeout?, max_steps_per_run?, extra_http_headers?, totp_identifier?, totp_url?, browser_address?, max_screenshot_scrolling_times?) → WorkflowRunResponse
+```
+
+Python does not support `wait_for_completion` - poll with `get_run()`. TypeScript supports `waitForCompletion`.
+
+### upload\_file
+
+```
+upload_file(file) → UploadFileResponse
+```
+
+Returns `s3uri` and `presigned_url`.
+
+***
+
+## Error Handling
+
+<CodeGroup>
+  ```python Python theme={null}
+  from skyvern.client.core import ApiError
+  from skyvern.client.errors import NotFoundError
+
+  try:
+      run = await client.get_run("tsk_nonexistent")
+  except NotFoundError as e:
+      print(e.status_code, e.body)    # 404
+  except ApiError as e:
+      print(e.status_code, e.body)    # Any other HTTP error
+  ```
+
+  ```typescript TypeScript theme={null}
+  import { SkyvernError, SkyvernTimeoutError, SkyvernApi } from "@skyvern/client";
+
+  try {
+    const run = await skyvern.getRun("tsk_nonexistent");
+  } catch (e) {
+    if (e instanceof SkyvernApi.NotFoundError) {
+      console.log(e.statusCode, e.body);    // 404
+    } else if (e instanceof SkyvernError) {
+      console.log(e.statusCode, e.body);    // Any other HTTP error
+    }
+  }
+  ```
+</CodeGroup>
+
+**Error types:** `BadRequestError` (400), `ForbiddenError` (403), `NotFoundError` (404), `ConflictError` (409), `UnprocessableEntityError` (422). All inherit from `ApiError` (Python) or `SkyvernError` (TypeScript).
+
+Run failure is not an exception - check `result.status` (`completed`, `failed`, `terminated`, `timed_out`, `canceled`).
+
+***
+
+## Request options
+
+Every method accepts `request_options` (Python) or a second options argument (TypeScript) for per-request overrides:
+
+<CodeGroup>
+  ```python Python theme={null}
+  from skyvern.client.core import RequestOptions
+
+  request_options=RequestOptions(
+      timeout_in_seconds=120,
+      max_retries=3,
+      additional_headers={"x-custom-header": "value"},
+  )
+  ```
+
+  ```typescript TypeScript theme={null}
+  {
+    timeoutInSeconds: 120,
+    maxRetries: 3,
+    headers: { "x-custom-header": "value" },
+    abortSignal: controller.signal,  // TypeScript only
+    apiKey: "override-key",          // TypeScript only
+  }
+  ```
+</CodeGroup>
+
+***
+
+## Key constraints
+
+* `browser_profile_id` works with `run_workflow` only - silently ignored by `run_task`.
+* Python `download_files` does not support `wait_for_completion` - poll manually or use webhooks.
+* `publish_workflow=True` is deprecated and routes through the legacy Skyvern 2.0 publish path for backwards compatibility. Prefer creating reusable workflows with the workflow APIs.
+* Only workflow runs with `persist_browser_session=True` produce archives for profile creation.
+* `engine` accepts `RunEngine` enum values: `skyvern_v1`, `skyvern_v2`, `openai_cua`, `anthropic_cua`, `ui_tars`, `yutori_navigator`.
+* `launch_local_browser` requires Python local mode (`Skyvern.local()`) and the `skyvern[local]` extra.
+* `page.agent` methods always wait for completion.
+* Python-only features: `launch_local_browser`, `get_page_for`, `locator`/`AILocator`, `type`, `hover`, `scroll`, `upload_file` (page-level), form automation (`fill_form`, `fill_multipage_form`, `fill_from_mapping`, `extract_form_fields`, `validate_mapping`, `fill_autocomplete`), iframe management (`frame_switch`, `frame_main`, `frame_list`).

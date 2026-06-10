@@ -1,0 +1,296 @@
+================================================================================
+PONTUS CAPITAL — STACK CONTEXT PACK (CONTEXT FILE FOR CLAUDE CODE)
+Authoritative AI-readable documentation for the entire Pontus stack
+================================================================================
+HOW TO USE THIS FILE:
+
+This file points Claude Code (and any other AI coding agent) at the OFFICIAL,
+AI-readable documentation for every layer of the Pontus stack. It is the
+companion to the way Skyvern ships a full `llms.txt` dump: instead of relying
+on the model's training data (which goes stale), the agent fetches current
+docs straight from each vendor's `llms.txt` / `llms-full.txt` endpoint.
+
+DROP THIS INTO EVERY PROJECT alongside:
+  - pontus_internal_tools_template.txt  (the build standard)
+  - pontus_ui_design_system.txt         (the UI standard)
+
+WHAT IS llms.txt? An emerging convention (llmstxt.org). A site publishes a
+plain-text/Markdown file at /llms.txt (an INDEX of links) and often an
+/llms-full.txt (the ENTIRE docs concatenated into one file). LLMs read these
+directly — no crawling, no stale training data.
+
+HOW CLAUDE CODE SHOULD USE THESE LINKS:
+- When you (the agent) are unsure of a current API signature, import path, or
+  config option, FETCH the relevant llms.txt/llms-full.txt below and read it
+  BEFORE writing code. Do not guess from training data.
+- Prefer llms-full.txt when you need depth on one library; prefer the smaller
+  llms.txt index when you just need to find the right page to fetch.
+- These files are large. Fetch the most specific one for the task at hand.
+
+NOTE ON FRESHNESS: vendors move these URLs occasionally. If a link 404s, the
+fallback is the vendor's main docs site (also listed). The llms.txt standard
+is community-driven; some of these are official, some are community mirrors —
+each entry says which.
+
+================================================================================
+THE STACK — AT A GLANCE
+================================================================================
+
+LAYER              | TOOL              | PRIMARY AI-DOC SOURCE
+-------------------|-------------------|--------------------------------------
+Frontend framework | Next.js           | nextjs.org/docs/llms-full.txt  (OFFICIAL)
+Styling            | Tailwind CSS      | context7 mirror (no official full file)
+Components         | shadcn/ui         | ui.shadcn.com/llms.txt  (OFFICIAL) + MCP
+Typography         | Geist             | covered by Next.js docs (next/font)
+Database / Auth    | Firebase          | firebase.google.com/docs/llms.txt + MCP
+Frontend hosting   | Vercel            | vercel.com/docs/llms.txt  (OFFICIAL)
+Serverless jobs    | Cloud Functions   | covered by Firebase docs (functions)
+Scraping           | Skyvern           | docs.skyvern.com (full dump already saved)
+
+================================================================================
+1 — NEXT.JS  (frontend framework)
+================================================================================
+STATUS: Official. The Next.js team publishes both files.
+
+INDEX (links to every doc page):
+  https://nextjs.org/docs/llms.txt
+
+FULL DUMP (entire docs in one file — large):
+  https://nextjs.org/docs/llms-full.txt
+
+HUMAN DOCS (fallback):
+  https://nextjs.org/docs
+
+WHAT TO READ IT FOR:
+- App Router conventions (route groups, layouts, server vs client components)
+- Server Components, Server Actions, data fetching + caching semantics
+- API route handlers (app/api/*/route.ts) — the Pontus light-backend pattern
+- next/font (this is how Geist Sans/Mono are loaded — see UI doc)
+- Metadata, middleware, environment variables, deployment notes
+
+PONTUS GOTCHAS:
+- We use the APP ROUTER only, never the Pages Router. If the agent finds a
+  Pages-Router pattern (pages/api, getServerSideProps), it's wrong for us.
+- Server components are the default; add "use client" only for interactivity.
+
+================================================================================
+2 — TAILWIND CSS  (styling)
+================================================================================
+STATUS: NO official llms-full.txt as of this writing (open request:
+github.com/tailwindlabs/tailwindcss/discussions/18256). Use a mirror.
+
+BEST AVAILABLE AI-DOC SOURCE (community mirror, kept current):
+  https://context7.com/websites/tailwindcss
+  (Context7 also exposes an MCP server — see the MCP section at the bottom.)
+
+HUMAN DOCS (authoritative fallback — read these for v4 specifics):
+  https://tailwindcss.com/docs
+
+WHAT TO READ IT FOR:
+- Utility class names and the v4 configuration model (@theme, CSS-first config)
+- The exact class names referenced in the Pontus UI doc (neutral-50,
+  neutral-950, blue-600, tabular-nums, etc.)
+
+PONTUS GOTCHAS:
+- Pontus is on Tailwind v4 (CSS-first config in globals.css via @theme), NOT
+  the old v3 tailwind.config.js JS-object model. If the agent reaches for a
+  tailwind.config.js with a `theme.extend` object, double-check against v4.
+- The Pontus palette maps almost entirely to Tailwind DEFAULT scales — the UI
+  doc lists the mapping. Don't invent custom color tokens.
+
+================================================================================
+3 — shadcn/ui  (components)
+================================================================================
+STATUS: Official. shadcn/ui is "AI-ready" by design and ships an llms.txt
+plus an official MCP server for installing components by natural language.
+
+INDEX (official):
+  https://ui.shadcn.com/llms.txt
+
+PER-COMPONENT AI DOCS: each component page has an LLM-optimized version.
+  Pattern: https://ui.shadcn.com/docs/components/<name>  (use the "Copy /
+  Open in" menu on the page, or fetch via the llms.txt index links).
+
+HUMAN DOCS (fallback):
+  https://ui.shadcn.com/docs
+
+OFFICIAL MCP SERVER (lets the agent browse/search/install components):
+  https://ui.shadcn.com/docs/mcp
+
+WHAT TO READ IT FOR:
+- Installing components with the CLI (npx shadcn@latest add <component>)
+- components.json config, theming, the registry system
+- The exact prop APIs for button, badge, table, card, select, input, sheet,
+  dialog, tabs, sonner, command (the Pontus standard set — see template §3)
+
+PONTUS GOTCHAS:
+- We OWN the component code (shadcn copies source into components/ui/). The
+  UI doc's StatusBadge / StatCard / AppShell / PropertyTable are WRAPPERS over
+  shadcn primitives — never hand-roll a primitive, never restyle inline.
+- Use the "Neutral" base color and CSS variables = yes at init (template §3).
+
+================================================================================
+4 — FIREBASE  (database + auth + functions)  ★ the new data layer
+================================================================================
+STATUS: Official llms.txt files maintained by Google across the Firebase docs.
+Firebase ALSO ships an official MCP server + "rules packs" purpose-built for
+AI coding agents (Claude Code, Cursor, etc.) — this is the closest analog to
+Skyvern's full-context approach, and the BEST option for our use case.
+
+INDEX (official — links to per-topic Markdown):
+  https://firebase.google.com/docs/llms.txt
+
+AI / LLM DEVELOPMENT HUB (official — start here):
+  https://firebase.google.com/docs/ai
+
+OFFICIAL FIREBASE MCP SERVER (agentive tools for Claude Code / Cursor /
+Antigravity — browse project, read/write Firestore, manage rules):
+  https://firebase.google.com/docs/cli/mcp-server
+  (Search the AI hub above for "MCP server" if this moves.)
+
+KEY HUMAN DOCS (authoritative; fetch the .md versions via llms.txt index):
+  Web modular SDK setup ...... https://firebase.google.com/docs/web/setup
+  Firestore (web) ............ https://firebase.google.com/docs/firestore
+  Firestore data model ....... https://firebase.google.com/docs/firestore/data-model
+  Firestore queries .......... https://firebase.google.com/docs/firestore/query-data/queries
+  Security rules ............. https://firebase.google.com/docs/firestore/security/get-started
+  Firebase Auth (web) ........ https://firebase.google.com/docs/auth/web/start
+  Admin SDK (Node) ........... https://firebase.google.com/docs/admin/setup
+  Cloud Functions (v2) ....... https://firebase.google.com/docs/functions
+  JS SDK release notes ....... https://firebase.google.com/support/release-notes/js
+  firebase npm package ....... https://www.npmjs.com/package/firebase
+
+WHAT TO READ IT FOR:
+- The MODULAR v9+ Web SDK (function-style imports). This is mandatory for
+  Pontus — see gotchas. Read the web/setup + firestore pages for exact imports.
+- Firestore querying: where(), orderBy(), limit(), and when a COMPOSITE INDEX
+  is required (the error gives a console link; mirror it into
+  firestore.indexes.json — see template §6).
+- Security rules syntax (rules_version '2', match blocks, request.auth).
+- Admin SDK init from a service-account credential (server side).
+- serverTimestamp() / FieldValue.serverTimestamp() for created_at/updated_at.
+
+PONTUS GOTCHAS (read these — they cause the most agent mistakes):
+- USE THE MODULAR v9+ SDK ONLY. Correct:
+      import { getFirestore, collection, getDocs } from "firebase/firestore";
+  WRONG (v8 / compat — bigger bundle, not tree-shakeable, do not use):
+      import firebase from "firebase/compat/app"; firebase.firestore()...
+- GUARD INITIALIZATION against hot-reload duplicates:
+      const app = getApps().length === 0 ? initializeApp(cfg) : getApp();
+  Otherwise you get "Firebase App named '[DEFAULT]' already exists."
+- CLIENT SDK (firebase) in the browser; ADMIN SDK (firebase-admin) on the
+  server only. Never import firebase-admin into a "use client" file.
+- NO migrations, NO SQL, NO joins. Model data as collections of documents;
+  store referenced IDs and do a second read, or denormalize. See template §4.
+- There is NO auto-updated_at trigger. Set updated_at with serverTimestamp()
+  on EVERY write yourself.
+- The NEXT_PUBLIC_FIREBASE_* web config is NOT secret (it identifies the
+  project). What protects data is firestore.rules. The service-account JSON
+  IS secret — server only, never NEXT_PUBLIC_, never committed.
+
+================================================================================
+5 — VERCEL  (frontend hosting)
+================================================================================
+STATUS: Official. Vercel publishes llms.txt + a famously large llms-full.txt.
+
+INDEX (official):
+  https://vercel.com/docs/llms.txt
+
+FULL DUMP (entire docs — very large):
+  https://vercel.com/docs/llms-full.txt
+
+HUMAN DOCS (fallback):
+  https://vercel.com/docs
+
+WHAT TO READ IT FOR:
+- Git-based deploys (push to GitHub → auto-deploy), preview deployments per PR
+- Environment variable configuration in the Vercel dashboard
+- Next.js-on-Vercel specifics (the framework is auto-detected)
+- Build settings, project config (vercel.json), domains
+
+PONTUS GOTCHAS:
+- Deployment is push-to-deploy; we don't hand-roll CI. See template §11.
+- Set ALL env vars (NEXT_PUBLIC_FIREBASE_* + FIREBASE_SERVICE_ACCOUNT_KEY +
+  NEXT_PUBLIC_APP_URL) in the Vercel dashboard, per environment.
+
+================================================================================
+6 — CLOUD FUNCTIONS + CLOUD RUN  (serverless backend, when needed)
+================================================================================
+STATUS: Covered by the official Firebase docs (§4 above) and Google Cloud docs.
+There is NO separate Python host in this stack (no Railway, no standalone
+FastAPI service).
+
+WHERE BACKEND WORK GOES (in order of preference):
+- Next.js API routes ... request/response work. Default. (See §1, Next.js.)
+- Cloud Functions ...... triggers, cron, light async jobs. TypeScript, same
+  Admin SDK, no new host. Docs: https://firebase.google.com/docs/functions
+- Cloud Run ............ ESCAPE HATCH only — long-running Python (Playwright,
+  pandas, ML). Firebase/GCP-native. Docs: https://cloud.google.com/run/docs
+
+WHAT TO READ IT FOR:
+- Cloud Functions v2: onDocumentCreated / onSchedule triggers, deploy with
+  `firebase deploy --only functions`.
+- Cloud Run: containerize and `gcloud run deploy <name> --source .`.
+
+PONTUS GOTCHAS:
+- Most "heavy backend" needs are really "call Skyvern's API on a schedule" —
+  a Cloud Function covers that with a fetch(); no Python server required.
+- Reach for Cloud Run LAST, and only for genuinely long-running Python.
+- Inside Firebase/GCP, the Admin SDK auto-initializes — you don't pass the
+  service-account key as an env var there.
+
+================================================================================
+7 — SKYVERN  (browser-automation scraping)  — already in the repo
+================================================================================
+STATUS: Full docs dump already saved in the project (the llms-full.txt you
+downloaded). Keep using that file as the standing Skyvern context.
+
+HUMAN DOCS / API REF (fallback / updates):
+  https://docs.skyvern.com
+  https://docs.skyvern.com/api-reference  (run/task, workflows, browser
+  profiles, login tasks, artifacts, file-download tasks)
+
+WHAT TO READ IT FOR:
+- Task & workflow runs, login tasks, persistent browser profiles / sessions
+- The Axial lead-gen login flow (persistent session question)
+
+PONTUS GOTCHAS:
+- Skyvern is the chosen tool for write-heavy government portals (benchmark-
+  backed) — see the property-tax monitoring context. Make.com is for
+  event-driven triggers, NOT production scraping at portfolio scale.
+
+================================================================================
+8 — MCP SERVERS THE AGENT CAN CONNECT (optional but powerful)
+================================================================================
+Several stack vendors ship Model Context Protocol servers. Connecting these in
+Claude Code gives the agent LIVE, authoritative tools instead of static text.
+
+- Firebase MCP server ... agentive Firestore/rules tools; install per the AI
+  hub (https://firebase.google.com/docs/ai). Best fit for our data layer.
+- shadcn/ui MCP server .. browse/search/install components by natural language
+  (https://ui.shadcn.com/docs/mcp).
+- Context7 MCP server ... up-to-date docs for many libraries incl. Tailwind &
+  Next.js (https://context7.com). Useful when a vendor has no llms-full.txt.
+
+PRECEDENCE WHEN SOURCES DISAGREE:
+1. A connected official MCP server (most current, structured).
+2. The vendor's official llms-full.txt / llms.txt.
+3. The vendor's human docs site.
+4. Model training data — LAST resort; always verify against the above.
+
+================================================================================
+9 — QUICK FETCH LIST (copy-paste targets for the agent)
+================================================================================
+Next.js  full ... https://nextjs.org/docs/llms-full.txt
+Next.js  index .. https://nextjs.org/docs/llms.txt
+shadcn   index .. https://ui.shadcn.com/llms.txt
+Firebase index .. https://firebase.google.com/docs/llms.txt
+Firebase AI hub . https://firebase.google.com/docs/ai
+Vercel   full ... https://vercel.com/docs/llms-full.txt
+Vercel   index .. https://vercel.com/docs/llms.txt
+Tailwind mirror . https://context7.com/websites/tailwindcss
+Skyvern  docs ... https://docs.skyvern.com
+
+================================================================================
+END OF STACK CONTEXT PACK
+================================================================================

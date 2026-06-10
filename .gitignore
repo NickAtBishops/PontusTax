@@ -1,0 +1,21 @@
+# Env / secrets — NEVER commit
+.env
+.env*.local
+*serviceAccount*.json
+firebase-debug.log
+.firebase/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store

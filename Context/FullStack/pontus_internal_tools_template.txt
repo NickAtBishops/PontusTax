@@ -1,0 +1,860 @@
+================================================================================
+PONTUS CAPITAL — INTERNAL TOOLS BUILD TEMPLATE (CONTEXT FILE FOR CLAUDE CODE)
+The Pontus Tooling Standard — with reference code
+================================================================================
+HOW TO USE THIS FILE:
+
+This is the project-agnostic technical template for every Pontus internal
+tool. It defines the stack, folder structure, database conventions, API
+patterns, deployment, and security rules — all with copy-pasteable reference
+code. Drop this into any project alongside the UI Design System spec.
+
+Project-specific details (data model, screens, business logic) live in each
+project's own brief. Everything below applies to ALL Pontus projects equally.
+
+When building: copy the reference code verbatim. Adapt only the names
+(collection names, project paths). The structure does not change.
+
+DATA LAYER: This standard uses FIREBASE (Firestore + Firebase Auth +
+Cloud Functions), not Supabase. Firestore is a NoSQL document database, so
+the conventions below are document/collection-oriented rather than relational.
+
+HOSTING: Two platforms only — VERCEL (Next.js frontend) and FIREBASE (data,
+auth, serverless functions). There is NO separate Python host (no Railway).
+Backend work is split as: Next.js API routes for light/request work, Cloud
+Functions for triggers/cron/light jobs, and — only if a job genuinely needs
+long-running Python (Playwright, pandas, ML) — a container on Cloud Run
+(Firebase/GCP-native). See §8.
+
+================================================================================
+SECTION 1 — STACK SUMMARY (memorize)
+================================================================================
+
+LAYER              | CHOICE                                      | NOTES
+-------------------|---------------------------------------------|----------------
+Frontend framework | Next.js (App Router) + TypeScript           | Vercel-native
+Styling            | Tailwind CSS                                | Utility-first
+Components         | shadcn/ui                                   | See UI doc
+Typography         | Geist Sans + Geist Mono via next/font       | See UI doc
+Light backend      | Next.js API routes (app/api/*)              | Same codebase
+Serverless jobs    | Cloud Functions for Firebase                | Triggers / cron / light
+Heavy backend      | Cloud Run container — ONLY if truly needed  | Escape hatch, see §8
+Database           | Firestore via Firebase                      | One project, collection group per tool
+Auth               | Firebase Authentication                     | When user auth needed
+Frontend hosting   | Vercel                                      | Auto-deploys on push
+Data + functions   | Firebase                                    | Firestore, Auth, Functions
+Version control    | GitHub                                      | Source of truth
+Build tool         | Claude Code + v0.dev for scaffolding        | Driven by CLAUDE.md
+
+WHY FIREBASE OVER SUPABASE (rationale, write it down):
+- Firestore is a managed, horizontally-scaling document store with real-time
+  listeners out of the box (onSnapshot) — useful for live dashboards.
+- Firebase Auth integrates directly and gives us Google sign-in for the team
+  with almost no setup.
+- The Firebase Admin SDK gives server-side full access from API routes and
+  Cloud Functions without per-table policy plumbing.
+- The trade-off: NoSQL means no SQL joins and no schema migrations. We model
+  data as collections of documents and enforce shape in code + security rules.
+
+================================================================================
+SECTION 2 — STANDARD FOLDER STRUCTURE
+================================================================================
+
+Every project uses this layout. Don't deviate.
+
+my-tool/
+├── app/
+│   ├── (dashboard)/
+│   │   └── page.tsx              # pages live under route groups
+│   ├── api/
+│   │   └── properties/route.ts   # Next.js API routes (light backend)
+│   ├── layout.tsx                # root layout — Geist + globals
+│   └── globals.css               # design tokens (see UI doc)
+├── components/
+│   ├── ui/                       # shadcn components (button, table, …)
+│   ├── app-shell.tsx             # layout shell (see UI doc)
+│   ├── status-badge.tsx          # reference component (see UI doc)
+│   ├── stat-card.tsx             # reference component (see UI doc)
+│   └── property-table.tsx        # project-specific component
+├── lib/
+│   ├── firebase.ts               # CLIENT SDK init (browser)        (see §5)
+│   ├── firebase-admin.ts         # ADMIN SDK init (server only)     (see §5)
+│   └── utils.ts                  # cn() helper from shadcn
+├── functions/                    # OPTIONAL Cloud Functions (see §8)
+│   ├── src/index.ts
+│   ├── package.json
+│   └── tsconfig.json
+├── firestore.rules               # security rules (see §6)
+├── firestore.indexes.json        # composite index definitions (see §6)
+├── firebase.json                 # Firebase project config
+├── .env.local                    # NEVER committed — see .gitignore
+├── .gitignore
+├── CLAUDE.md                     # standing context for Claude Code (see §10)
+├── package.json
+└── tsconfig.json
+
+================================================================================
+SECTION 3 — ONE-TIME PROJECT SETUP
+================================================================================
+
+----- terminal — run once per project -----
+# 1. Scaffold Next.js (TypeScript, Tailwind, App Router — accept defaults)
+npx create-next-app@latest my-tool
+cd my-tool
+
+# 2. UI foundation
+npx shadcn@latest init
+npx shadcn@latest add button badge table card select input \
+  sheet dialog tabs sonner command
+
+# 3. Project dependencies
+#    - firebase     = client SDK (browser, modular v9+)
+#    - firebase-admin = admin SDK (server-side, API routes)
+npm install geist @tanstack/react-table recharts lucide-react \
+  firebase firebase-admin
+
+# 4. (Optional) Firebase CLI for rules, indexes, emulators, functions
+npm install -g firebase-tools
+firebase login
+firebase init firestore    # writes firestore.rules + firestore.indexes.json
+#   add `firebase init functions` only if you need Cloud Functions
+
+# 5. Init git + protect secrets BEFORE any commit
+git init
+echo ".env*.local" >> .gitignore
+echo "node_modules" >> .gitignore
+echo ".next" >> .gitignore
+-------------------------------------------
+
+ONE-TIME FIREBASE CONSOLE SETUP (per project):
+1. Create a Firebase project at console.firebase.google.com.
+2. Add a Web App → copy the config object into .env.local (see §9).
+3. Build → Firestore Database → Create database (production mode).
+4. (If you need auth) Build → Authentication → enable Google + Email/Password.
+5. Project settings → Service accounts → Generate new private key. This JSON
+   is the admin credential. NEVER commit it — load it via env var (see §9).
+
+================================================================================
+SECTION 4 — DATABASE: ONE COLLECTION GROUP PER TOOL
+================================================================================
+
+One Firebase project hosts all Pontus tools. Firestore has no SQL schemas, so
+we namespace each tool under a TOP-LEVEL COLLECTION named for the tool:
+
+  property_tax/   (collection)
+    {docId}/        (a document — e.g. one property)
+      history/      (subcollection — append-only)
+  axial/
+  research/
+
+Equivalent of the old "schema per tool" rule: each tool owns one top-level
+collection prefix. Tools never read each other's collections directly.
+
+UNIVERSAL FIRESTORE RULES (apply to every collection in every project):
+1. One top-level collection per tool (prefix everything with the tool name).
+2. snake_case for collection + field names (matches the old SQL convention so
+   nothing else in the doc changes). camelCase everywhere in TypeScript.
+3. Every document carries: id (the Firestore doc ID, also stored in a field),
+   created_at, updated_at — all set in code (Firestore has no triggers).
+4. Append history, don't overwrite — values changing over time go to a
+   `history` SUBCOLLECTION on the document, not an in-place field update.
+5. Store rules as data, not code — business-logic variation goes in documents.
+6. References, not joins — store the referenced document's ID as a field
+   (e.g. property_id). Resolve with a second read or denormalize on write.
+7. Security rules ON by default — firestore.rules denies all client access
+   unless a rule explicitly allows it (see §6). Server (Admin SDK) bypasses.
+8. Set updated_at in EVERY write. Firestore has no auto-updated_at trigger;
+   use serverTimestamp() so the server clock is authoritative.
+
+KEY MENTAL-MODEL SHIFTS FROM SUPABASE/POSTGRES:
+- No migrations. You don't "create a table" — a collection exists once you
+  write a document to it. Shape is enforced in code + rules, not DDL.
+- No SQL. Queries are method chains: where(), orderBy(), limit().
+- No joins. Either do a second lookup by stored ID, or denormalize.
+- Composite queries (filter on field A + order by field B) require a
+  composite index — Firestore's error message gives you a one-click link,
+  and the index is recorded in firestore.indexes.json (commit it).
+
+================================================================================
+SECTION 5 — FIREBASE CLIENTS
+================================================================================
+
+Two SDKs, two files. The CLIENT SDK (firebase) runs in the browser and is
+governed by security rules. The ADMIN SDK (firebase-admin) runs ONLY on the
+server (API routes / Cloud Functions / Cloud Run) and bypasses all rules.
+
+NEVER import firebase-admin into a "use client" component or any browser code.
+
+----- lib/firebase.ts (CLIENT SDK — browser-safe, modular v9+) -----
+import { initializeApp, getApps, getApp } from "firebase/app";
+import { getFirestore } from "firebase/firestore";
+import { getAuth } from "firebase/auth";
+
+// All NEXT_PUBLIC_* values are safe to expose — they identify the project,
+// they are not secrets. Access is controlled by Firestore security rules.
+const firebaseConfig = {
+  apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY!,
+  authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN!,
+  projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID!,
+  storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET!,
+  messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID!,
+  appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID!,
+};
+
+// Guard against re-initialization during Next.js hot-reload / multiple imports.
+const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
+
+export const db = getFirestore(app);
+export const auth = getAuth(app);
+--------------------------------------------------------------------
+
+----- lib/firebase-admin.ts (ADMIN SDK — server only, bypasses rules) -----
+import { initializeApp, getApps, getApp, cert } from "firebase-admin/app";
+import { getFirestore } from "firebase-admin/firestore";
+
+// The service-account JSON is provided as a single env var (stringified).
+// NEVER expose this to the browser; it has full read/write on the project.
+function getAdminApp() {
+  if (getApps().length > 0) {
+    return getApp();
+  }
+  const serviceAccount = JSON.parse(
+    process.env.FIREBASE_SERVICE_ACCOUNT_KEY!,
+  );
+  return initializeApp({
+    credential: cert(serviceAccount),
+  });
+}
+
+export const adminDb = getFirestore(getAdminApp());
+---------------------------------------------------------------------------
+
+CLIENT vs ADMIN — when to use which:
+- adminDb (server): API routes, server components doing privileged work,
+  Cloud Functions, Cloud Run. Full access. The default for Pontus internal
+  tools, where most reads/writes happen server-side.
+- db (client): only when a browser component must read/write directly AND a
+  security rule permits it (e.g. an authenticated analyst reading their data,
+  or a real-time onSnapshot listener on a dashboard).
+
+================================================================================
+SECTION 6 — FIRESTORE DATA + SECURITY RULES PATTERN
+================================================================================
+
+There are no SQL migrations. Instead you (a) write documents in the canonical
+shape, and (b) lock the database with security rules. Both are shown here.
+
+CANONICAL DOCUMENT SHAPE (every document in every tool):
+{
+  id:         "<firestore doc id, duplicated into a field for convenience>",
+  created_at: <serverTimestamp>,
+  updated_at: <serverTimestamp>,
+  ...tool-specific fields
+}
+
+Example: a `property_tax/{propertyId}` document:
+{
+  id:         "abc123",
+  name:       "1450 Industrial Pkwy",
+  parcel_id:  "047-221-09",
+  county:     "San Diego",
+  state:      "CA",
+  created_at: <serverTimestamp>,
+  updated_at: <serverTimestamp>
+}
+
+APPEND-HISTORY pattern (replaces the SQL history table). Each property keeps a
+`history` SUBCOLLECTION; you INSERT a new doc, never overwrite:
+
+  property_tax/{propertyId}/history/{autoId}
+  {
+    assessed_value: 1200000,
+    tax_bill:       18400,
+    recorded_at:    <serverTimestamp>
+  }
+
+----- firestore.rules (deny-by-default; commit this file) -----
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // DEFAULT: deny everything. The Admin SDK (server) is unaffected by rules,
+    // so server-side reads/writes still work. This blocks all *client* access
+    // unless a rule below explicitly allows it.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // EXAMPLE: allow signed-in Pontus users to READ property_tax data from the
+    // browser (e.g. for real-time dashboards), but never write from the client
+    // — all writes go through server API routes using the Admin SDK.
+    match /property_tax/{propertyId} {
+      allow read: if request.auth != null;
+      allow write: if false;
+
+      match /history/{historyId} {
+        allow read: if request.auth != null;
+        allow write: if false;
+      }
+    }
+  }
+}
+---------------------------------------------------------------
+
+----- firestore.indexes.json (commit; Firestore tells you when you need one) -----
+{
+  "indexes": [
+    {
+      "collectionGroup": "properties",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "state", "order": "ASCENDING" },
+        { "fieldPath": "county", "order": "ASCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}
+----------------------------------------------------------------------------------
+
+Deploy rules + indexes with the Firebase CLI:
+  firebase deploy --only firestore:rules,firestore:indexes
+
+PATTERN NOTES:
+- Deny-by-default is the Firestore equivalent of "RLS on with no policies":
+  no client can touch data until you add a rule. The server is always allowed.
+- History subcollections are ALWAYS append-only. Never update or delete a
+  history doc — only addDoc().
+- updated_at must be set on every write with serverTimestamp(); there is no
+  trigger to do it for you.
+- A query that filters on one field and orders by another needs a composite
+  index. Run the query once; Firestore's error gives a console link that
+  creates it, then mirror it into firestore.indexes.json and commit.
+
+================================================================================
+SECTION 7 — NEXT.JS API ROUTE PATTERN (app/api/<resource>/route.ts)
+================================================================================
+
+Light backend lives in app/api/*. One file per resource. Always uses the
+Admin SDK (server-side) so it bypasses rules and has full access.
+
+----- app/api/properties/route.ts -----
+import { NextResponse } from "next/server";
+import { adminDb } from "@/lib/firebase-admin";
+import { FieldValue } from "firebase-admin/firestore";
+
+const COLLECTION = "property_tax";
+
+// GET /api/properties — list all properties (newest first)
+export async function GET() {
+  try {
+    const snapshot = await adminDb
+      .collection(COLLECTION)
+      .orderBy("created_at", "desc")
+      .get();
+
+    const data = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+    return NextResponse.json(data);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
+}
+
+// POST /api/properties — create a new property
+export async function POST(req: Request) {
+  try {
+    const body = await req.json();
+
+    const docRef = await adminDb.collection(COLLECTION).add({
+      ...body,
+      created_at: FieldValue.serverTimestamp(),
+      updated_at: FieldValue.serverTimestamp(),
+    });
+
+    // Store the generated ID back into the document for convenience.
+    await docRef.update({ id: docRef.id });
+
+    const created = await docRef.get();
+    return NextResponse.json({ id: created.id, ...created.data() }, {
+      status: 201,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    return NextResponse.json({ error: message }, { status: 400 });
+  }
+}
+---------------------------------------
+
+Per-item routes (app/api/properties/[id]/route.ts):
+
+----- app/api/properties/[id]/route.ts -----
+import { NextResponse } from "next/server";
+import { adminDb } from "@/lib/firebase-admin";
+import { FieldValue } from "firebase-admin/firestore";
+
+const COLLECTION = "property_tax";
+
+// GET /api/properties/:id
+export async function GET(
+  _req: Request,
+  { params }: { params: { id: string } },
+) {
+  const doc = await adminDb.collection(COLLECTION).doc(params.id).get();
+
+  if (!doc.exists) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
+  return NextResponse.json({ id: doc.id, ...doc.data() });
+}
+
+// PATCH /api/properties/:id
+export async function PATCH(
+  req: Request,
+  { params }: { params: { id: string } },
+) {
+  try {
+    const body = await req.json();
+    const docRef = adminDb.collection(COLLECTION).doc(params.id);
+
+    await docRef.update({
+      ...body,
+      updated_at: FieldValue.serverTimestamp(),
+    });
+
+    const updated = await docRef.get();
+    return NextResponse.json({ id: updated.id, ...updated.data() });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    return NextResponse.json({ error: message }, { status: 400 });
+  }
+}
+
+// DELETE /api/properties/:id
+export async function DELETE(
+  _req: Request,
+  { params }: { params: { id: string } },
+) {
+  try {
+    await adminDb.collection(COLLECTION).doc(params.id).delete();
+    return new NextResponse(null, { status: 204 });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    return NextResponse.json({ error: message }, { status: 400 });
+  }
+}
+-------------------------------------------
+
+Append a history row (the canonical "value changed over time" write):
+
+----- app/api/properties/[id]/history/route.ts -----
+import { NextResponse } from "next/server";
+import { adminDb } from "@/lib/firebase-admin";
+import { FieldValue } from "firebase-admin/firestore";
+
+// POST /api/properties/:id/history — append, never overwrite
+export async function POST(
+  req: Request,
+  { params }: { params: { id: string } },
+) {
+  const body = await req.json();
+
+  await adminDb
+    .collection("property_tax")
+    .doc(params.id)
+    .collection("history")
+    .add({
+      assessed_value: body.assessed_value,
+      tax_bill: body.tax_bill,
+      recorded_at: FieldValue.serverTimestamp(),
+    });
+
+  return new NextResponse(null, { status: 201 });
+}
+----------------------------------------------------
+
+Frontend fetch pattern (in a server component or client component):
+
+----- example fetch -----
+// Server component (preferred — runs on server, no client JS needed)
+async function getProperties() {
+  const res = await fetch(`${process.env.NEXT_PUBLIC_APP_URL}/api/properties`, {
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error("Failed to fetch properties");
+  return res.json();
+}
+
+// Client component (when interactivity needed)
+"use client";
+import { useEffect, useState } from "react";
+
+export function PropertyList() {
+  const [data, setData] = useState([]);
+  useEffect(() => {
+    fetch("/api/properties").then((r) => r.json()).then(setData);
+  }, []);
+  return <PropertyTable rows={data} />;
+}
+-------------------------
+
+OPTIONAL — real-time dashboard with the CLIENT SDK (Firestore's superpower).
+Requires a security rule that allows the signed-in user to read (see §6):
+
+----- live listener (client component) -----
+"use client";
+import { useEffect, useState } from "react";
+import { db } from "@/lib/firebase";
+import { collection, onSnapshot, query, orderBy } from "firebase/firestore";
+
+export function LiveProperties() {
+  const [rows, setRows] = useState([]);
+  useEffect(() => {
+    const q = query(
+      collection(db, "property_tax"),
+      orderBy("created_at", "desc"),
+    );
+    // onSnapshot pushes updates in real time — no polling.
+    const unsub = onSnapshot(q, (snap) => {
+      setRows(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+    });
+    return () => unsub();
+  }, []);
+  return <PropertyTable rows={rows} />;
+}
+--------------------------------------------
+
+================================================================================
+SECTION 8 — SERVERLESS BACKEND: CLOUD FUNCTIONS (+ Cloud Run escape hatch)
+================================================================================
+
+There is NO separate Python host. Backend work lands in one of three places,
+in order of preference:
+
+  1. Next.js API routes (app/api/*)   — request/response work (see §7). Default.
+  2. Cloud Functions for Firebase     — triggers, cron, light async jobs. §8.
+  3. Cloud Run container              — ONLY if a job genuinely needs
+                                        long-running Python (Playwright, pandas,
+                                        ML). The escape hatch. §8 (end).
+
+DECISION RULE:
+- Responds to an HTTP request from the app? → Next.js API route.
+- "When a doc changes, do X", or "every morning do Y", or a short async task?
+  → Cloud Function (TypeScript).
+- Long-running, Python-only libraries, or heavy CPU/RAM? → Cloud Run.
+- Orchestrating Skyvern? → Skyvern runs as its own service; you CALL ITS API
+  over HTTP. That's a normal fetch() from a Cloud Function or API route — it
+  does NOT require a Python server of your own.
+
+----- functions/src/index.ts (Cloud Functions — the serverless default) -----
+import { onDocumentCreated } from "firebase-functions/v2/firestore";
+import { onSchedule } from "firebase-functions/v2/scheduler";
+import { initializeApp } from "firebase-admin/app";
+import { getFirestore, FieldValue } from "firebase-admin/firestore";
+
+initializeApp();
+const db = getFirestore();
+
+// TRIGGER: runs whenever a new property document is created.
+export const onPropertyCreated = onDocumentCreated(
+  "property_tax/{propertyId}",
+  async (event) => {
+    const propertyId = event.params.propertyId;
+    // e.g. seed an initial history row, or enqueue a tax-bill check.
+    await db
+      .collection("property_tax")
+      .doc(propertyId)
+      .collection("history")
+      .add({ recorded_at: FieldValue.serverTimestamp() });
+  },
+);
+
+// SCHEDULE: runs every day at 06:00 America/Los_Angeles.
+// This is where a daily Skyvern run is KICKED OFF — call Skyvern's API,
+// then write results back to Firestore (append history; see §7).
+export const dailyTaxCheck = onSchedule(
+  { schedule: "every day 06:00", timeZone: "America/Los_Angeles" },
+  async () => {
+    const targets = await db.collection("property_tax").get();
+    for (const doc of targets.docs) {
+      // Fire a Skyvern task over HTTP. No Python server needed.
+      // const res = await fetch("https://api.skyvern.com/...", { ... });
+      // Validate, then append a history doc rather than overwriting.
+    }
+  },
+);
+------------------------------------------------------------------------------
+
+Deploy: firebase deploy --only functions
+
+CLOUD FUNCTIONS NOTES:
+- TypeScript only — the SAME Admin SDK and the SAME data rules as everything
+  else (§6). No new language, no new host.
+- Functions have execution-time limits. For most Pontus jobs (kick off a
+  Skyvern task, validate a webhook, write history) that is plenty. If a single
+  invocation must run for many minutes doing heavy local work, use Cloud Run.
+
+----- ESCAPE HATCH: Cloud Run (only when Python is genuinely required) -----
+If — and only if — a job truly needs long-running Python (e.g. local Playwright
+crawling at scale, pandas/ML), deploy a container to CLOUD RUN. It is
+Firebase/GCP-native (same Google project as your Firestore), so you stay on
+Vercel + Firebase rather than adding a third host. Use the Firebase Admin SDK
+for Python to read/write the SAME database, following the same rules:
+append history, set recorded_at with firestore.SERVER_TIMESTAMP, validate
+before writing, write to the DB never to files.
+
+  # minimal container
+  FROM python:3.12-slim
+  WORKDIR /app
+  COPY requirements.txt . && pip install --no-cache-dir -r requirements.txt
+  COPY . .
+  CMD ["python", "worker.py"]
+
+  # deploy (one command, no separate dashboard)
+  gcloud run deploy my-tool-worker --source . --region us-west1
+
+Reach for this last. Most "heavy backend" needs in practice are really "call
+Skyvern's API on a schedule", which a Cloud Function already covers.
+
+================================================================================
+SECTION 9 — ENVIRONMENT VARIABLES & SECRETS
+================================================================================
+
+----- .env.local (NEVER commit) -----
+# Firebase Web (CLIENT) config — safe to expose; these identify the project,
+# they are not secrets. Access is controlled by Firestore security rules.
+NEXT_PUBLIC_FIREBASE_API_KEY=AIza...
+NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=<project>.firebaseapp.com
+NEXT_PUBLIC_FIREBASE_PROJECT_ID=<project>
+NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET=<project>.appspot.com
+NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=000000000000
+NEXT_PUBLIC_FIREBASE_APP_ID=1:000000000000:web:abc123
+
+# Firebase ADMIN service account — SERVER ONLY, a real secret.
+# Paste the entire service-account JSON as a single-line string.
+FIREBASE_SERVICE_ACCOUNT_KEY={"type":"service_account","project_id":"...", ...}
+
+# App URL — used for internal fetches in server components
+NEXT_PUBLIC_APP_URL=http://localhost:3000
+
+# Per-project: scraping APIs, third-party services, etc.
+SKYVERN_API_KEY=...
+RESEND_API_KEY=...
+--------------------------------------
+
+----- .gitignore (must include these from FIRST commit) -----
+.env*.local
+.env
+node_modules/
+.next/
+out/
+# Firebase service-account files — NEVER commit these
+*serviceAccount*.json
+firebase-debug.log
+.firebase/
+.DS_Store
+-------------------------------------------------------------
+
+NON-NEGOTIABLE SECURITY RULES:
+- No API keys, secrets, or credentials in source code. Ever.
+- The Firebase service-account JSON is a FULL-ACCESS credential. Treat it like
+  a root password. It lives only in env vars / host dashboards, never in git.
+- .env.local is in .gitignore from the FIRST commit, not added later.
+- If a service-account key ever gets committed: revoke it immediately in the
+  Firebase console (Project settings → Service accounts) and generate a new
+  one. Git history is forever.
+- The NEXT_PUBLIC_FIREBASE_* values are safe to expose — they are the public
+  web config, not secrets. The thing that protects your data is your
+  firestore.rules file, NOT hiding the config. Write good rules.
+- FIREBASE_SERVICE_ACCOUNT_KEY is NEVER NEXT_PUBLIC_ prefixed and NEVER
+  imported into a "use client" component.
+
+================================================================================
+SECTION 10 — CLAUDE.md (paste verbatim, fill the project-specific section)
+================================================================================
+
+Every project has a CLAUDE.md at the repo root. This is the standing context
+Claude Code reads every session.
+
+----- CLAUDE.md -----
+# Pontus Internal Tool — Claude Code Context
+
+## Stack (non-negotiable)
+- Frontend: Next.js (App Router) + TypeScript
+- Styling: Tailwind + shadcn/ui + Geist (Sans + Mono)
+- Light backend: Next.js API routes (app/api/*)
+- Serverless jobs: Cloud Functions for Firebase (triggers / cron / light)
+- Heavy backend: Cloud Run container — ONLY if long-running Python is required
+- Database: Firestore via Firebase (top-level collection: "<tool_name>")
+- Auth: Firebase Authentication (only when user auth is needed)
+- Hosting: Vercel (frontend) + Firebase (data / functions). No Railway.
+
+## Rules
+- ALWAYS use shadcn components. Never hand-roll button/table/badge/input.
+- ALWAYS use the reference components from the UI Design System doc
+  (StatusBadge, StatCard, AppShell, PropertyTable). Never style status inline.
+- ALL numbers use `font-mono tabular-nums` and are right-aligned in tables.
+- ALL secrets via environment variables. NEVER in source code.
+- USE the modular Firebase v9+ SDK (import { getFirestore } from
+  "firebase/firestore"). NEVER the v8 / compat namespace style.
+- CLIENT SDK (lib/firebase.ts) in the browser; ADMIN SDK (lib/firebase-admin.ts)
+  on the server only. NEVER import firebase-admin into a "use client" file.
+- ONE top-level collection per tool; prefix everything with the tool name.
+- Every document has id, created_at, updated_at; set updated_at with
+  serverTimestamp() on EVERY write (no triggers exist).
+- APPEND history, don't overwrite — values changing over time go to a
+  `history` subcollection, not an in-place field update.
+- Firestore is deny-by-default in firestore.rules; writes go through server
+  API routes (Admin SDK). Allow client reads only when a dashboard needs them.
+- ONE primary button per view. Everything else is outline or ghost.
+- snake_case for Firestore collections/fields. camelCase in TypeScript.
+
+## Aesthetic
+Modern Linear/Vercel light mode. Light mode only. Background neutral-50,
+text neutral-950, ONE accent: blue-600. If a screen could plausibly have
+been designed in 2014, it's wrong.
+
+## Folder structure
+See the Tooling Template doc, section 2.
+
+## Project-specific (fill in per project)
+- Tool name: <e.g. Property Tax Registry>
+- Top-level collection: <e.g. property_tax>
+- Primary documents/subcollections: <e.g. properties, history>
+- External data sources: <e.g. county portals via Skyvern>
+- Key users: <e.g. Michael Press, analysts>
+---------------------
+
+================================================================================
+SECTION 11 — DEPLOYMENT
+================================================================================
+
+Same pipeline for every project. Two hosts: Vercel + Firebase.
+
+1. Push code to GitHub.
+2. Vercel connects to the repo and auto-deploys the Next.js app on every
+   push to main.
+3. Every branch and PR gets a preview deployment — a private URL for review
+   before merging.
+4. Firebase hosts the data from day one; nothing to provision beyond the
+   console setup in §3. Ship rules + indexes and functions via the CLI:
+       firebase deploy --only firestore:rules,firestore:indexes
+       firebase deploy --only functions
+5. Secrets live in the Vercel dashboard (and Firebase config for functions).
+   Change → redeploy → live. No code edits.
+6. (Rare) If a Cloud Run worker exists, it deploys with:
+       gcloud run deploy <name> --source . --region us-west1
+   Same Google project as Firestore — no extra host, no extra dashboard.
+
+----- vercel.json (project root, only if customizing) -----
+{
+  "buildCommand": "next build",
+  "framework": "nextjs"
+}
+-----------------------------------------------------------
+
+ENV VARS TO SET IN EACH HOST:
+- Vercel: all NEXT_PUBLIC_FIREBASE_* + FIREBASE_SERVICE_ACCOUNT_KEY +
+  NEXT_PUBLIC_APP_URL (set to the deployed URL in production).
+- Firebase Functions / Cloud Run (if used): FIREBASE_SERVICE_ACCOUNT_KEY is
+  not needed inside Firebase's own environment (the Admin SDK auto-initializes
+  there); set only per-project scraping keys (e.g. SKYVERN_API_KEY).
+
+================================================================================
+SECTION 12 — EXTERNAL DATA ACQUISITION PATTERN
+================================================================================
+
+When a project needs data from outside (scraping, APIs, third-party services),
+follow these patterns. The specific tool varies by source.
+
+CHOOSE THE TOOL BY SOURCE TYPE:
+
+SOURCE TYPE                              | RIGHT TOOL              | NOTES
+-----------------------------------------|-------------------------|----------
+JS-heavy portals with logins, CAPTCHAs,  | Skyvern                 | Government
+dynamic forms                            | (vision-based AI agent) | portals
+Predictable HTML pages, lots of them     | Playwright +            | Listings,
+                                         | BeautifulSoup           | catalogs
+Public APIs                              | Direct HTTP (httpx /    | Best path
+                                         | fetch)                  | when avail.
+Email ingestion, forwarded content       | n8n or Make.com         | Event-driven
+
+UNIVERSAL ACQUISITION RULES (every tool, every project):
+- ALWAYS write results to Firestore, never to files or memory. The database
+  is the contract between acquisition and the rest of the system.
+- DECOUPLE scraping from processing. The scraper's job is to get the data
+  and store it raw. Cleaning, normalization, scoring, and analysis happen
+  in separate steps that read from Firestore.
+- RESUMABILITY is mandatory. Any long scrape must survive a crash and pick
+  up where it left off. Track progress in a `scrape_state` collection, not
+  in process memory.
+- RATE-LIMIT and back off. Hammering a source gets you blocked. Build in
+  delays from the start; tune them down later.
+- VALIDATE output shape before writing. If a scraper returns malformed
+  data, fail the row, not the whole job — and log it for review.
+
+Example scrape_state document shape for resumability:
+
+----- property_tax/.../scrape_state document -----
+# collection: property_tax_scrape_state  (one doc per job+target)
+{
+  id:           "<job_name>__<target_id>",   # deterministic doc ID
+  job_name:     "tax_bill_check",
+  target_id:    "abc123",
+  status:       "pending",   # 'pending' | 'in_progress' | 'done' | 'failed'
+  error:        null,
+  attempted_at: <serverTimestamp | null>,
+  completed_at: <serverTimestamp | null>,
+  created_at:   <serverTimestamp>
+}
+# Use a deterministic doc ID (job_name__target_id) so re-runs upsert the same
+# doc instead of creating duplicates — Firestore's equivalent of UNIQUE().
+---------------------------------------------------
+
+================================================================================
+SECTION 13 — DO / DON'T QUICK REFERENCE
+================================================================================
+
+DO:
+- Put every collection under a tool-specific top-level prefix (never share)
+- Use snake_case in Firestore, camelCase in TypeScript
+- Store the doc ID inside the document as an `id` field
+- Add id / created_at / updated_at to every document
+- Set updated_at with serverTimestamp() on every write
+- Keep firestore.rules deny-by-default; commit rules + indexes to git
+- Append history docs to a subcollection, don't overwrite the parent
+- Use the Admin SDK only in server-side code (API routes, Cloud Functions, Cloud Run)
+- Use the modular v9+ Firebase SDK (function imports, tree-shakeable)
+- Store the service-account JSON in env vars, in the host dashboard
+- Put .env.local in .gitignore from the FIRST commit
+
+DON'T:
+- Share one collection across two tools
+- Use camelCase in Firestore or snake_case in TypeScript
+- Forget to set updated_at (there is no trigger to do it for you)
+- Overwrite a value when you should be appending a history doc
+- Disable security rules because "it's just an internal tool"
+- Import firebaseAdmin / adminDb into a "use client" component
+- Use the v8 / compat namespace API (import firebase from "firebase/compat/app")
+- Commit the service-account JSON, even once
+- Put the service-account key behind a NEXT_PUBLIC_ prefix
+
+================================================================================
+THE SINGLE MOST IMPORTANT INSTRUCTION
+================================================================================
+
+Before writing any new code, check: does a pattern for this already exist in
+this doc?
+- Need a Firebase client? Section 5.
+- Need an API route? Section 7.
+- Need to model a new collection? Section 6.
+- Need a scheduled/triggered job? Section 8 (Cloud Functions; Cloud Run only if Python).
+- Need to scrape something? Section 12.
+- Need to wire up secrets? Section 9.
+
+If yes, copy the reference verbatim and adapt names only. If no, the design
+might be wrong — talk it through in chat before writing code.
+
+================================================================================
+END OF INTERNAL TOOLS BUILD TEMPLATE CONTEXT FILE
+================================================================================
