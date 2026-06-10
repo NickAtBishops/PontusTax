@@ -27,7 +27,7 @@ except ModuleNotFoundError:
 
 from pontus_tax.config import Config
 from pontus_tax.orchestrator import execute_run
-from pontus_tax.store import FirestoreStore, LocalStore
+from pontus_tax.store import FirestoreStore, LocalStore, claim_next_queued
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,8 +63,13 @@ def main(argv: list[str] | None = None) -> int:
     elif args.run_id:
         store = FirestoreStore(cfg, args.run_id)
     else:
-        log.error("provide RUN_ID (env or --run-id) or --local-xlsx PATH")
-        return 2
+        # Cloud Run executions start argument-free: claim the oldest queued
+        # run (atomic) so triggering needs no container overrides.
+        run_id = claim_next_queued(cfg)
+        if run_id is None:
+            log.info("no queued runs — nothing to do")
+            return 0
+        store = FirestoreStore(cfg, run_id)
 
     if not args.dry_run and not cfg.skyvern_api_key:
         log.error("SKYVERN_API_KEY is not set (use --dry-run to test without it)")

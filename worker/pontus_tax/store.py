@@ -85,6 +85,44 @@ class RunStore(Protocol):
 # Firestore
 # ===========================================================================
 
+def claim_next_queued(cfg: Config) -> str | None:
+    """Find the oldest QUEUED run and claim it atomically (status → running).
+    Lets Cloud Run job executions start with no arguments — plain run.jobs.run
+    is enough to trigger them. Returns the claimed run id, or None."""
+    store = FirestoreStore(cfg, run_id="__sweep__")
+    from google.cloud import firestore
+
+    db = store.db()
+    snaps = list(
+        db.collection(FirestoreStore.RUNS)
+        .where("status", "==", "queued")
+        .limit(10)
+        .stream()
+    )
+    snaps.sort(key=lambda s: (s.create_time and s.create_time.timestamp()) or 0)
+
+    for snap in snaps:
+        ref = snap.reference
+        transaction = db.transaction()
+
+        @firestore.transactional
+        def _claim(tx, ref=ref):
+            doc = ref.get(transaction=tx)
+            if not doc.exists or doc.get("status") != "queued":
+                return False
+            tx.update(ref, {
+                "status": "running",
+                "started_at": firestore.SERVER_TIMESTAMP,
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            })
+            return True
+
+        if _claim(transaction):
+            log.info("claimed queued run %s", snap.id)
+            return snap.id
+    return None
+
+
 class FirestoreStore:
     RUNS = "tax_checker_runs"
     PLAYBOOKS = "tax_checker_playbooks"

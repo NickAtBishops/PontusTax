@@ -80,7 +80,7 @@ export async function POST(
 
   let trigger;
   try {
-    trigger = await triggerWorker(id, { RESUME: "1" });
+    trigger = await triggerWorker(id);
   } catch (e) {
     trigger = {
       triggered: false,

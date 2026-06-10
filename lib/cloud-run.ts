@@ -7,22 +7,19 @@ export interface TriggerResult {
 }
 
 /**
- * Kick one execution of the Cloud Run JOB that processes a run.
- * The job container receives RUN_ID (plus any extra env) as overrides.
+ * Kick one execution of the Cloud Run JOB. The job receives no arguments —
+ * it claims the oldest QUEUED run from Firestore itself (transactional), so
+ * plain run.jobs.run (roles/run.invoker on the job) is sufficient; no
+ * container overrides, no run.jobs.runWithOverrides.
  *
  * Requires:
  *   CLOUD_RUN_JOB     e.g. "tax-checker-worker"
  *   CLOUD_RUN_REGION  e.g. "us-west1"
- * and the service account (FIREBASE_SERVICE_ACCOUNT_KEY) holding
- * roles/run.developer (or run.invoker) on the job.
  *
  * When CLOUD_RUN_JOB is unset (local dev), the run stays "queued" and the
  * worker is started by hand: `cd worker && python main.py --run-id <id>`.
  */
-export async function triggerWorker(
-  runId: string,
-  extraEnv: Record<string, string> = {},
-): Promise<TriggerResult> {
+export async function triggerWorker(runId: string): Promise<TriggerResult> {
   const job = process.env.CLOUD_RUN_JOB;
   const region = process.env.CLOUD_RUN_REGION;
   if (!job || !region) {
@@ -45,16 +42,7 @@ export async function triggerWorker(
     `https://run.googleapis.com/v2/projects/${project}` +
     `/locations/${region}/jobs/${job}:run`;
 
-  const env = [
-    { name: "RUN_ID", value: runId },
-    ...Object.entries(extraEnv).map(([name, value]) => ({ name, value })),
-  ];
-
-  await client.request({
-    url,
-    method: "POST",
-    data: { overrides: { containerOverrides: [{ env }] } },
-  });
+  await client.request({ url, method: "POST", data: {} });
 
   return { triggered: true, detail: `Cloud Run job ${job} execution started` };
 }
