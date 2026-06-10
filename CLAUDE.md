@@ -361,3 +361,58 @@ cases the generic engine must reproduce:
   script per property.
 - This task = Excel in/out. Dashboard, Firestore persistence, alerts, appeals
   are later phases.
+
+---
+
+## 12. IMPLEMENTATION STATE (for the next session — system built 2026-06-10)
+
+**Session defaults are AUTOMATIC**: `.claude/settings.json` pins
+`model: claude-fable-5` + `effortLevel: xhigh` (≡ `/model claude-fable-5` +
+`/effort max`). Do not downgrade either for this project.
+
+§1–§11 above are the binding spec and are now FULLY IMPLEMENTED:
+
+| Piece | Where |
+|---|---|
+| Web app (upload → live runs dashboard → run detail → download) | `app/`, `components/`, `lib/` — Next.js 16 at repo ROOT, Vercel-targeted |
+| API routes (create/list/download/cancel/retry, Bearer-verified) | `app/api/runs/**` |
+| Engine: intake §2 / schema §3 / taxonomy §4 / extraction §5 / verify §6 / validate §7 / playbooks §8 / write-back §10 | `worker/pontus_tax/` (intake, identifiers, taxonomy, playbooks, prompts, extraction_schema, skyvern_runner, verify, validate, writeback, store, orchestrator) |
+| Tests (36; synthetic Florida workbook + dry-run pipeline) | `worker/tests/` → `npm run worker:test` |
+| Firestore: `tax_checker_runs/{id}/rows+events`, `tax_checker_playbooks`, `tax_checker_scrape_state` | rules deny-by-default; deploy with `npm run deploy:rules` |
+
+Live facts:
+- Firebase project **pontustax** (Blaze). Bucket `pontustax.firebasestorage.app`.
+  Admin key = `./serviceAccount.json` via `FIREBASE_SERVICE_ACCOUNT_KEY_FILE`
+  (gitignored; on Vercel paste the JSON one-line into
+  `FIREBASE_SERVICE_ACCOUNT_KEY` instead).
+- `scripts/firebase-status.js` = project health check + `.env.local` autofill.
+  `scripts/deploy-rules.js` = rules deploy via Rules API (the admin-SDK SA
+  cannot call serviceusage, so plain `firebase-tools deploy` 403s — use the
+  script).
+- Uploads stay **queued** until the Cloud Run JOB exists: deploy with
+  `gcloud run jobs deploy tax-checker-worker --source worker …` then set
+  `CLOUD_RUN_JOB`/`CLOUD_RUN_REGION` (.env.local + Vercel). Manual processing:
+  `cd worker && .venv/bin/python main.py --run-id <id>`; no-cloud dev:
+  `--local-xlsx file.xlsx [--dry-run]`.
+- `MAX_CONCURRENCY` = concurrent PORTALS (same-portal rows stay sequential +
+  polite — never raise the per-domain rate). Currently 10 in `.env.local`.
+
+Engineering invariants learned the hard way — keep them:
+- Row-doc IDs are zero-padded (`s00_r0003`) so `documentId()` order == sheet
+  order; the UI sorts by it. NO composite indexes by design — query
+  single-field, filter in code (`store.pending_keys`).
+- Column formula-protection is proportional (≥50% of non-empty cells), so a
+  totals-row SUM doesn't freeze a column; `_safe_write` guards per-cell.
+- A prior-year bill with a balance is DELINQUENT even if partially paid;
+  PARTIAL is only for current-cycle installments (§5.2/§7 interplay).
+- shadcn CLI is v4-style now: `init -b radix -p vega` (no `-b neutral`).
+- The UI design doc referenced in the header does NOT exist in Context/ —
+  UI rules come from the tools template §10 + its Aesthetic block.
+
+Housekeeping: `web/` + `python/` at root are dead Supabase-era dirs
+(gitignored — safe to delete); prototype preserved at
+`legacy/tax_retriever.py`. SECURITY: the service-account key was pasted into
+a chat transcript on 2026-06-10 — if `scripts/firebase-status.js` shows the
+key still valid and no rotation happened yet, prompt the user to rotate
+(console → new key → replace `./serviceAccount.json` → delete old key id
+`31383e0c…` in GCP IAM).

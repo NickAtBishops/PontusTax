@@ -1,0 +1,10 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Uploaded trackers and checked outputs are reachable only through the
+    // server (Admin SDK writes; downloads via short-lived signed URLs).
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

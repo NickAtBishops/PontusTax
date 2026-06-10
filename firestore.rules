@@ -1,0 +1,41 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // DEFAULT: deny everything. The Admin SDK (server API routes + the
+    // Cloud Run worker) is unaffected by rules. This blocks all *client*
+    // access unless a rule below explicitly allows it.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Signed-in Pontus users can READ run progress live from the browser
+    // (onSnapshot dashboards). All writes go through server API routes
+    // using the Admin SDK — never from the client.
+    match /tax_checker_runs/{runId} {
+      allow read: if request.auth != null;
+      allow write: if false;
+
+      match /rows/{rowId} {
+        allow read: if request.auth != null;
+        allow write: if false;
+      }
+
+      match /events/{eventId} {
+        allow read: if request.auth != null;
+        allow write: if false;
+      }
+    }
+
+    // Vendor playbook library — readable for auditing, server-written only.
+    match /tax_checker_playbooks/{vendorId} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+
+    // Scrape/resume state is worker-internal. No client access.
+    match /tax_checker_scrape_state/{stateId} {
+      allow read, write: if false;
+    }
+  }
+}
