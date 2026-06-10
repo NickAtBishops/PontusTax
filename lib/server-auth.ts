@@ -1,9 +1,37 @@
 import { NextResponse } from "next/server";
-import { adminAuth } from "@/lib/firebase-admin";
+import { createRemoteJWKSet, jwtVerify } from "jose";
+import { adminProjectId } from "@/lib/firebase-admin";
 
 export interface AuthedUser {
   uid: string;
   email: string | null;
+}
+
+// Firebase ID tokens are standard RS256 JWTs signed by Google's
+// securetoken service — verified here with jose per the documented
+// third-party-JWT method (firebase-admin/auth's dependency chain breaks
+// on Vercel). The JWKS is cached per server instance.
+const FIREBASE_JWKS = createRemoteJWKSet(
+  new URL(
+    "https://www.googleapis.com/service_accounts/v1/jwk/" +
+      "securetoken@system.gserviceaccount.com",
+  ),
+);
+
+async function verifyIdToken(
+  token: string,
+): Promise<{ uid: string; email: string | null }> {
+  const projectId = adminProjectId();
+  const { payload } = await jwtVerify(token, FIREBASE_JWKS, {
+    issuer: `https://securetoken.google.com/${projectId}`,
+    audience: projectId,
+    algorithms: ["RS256"],
+  });
+  if (!payload.sub) throw new Error("token has no subject");
+  return {
+    uid: payload.sub,
+    email: typeof payload.email === "string" ? payload.email : null,
+  };
 }
 
 /**
@@ -20,16 +48,16 @@ export async function requireUser(
     return NextResponse.json({ error: "Not signed in" }, { status: 401 });
   }
 
-  let decoded;
+  let decoded: { uid: string; email: string | null };
   try {
-    decoded = await adminAuth().verifyIdToken(token);
+    decoded = await verifyIdToken(token);
   } catch {
     return NextResponse.json({ error: "Invalid or expired session" }, {
       status: 401,
     });
   }
 
-  const email = decoded.email ?? null;
+  const email = decoded.email;
   const domains = (process.env.ALLOWED_EMAIL_DOMAINS ?? "")
     .split(",")
     .map((s) => s.trim().toLowerCase())

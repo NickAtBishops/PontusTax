@@ -26,3 +26,4 @@ python/
 
 # Test artifacts
 .pytest_cache/
+.vercel

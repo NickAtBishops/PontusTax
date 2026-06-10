@@ -1,8 +1,12 @@
 import { initializeApp, getApps, getApp, cert } from "firebase-admin/app";
 import { getFirestore, Firestore } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
-import { getAuth, Auth } from "firebase-admin/auth";
 import type { Bucket } from "@google-cloud/storage";
+
+// NOTE: firebase-admin/auth is deliberately NOT imported — its jwks-rsa →
+// jose require chain breaks under Vercel's external-module loader
+// (ERR_REQUIRE_ESM). ID tokens are verified with jose directly in
+// lib/server-auth.ts instead (the documented third-party-JWT method).
 
 // The service-account credential comes from either:
 //   FIREBASE_SERVICE_ACCOUNT_KEY       — the JSON itself as one line (Vercel), or
@@ -45,10 +49,6 @@ export function adminDb(): Firestore {
 
 export function adminBucket(): Bucket {
   return getStorage(getAdminApp()).bucket();
-}
-
-export function adminAuth(): Auth {
-  return getAuth(getAdminApp());
 }
 
 export function adminProjectId(): string {
