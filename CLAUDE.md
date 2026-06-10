@@ -408,6 +408,19 @@ unchanged and non-negotiable. Do not re-add the rich extraction without the
 user asking.
 
 Engineering invariants learned the hard way — keep them:
+- NEVER import firebase-admin/auth — its jwks-rsa→jose chain dies on Vercel
+  (ERR_REQUIRE_ESM). ID tokens are verified with jose in lib/server-auth.ts.
+- Cloud executions are SERIALIZED (claim_next_queued exits if a run is
+  active) and MAX_CONCURRENCY=2: the Skyvern plan's browser-session cap
+  mass-fails sessions (connect_over_cdp timeouts) at ~6 concurrent. Raising
+  concurrency requires a Skyvern plan upgrade, not a code change.
+- Job executions start ARGUMENT-FREE and claim the oldest queued run
+  (roles/run.invoker only covers plain run.jobs.run — overrides need more).
+- tax_checker/ in the Storage bucket is working state — console deletions
+  there killed live runs once (2026-06-10; recovered via 7-day soft delete).
+- The user's Vercel has had TWO projects; the real one is tax-project-qso5
+  (env vars live there, marked Sensitive = not CLI-pullable). Deploy with
+  `npx vercel deploy --prod` from the repo root (linked via .vercel/).
 - Row-doc IDs are zero-padded (`s00_r0003`) so `documentId()` order == sheet
   order; the UI sorts by it. NO composite indexes by design — query
   single-field, filter in code (`store.pending_keys`).
