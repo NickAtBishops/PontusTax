@@ -88,11 +88,30 @@ class RunStore(Protocol):
 def claim_next_queued(cfg: Config) -> str | None:
     """Find the oldest QUEUED run and claim it atomically (status → running).
     Lets Cloud Run job executions start with no arguments — plain run.jobs.run
-    is enough to trigger them. Returns the claimed run id, or None."""
+    is enough to trigger them. Returns the claimed run id, or None.
+
+    Executions are globally SERIALIZED: if another run is actively being
+    processed (status=running, touched in the last 30 min), exit instead —
+    two concurrent runs would stack browser sessions past the Skyvern
+    plan's cap (the observed cause of mass connect_over_cdp timeouts)."""
     store = FirestoreStore(cfg, run_id="__sweep__")
     from google.cloud import firestore
 
     db = store.db()
+
+    import datetime as _dt
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    for s in db.collection(FirestoreStore.RUNS).where(
+        "status", "in", ["running", "writing_back"]
+    ).limit(5).stream():
+        touched = s.update_time
+        if touched and (now - touched).total_seconds() < 1800:
+            log.info(
+                "run %s is active — exiting to respect the browser-session cap",
+                s.id,
+            )
+            return None
     snaps = list(
         db.collection(FirestoreStore.RUNS)
         .where("status", "==", "queued")
