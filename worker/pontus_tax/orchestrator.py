@@ -358,6 +358,11 @@ class RowProcessor:
             rec = build_account_record(group.display, extraction, verdict)
             return rec, False
 
+        # Technical failures (Skyvern transport/browser errors) are
+        # UNREACHABLE — the Retry button re-queues them. NEEDS_REVIEW is
+        # reserved for business outcomes a human must look at.
+        if last_reason.startswith("skyvern"):
+            return _unreachable_record(group.display, last_reason), False
         return _needs_review_record(group.display, last_reason), False
 
     # ------------------------------------------------------------------
