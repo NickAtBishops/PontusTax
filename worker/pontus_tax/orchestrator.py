@@ -551,6 +551,16 @@ async def execute_run(
     playbooks = store.load_playbooks()
     processor = RowProcessor(cfg, runner, playbooks, store, dry_run, today)
 
+    # Reap any browser sessions left over from a prior killed/crashed
+    # execution before opening new ones — runs are serialized, so anything
+    # still open now is orphaned and is eating the plan's session quota.
+    if not dry_run:
+        reaped = await runner.reap_orphaned_sessions()
+        if reaped:
+            store.log_event(
+                "info", f"reaped {reaped} orphaned browser session(s) at startup"
+            )
+
     # Group by portal domain — same portal: one session, sequential, polite.
     by_domain: dict[str, list[RowJob]] = {}
     for job in todo:

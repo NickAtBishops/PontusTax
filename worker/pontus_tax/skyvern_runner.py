@@ -219,3 +219,33 @@ class SkyvernRunner:
             except Exception:  # noqa: BLE001
                 pass
         self._sessions.clear()
+
+    async def reap_orphaned_sessions(self) -> int:
+        """Close EVERY browser session the org currently has open.
+
+        Runs are serialized (claim_next_queued allows only one active run),
+        so any session alive at the START of a run is necessarily orphaned
+        from a previous execution — and safe to close. This is the backstop
+        that makes leaks impossible to accumulate: close_all() handles the
+        clean finish, but a hard SIGKILL/OOM/timeout skips it; the next run
+        then reaps whatever was left behind. Returns the number closed.
+        """
+        try:
+            client = self._sdk()
+            sessions = await client.get_browser_sessions()
+        except Exception as exc:  # noqa: BLE001 — never block a run on cleanup
+            log.warning("could not list browser sessions to reap: %s", exc)
+            return 0
+        closed = 0
+        for s in sessions or []:
+            sid = getattr(s, "browser_session_id", None)
+            if not sid:
+                continue
+            try:
+                await client.close_browser_session(sid)
+                closed += 1
+            except Exception:  # noqa: BLE001
+                pass
+        if closed:
+            log.info("reaped %d orphaned browser session(s) at startup", closed)
+        return closed

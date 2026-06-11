@@ -430,6 +430,17 @@ Engineering invariants learned the hard way — keep them:
   crashed run is marked failed (not re-queued) so the loop can't spin; the
   job's 6h timeout bounds it. roles/run.invoker only covers plain
   run.jobs.run — overrides need more.
+- Browser sessions are REAPED at run start (2026-06-11): execute_run calls
+  runner.reap_orphaned_sessions() (get_browser_sessions → close each) before
+  opening any. Safe because runs are serialized, so anything open at startup
+  is orphaned from a prior killed/crashed execution. close_all() still runs in
+  the finally for the clean finish; the startup reap is the backstop for hard
+  SIGKILL/OOM/timeout that skips finally — together they stop sessions
+  accumulating against the plan's session cap. The cap itself is NOT readable
+  via the Skyvern API (org_get omits it); only max_steps_per_run (=10, steps
+  per task, NOT concurrency) is exposed. Observed effective concurrent-session
+  ceiling on the current plan is ~2 — requesting more yields 503/403 on the
+  surplus sessions, which surface as UNREACHABLE rows.
 - Cancel is ON-THE-SPOT (2026-06-11): a watcher polls cancel_requested every
   CANCEL_POLL_SECONDS (5s) and, on cancel, `work.cancel()`s the in-flight
   Skyvern tasks immediately (CancelledError aborts the run_task await) rather
