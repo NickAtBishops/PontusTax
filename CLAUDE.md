@@ -375,7 +375,7 @@ cases the generic engine must reproduce:
 | Piece | Where |
 |---|---|
 | Web app (upload → live runs dashboard → run detail → download) | `app/`, `components/`, `lib/` — Next.js 16 at repo ROOT, Vercel-targeted |
-| API routes (create/list/download/cancel/retry, Bearer-verified) | `app/api/runs/**` |
+| API routes (create/list/download/cancel/retry, UNAUTHENTICATED) | `app/api/runs/**` |
 | Engine: intake §2 / schema §3 / taxonomy §4 / extraction §5 / verify §6 / validate §7 / playbooks §8 / write-back §10 | `worker/pontus_tax/` (intake, identifiers, taxonomy, playbooks, prompts, extraction_schema, skyvern_runner, verify, validate, writeback, store, orchestrator) |
 | Tests (36; synthetic Florida workbook + dry-run pipeline) | `worker/tests/` → `npm run worker:test` |
 | Firestore: `tax_checker_runs/{id}/rows+events`, `tax_checker_playbooks`, `tax_checker_scrape_state` | rules deny-by-default; deploy with `npm run deploy:rules` |
@@ -397,6 +397,14 @@ Live facts:
 - `MAX_CONCURRENCY` = concurrent PORTALS (same-portal rows stay sequential +
   polite — never raise the per-domain rate). Currently 10 in `.env.local`.
 
+**AUTH REMOVED (2026-06-11, user decision, risks acknowledged):** the site
+is fully public — no Firebase Auth, no sign-in UI, no Bearer checks on
+`app/api/runs/**`, Firestore reads on `tax_checker_runs`/`playbooks` are
+`allow read: if true`. Anyone with the URL can view data, download
+workbooks, and start paid runs. `lib/server-auth.ts`, `auth-provider`,
+`auth-gate` were deleted (`ConfigGate` keeps the env-setup screen); `jose`
+uninstalled. Do not re-add auth without the user asking.
+
 **FAST-MODE PIVOT (2026-06-10, user decision — overrides §3/§5 detail):**
 the product question is ONE number per property — “amount left to pay now.”
 The Skyvern schema/prompts extract only amount_due_now (+ owner/situs/parcel
@@ -409,7 +417,8 @@ user asking.
 
 Engineering invariants learned the hard way — keep them:
 - NEVER import firebase-admin/auth — its jwks-rsa→jose chain dies on Vercel
-  (ERR_REQUIRE_ESM). ID tokens are verified with jose in lib/server-auth.ts.
+  (ERR_REQUIRE_ESM). (Auth is currently removed; if it returns, verify ID
+  tokens with jose directly, as the deleted lib/server-auth.ts did.)
 - Cloud executions are SERIALIZED (claim_next_queued exits if a run is
   active) and MAX_CONCURRENCY=2: the Skyvern plan's browser-session cap
   mass-fails sessions (connect_over_cdp timeouts) at ~6 concurrent. Raising

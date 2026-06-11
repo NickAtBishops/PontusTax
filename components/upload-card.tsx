@@ -4,15 +4,13 @@ import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { FileSpreadsheet, UploadCloud, X } from "lucide-react";
 import { toast } from "sonner";
-import { useAuth } from "@/components/auth-provider";
-import { authedFetch, readError } from "@/lib/api";
+import { readError } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 
 export function UploadCard() {
   const router = useRouter();
-  const { getToken } = useAuth();
   const inputRef = useRef<HTMLInputElement>(null);
   const [file, setFile] = useState<File | null>(null);
   const [dragging, setDragging] = useState(false);
@@ -33,7 +31,7 @@ export function UploadCard() {
     try {
       const form = new FormData();
       form.append("file", file);
-      const res = await authedFetch(getToken, "/api/runs", {
+      const res = await fetch("/api/runs", {
         method: "POST",
         body: form,
       });

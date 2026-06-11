@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { FieldValue } from "firebase-admin/firestore";
 import { adminDb, adminBucket } from "@/lib/firebase-admin";
-import { requireUser, isErrorResponse } from "@/lib/server-auth";
 import { triggerWorker } from "@/lib/cloud-run";
 import { COLLECTIONS } from "@/lib/types";
 
@@ -13,10 +12,7 @@ export const dynamic = "force-dynamic";
 const MAX_FILE_BYTES = 4 * 1024 * 1024;
 
 // GET /api/runs — list runs (newest first)
-export async function GET(req: Request) {
-  const user = await requireUser(req);
-  if (isErrorResponse(user)) return user;
-
+export async function GET() {
   try {
     const snapshot = await adminDb()
       .collection(COLLECTIONS.runs)
@@ -33,9 +29,6 @@ export async function GET(req: Request) {
 
 // POST /api/runs — upload a workbook and queue a check run
 export async function POST(req: Request) {
-  const user = await requireUser(req);
-  if (isErrorResponse(user)) return user;
-
   try {
     const form = await req.formData();
     const file = form.get("file");
@@ -79,7 +72,7 @@ export async function POST(req: Request) {
       error: null,
       trigger_error: null,
       cancel_requested: false,
-      requested_by: { uid: user.uid, email: user.email },
+      requested_by: null,
       totals: {
         rows: 0,
         processed: 0,

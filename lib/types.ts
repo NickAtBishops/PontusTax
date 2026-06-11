@@ -69,7 +69,7 @@ export interface RunDoc {
   error: string | null;
   trigger_error: string | null;
   cancel_requested: boolean;
-  requested_by: { uid: string; email: string | null };
+  requested_by: { uid: string; email: string | null } | null;
   totals: RunTotals;
   sheets: SheetMapping[] | null;
   summary: RunSummary | null;

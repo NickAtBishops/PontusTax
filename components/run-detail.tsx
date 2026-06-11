@@ -20,8 +20,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { db } from "@/lib/firebase";
-import { useAuth } from "@/components/auth-provider";
-import { authedFetch, readError } from "@/lib/api";
+import { readError } from "@/lib/api";
 import {
   COLLECTIONS,
   type AccountRecord,
@@ -55,7 +54,6 @@ import {
 } from "@/components/ui/table";
 
 export function RunDetail({ runId }: { runId: string }) {
-  const { getToken } = useAuth();
   const [run, setRun] = useState<RunDoc | null | undefined>(undefined);
   const [rows, setRows] = useState<RowDoc[]>([]);
   const [selected, setSelected] = useState<RowDoc | null>(null);
@@ -105,7 +103,7 @@ export function RunDetail({ runId }: { runId: string }) {
   async function act(path: string, label: string) {
     setBusy(path);
     try {
-      const res = await authedFetch(getToken, path, { method: "POST" });
+      const res = await fetch(path, { method: "POST" });
       if (!res.ok) toast.error(await readError(res));
       else toast.success(label);
     } catch (e) {
@@ -118,7 +116,7 @@ export function RunDetail({ runId }: { runId: string }) {
   async function download() {
     setBusy("download");
     try {
-      const res = await authedFetch(getToken, `/api/runs/${runId}/download`);
+      const res = await fetch(`/api/runs/${runId}/download`);
       if (!res.ok) {
         toast.error(await readError(res));
         return;

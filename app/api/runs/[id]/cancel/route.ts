@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { FieldValue } from "firebase-admin/firestore";
 import { adminDb } from "@/lib/firebase-admin";
-import { requireUser, isErrorResponse } from "@/lib/server-auth";
 import { COLLECTIONS } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -10,12 +9,9 @@ export const dynamic = "force-dynamic";
 // POST /api/runs/:id/cancel — ask the worker to stop after the current row.
 // Already-checked rows are still written back to the output workbook.
 export async function POST(
-  req: Request,
+  _req: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
-  const user = await requireUser(req);
-  if (isErrorResponse(user)) return user;
-
   const { id } = await params;
   const ref = adminDb().collection(COLLECTIONS.runs).doc(id);
   const doc = await ref.get();

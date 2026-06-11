@@ -10,7 +10,7 @@ The task spec is `CLAUDE.md`; build standards live in `Context/`.
 ## Architecture
 
 ```
-Browser (Next.js on Vercel, Firebase Auth)
+Browser (Next.js on Vercel — no sign-in; the site and its data are public)
    │  upload .xlsx                      live progress (Firestore onSnapshot)
    ▼
 Next.js API routes (Admin SDK) ──────► Firestore  tax_checker_runs/{run}/rows
@@ -83,14 +83,13 @@ the repo-root `.env` — already present from the prototype era.
 3. **Build → Firestore Database** → Create database (production mode).
 4. **Build → Storage** → Get started (note the bucket name →
    `FIREBASE_STORAGE_BUCKET` / `STORAGE_BUCKET`).
-5. **Build → Authentication** → Sign-in method → enable **Google**.
-6. **Project settings → Service accounts → Generate new private key** →
+5. **Project settings → Service accounts → Generate new private key** →
    save the downloaded file as `./serviceAccount.json` (gitignored) and set
    `FIREBASE_SERVICE_ACCOUNT_KEY_FILE=./serviceAccount.json`. (Vercel has no
    filesystem — there you paste the JSON as ONE line into
    `FIREBASE_SERVICE_ACCOUNT_KEY`; generate it with
    `node -e "console.log(JSON.stringify(require('./serviceAccount.json')))" | pbcopy`.)
-7. Deploy rules:
+6. Deploy rules:
 
 ```bash
 npm run deploy:rules      # uses ./serviceAccount.json — no firebase login needed

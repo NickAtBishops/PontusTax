@@ -5,8 +5,8 @@ import type { Bucket } from "@google-cloud/storage";
 
 // NOTE: firebase-admin/auth is deliberately NOT imported — its jwks-rsa →
 // jose require chain breaks under Vercel's external-module loader
-// (ERR_REQUIRE_ESM). ID tokens are verified with jose directly in
-// lib/server-auth.ts instead (the documented third-party-JWT method).
+// (ERR_REQUIRE_ESM). (Auth was removed entirely on 2026-06-11; if it ever
+// comes back, verify ID tokens with jose directly, not firebase-admin/auth.)
 
 // The service-account credential comes from either:
 //   FIREBASE_SERVICE_ACCOUNT_KEY       — the JSON itself as one line (Vercel), or

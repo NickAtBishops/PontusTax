@@ -2,9 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Building2, LayoutDashboard, LogOut } from "lucide-react";
-import { useAuth } from "@/components/auth-provider";
-import { Button } from "@/components/ui/button";
+import { Building2, LayoutDashboard } from "lucide-react";
 import { Separator } from "@/components/ui/separator";
 import { cn } from "@/lib/utils";
 
@@ -20,7 +18,6 @@ export function AppShell({
   children: React.ReactNode;
 }) {
   const pathname = usePathname();
-  const { user, signOut } = useAuth();
 
   return (
     <div className="flex min-h-screen">
@@ -52,22 +49,6 @@ export function AppShell({
             </Link>
           ))}
         </nav>
-        <Separator />
-        <div className="flex items-center justify-between gap-2 p-4">
-          <div className="min-w-0">
-            <p className="truncate text-xs text-muted-foreground">
-              {user?.email ?? "—"}
-            </p>
-          </div>
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => signOut()}
-            title="Sign out"
-          >
-            <LogOut className="h-4 w-4" />
-          </Button>
-        </div>
       </aside>
 
       <div className="flex min-w-0 flex-1 flex-col">

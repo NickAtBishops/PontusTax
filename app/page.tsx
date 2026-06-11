@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { AuthGate } from "@/components/auth-gate";
+import { ConfigGate } from "@/components/config-gate";
 import { AppShell } from "@/components/app-shell";
 import { UploadCard } from "@/components/upload-card";
 import { RunsTable } from "@/components/runs-table";
@@ -24,7 +24,7 @@ export default function DashboardPage() {
   const latestDue = latest?.totals?.amount_due ?? null;
 
   return (
-    <AuthGate>
+    <ConfigGate>
       <AppShell title="Dashboard">
         <UploadCard />
         <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
@@ -50,6 +50,6 @@ export default function DashboardPage() {
         </div>
         <RunsTable onRuns={setRuns} />
       </AppShell>
-    </AuthGate>
+    </ConfigGate>
   );
 }

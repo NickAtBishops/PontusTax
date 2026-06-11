@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { FieldValue } from "firebase-admin/firestore";
 import { adminDb } from "@/lib/firebase-admin";
-import { requireUser, isErrorResponse } from "@/lib/server-auth";
 import { triggerWorker } from "@/lib/cloud-run";
 import { COLLECTIONS } from "@/lib/types";
 
@@ -12,12 +11,9 @@ export const dynamic = "force-dynamic";
 // portal unreachable) and start a new worker execution. Business outcomes
 // like NEEDS_REVIEW are deliberate results and are NOT retried automatically.
 export async function POST(
-  req: Request,
+  _req: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
-  const user = await requireUser(req);
-  if (isErrorResponse(user)) return user;
-
   const { id } = await params;
   const db = adminDb();
   const runRef = db.collection(COLLECTIONS.runs).doc(id);
