@@ -70,6 +70,7 @@ class RunStore(Protocol):
     def mark_in_progress(self, key: str) -> None: ...
     def save_outcome(self, key: str, outcome: RowOutcome) -> None: ...
     def mark_failed(self, key: str, error: str, outcome: RowOutcome) -> None: ...
+    def reset_in_progress(self) -> int: ...
     def cancel_requested(self) -> bool: ...
     def set_status(self, status: str) -> None: ...
     def collect_outcomes(self) -> dict[str, RowOutcome]: ...
@@ -393,6 +394,31 @@ class FirestoreStore:
         })
         self._run_ref().update(tally)
 
+    def reset_in_progress(self) -> int:
+        """Flip rows still IN_PROGRESS back to PENDING — used after an
+        on-the-spot cancel, whose aborted rows would otherwise be stuck
+        in_progress. They read as NOT CHECKED and are retryable. Returns
+        the number reset."""
+        # Single-field query + filter in code (no composite index — §12).
+        states = (
+            self.db()
+            .collection(self.SCRAPE_STATE)
+            .where("run_id", "==", self.run_id)
+            .stream()
+        )
+        reset = 0
+        for snap in states:
+            if snap.get("status") != "in_progress":
+                continue
+            reset += 1
+            snap.reference.update({"status": "pending", "updated_at": self._ts()})
+            key = snap.get("target_id")
+            self._run_ref().collection("rows").document(key).update({
+                "state": "pending",
+                "updated_at": self._ts(),
+            })
+        return reset
+
     def cancel_requested(self) -> bool:
         snap = self._run_ref().get(field_paths=["cancel_requested"])
         return bool(snap.exists and snap.get("cancel_requested"))
@@ -547,6 +573,9 @@ class LocalStore:
     def mark_failed(self, key: str, error: str, outcome: RowOutcome) -> None:
         self.outcomes[key] = outcome
         log.error("✗ %s failed: %s", key, error)
+
+    def reset_in_progress(self) -> int:
+        return 0
 
     def cancel_requested(self) -> bool:
         return False

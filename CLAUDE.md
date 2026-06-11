@@ -420,11 +420,25 @@ Engineering invariants learned the hard way — keep them:
   (ERR_REQUIRE_ESM). (Auth is currently removed; if it returns, verify ID
   tokens with jose directly, as the deleted lib/server-auth.ts did.)
 - Cloud executions are SERIALIZED (claim_next_queued exits if a run is
-  active) and MAX_CONCURRENCY=2: the Skyvern plan's browser-session cap
-  mass-fails sessions (connect_over_cdp timeouts) at ~6 concurrent. Raising
-  concurrency requires a Skyvern plan upgrade, not a code change.
-- Job executions start ARGUMENT-FREE and claim the oldest queued run
-  (roles/run.invoker only covers plain run.jobs.run — overrides need more).
+  active). The Skyvern plan's browser-session cap mass-fails sessions
+  (connect_over_cdp timeouts) at ~6 concurrent, so MAX_CONCURRENCY past ~5
+  needs a plan upgrade, not a code change. (User set the job's
+  MAX_CONCURRENCY=10 on 2026-06-11 anyway — watch for an UNREACHABLE spike.)
+- Job executions start ARGUMENT-FREE and DRAIN the queue: main.py loops
+  claim_next_queued → execute_run until none are left, so the queue empties
+  without a fresh `gcloud run jobs execute` per run (added 2026-06-11). A
+  crashed run is marked failed (not re-queued) so the loop can't spin; the
+  job's 6h timeout bounds it. roles/run.invoker only covers plain
+  run.jobs.run — overrides need more.
+- Cancel is ON-THE-SPOT (2026-06-11): a watcher polls cancel_requested every
+  CANCEL_POLL_SECONDS (5s) and, on cancel, `work.cancel()`s the in-flight
+  Skyvern tasks immediately (CancelledError aborts the run_task await) rather
+  than waiting out the up-to-8-min attempt. Aborted rows are left in_progress
+  → `store.reset_in_progress()` flips them back to pending (NOT CHECKED,
+  retryable) before write-back. Skyvern still bills server-side for steps the
+  aborted tasks already took. Do NOT use `gcloud run jobs executions cancel`
+  — it kills the worker with no output workbook and leaves the run doc
+  `running`, blocking the queue for 30 min.
 - tax_checker/ in the Storage bucket is working state — console deletions
   there killed live runs once (2026-06-10; recovered via 7-day soft delete).
 - The user's Vercel has had TWO projects; the real one is tax-project-qso5

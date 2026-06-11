@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import datetime as dt
 import logging
 import os
@@ -39,6 +40,12 @@ from .writeback import output_filename, write_output
 from . import pdf_bill
 
 log = logging.getLogger("pontus_tax.orchestrator")
+
+# How often the cancel watcher polls the run's cancel_requested flag while
+# rows are in flight. On cancel it aborts the in-flight Skyvern tasks
+# immediately (not at the next row boundary), so a cancel lands within this
+# window plus the few seconds write-back takes.
+CANCEL_POLL_SECONDS = 5.0
 
 
 @dataclass
@@ -556,16 +563,19 @@ async def execute_run(
     canceled = False
 
     async def run_domain(domain: str, domain_jobs: list[RowJob]) -> None:
-        nonlocal canceled
         async with sem:
             for job in domain_jobs:
-                if canceled or store.cancel_requested():
-                    canceled = True
+                if canceled:
                     return
                 store.mark_in_progress(job.key)
                 try:
                     outcome = await processor.process(job)
                     store.save_outcome(job.key, outcome)
+                except asyncio.CancelledError:
+                    # Cancel requested mid-row: abort on the spot. The row
+                    # keeps its in_progress state and gets no outcome, so
+                    # write-back reports it NOT CHECKED (retryable).
+                    raise
                 except Exception as exc:  # noqa: BLE001 — never abort the run
                     err = f"{type(exc).__name__}: {exc}"
                     log.error("[%s] row failed: %s\n%s", job.key, err,
@@ -584,12 +594,40 @@ async def execute_run(
                     )
                     store.mark_failed(job.key, err, oc)
 
+    work = asyncio.gather(*(
+        run_domain(d, js) for d, js in sorted(by_domain.items())
+    ))
+
+    async def watch_cancel() -> None:
+        # Poll the cancel flag while rows run; on cancel, abort the in-flight
+        # tasks immediately rather than waiting for them to finish.
+        nonlocal canceled
+        while not work.done():
+            if store.cancel_requested():
+                canceled = True
+                log.info("cancel requested — aborting %d in-flight row(s)",
+                         cfg.max_concurrency)
+                work.cancel()
+                return
+            await asyncio.sleep(CANCEL_POLL_SECONDS)
+
+    watcher = asyncio.ensure_future(watch_cancel())
     try:
-        await asyncio.gather(*(
-            run_domain(d, js) for d, js in sorted(by_domain.items())
-        ))
+        await work
+    except asyncio.CancelledError:
+        canceled = True
     finally:
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
         await runner.close_all()
+
+    # Rows aborted mid-flight by an on-the-spot cancel are left in_progress;
+    # flip them back to pending so they read NOT CHECKED and stay retryable.
+    if canceled:
+        n = store.reset_in_progress()
+        if n:
+            log.info("cancel: reset %d in-flight row(s) to pending", n)
 
     # ---- write-back (§10): every planned row gets a line ----------------
     store.set_status("writing_back")
