@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import {
   collection,
   doc,
@@ -29,6 +30,7 @@ import {
 } from "@/lib/types";
 import { fmtDateTime, fmtMoney } from "@/lib/format";
 import { AppShell } from "@/components/app-shell";
+import { DeleteRunButton } from "@/components/delete-run-button";
 import { StatusBadge } from "@/components/status-badge";
 import { StatCard } from "@/components/stat-card";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -54,6 +56,7 @@ import {
 } from "@/components/ui/table";
 
 export function RunDetail({ runId }: { runId: string }) {
+  const router = useRouter();
   const [run, setRun] = useState<RunDoc | null | undefined>(undefined);
   const [rows, setRows] = useState<RowDoc[]>([]);
   const [selected, setSelected] = useState<RowDoc | null>(null);
@@ -173,6 +176,15 @@ export function RunDetail({ runId }: { runId: string }) {
               <Download className="h-4 w-4" />
               Download checked workbook
             </Button>
+          )}
+          {run && isTerminal && (
+            <DeleteRunButton
+              runId={runId}
+              fileName={run.file_name}
+              status={run.status}
+              variant="full"
+              onDeleted={() => router.push("/")}
+            />
           )}
         </>
       }

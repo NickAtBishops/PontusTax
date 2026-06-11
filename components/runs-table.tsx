@@ -13,6 +13,7 @@ import { db } from "@/lib/firebase";
 import { COLLECTIONS, type RunDoc } from "@/lib/types";
 import { fmtMoney, fmtRelative } from "@/lib/format";
 import { StatusBadge } from "@/components/status-badge";
+import { DeleteRunButton } from "@/components/delete-run-button";
 import { Card } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import {
@@ -64,13 +65,14 @@ export function RunsTable({
             <TableHead className="text-right">Left to pay</TableHead>
             <TableHead className="text-right">Review</TableHead>
             <TableHead className="text-right">Started</TableHead>
+            <TableHead className="w-10" />
           </TableRow>
         </TableHeader>
         <TableBody>
           {runs === null ? (
             <TableRow>
               <TableCell
-                colSpan={6}
+                colSpan={7}
                 className="py-8 text-center text-sm text-muted-foreground"
               >
                 Loading…
@@ -79,7 +81,7 @@ export function RunsTable({
           ) : runs.length === 0 ? (
             <TableRow>
               <TableCell
-                colSpan={6}
+                colSpan={7}
                 className="py-8 text-center text-sm text-muted-foreground"
               >
                 No runs yet — upload a tracker above.
@@ -133,6 +135,13 @@ export function RunsTable({
                   </TableCell>
                   <TableCell className="text-right text-sm whitespace-nowrap text-muted-foreground">
                     {fmtRelative(run.created_at)}
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <DeleteRunButton
+                      runId={run.id}
+                      fileName={run.file_name}
+                      status={run.status}
+                    />
                   </TableCell>
                 </TableRow>
               );
