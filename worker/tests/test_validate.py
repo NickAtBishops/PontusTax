@@ -3,6 +3,7 @@ import datetime as dt
 from pontus_tax.canonical import (
     DELINQUENT, NEEDS_REVIEW, PAID, UNPAID,
     HIGH, LOW, MEDIUM,
+    AccountRecord,
     aggregate_status,
 )
 from pontus_tax.validate import (
@@ -97,3 +98,38 @@ def test_status_notes_short_form():
 
     all_paid = build_row_note([paid, paid, paid], PAID, TODAY)
     assert all_paid == "All 3 accounts paid — $0.00 due"
+
+
+def test_account_record_roundtrip_includes_new_fields():
+    # New optional fields default safely and roundtrip through to_dict /
+    # constructor without drift — store._outcome_doc relies on asdict for
+    # Firestore serialization, so this guards against silent field loss.
+    rec = AccountRecord(
+        account_searched="74-43-43-21-01-043-0050",
+        status=UNPAID,
+        amount_due=4974.48,
+        ultimate_payment_due=4974.48,
+        date_paid="2025-12-29",
+        amount_paid=4974.48,
+        due_dates=["2026-03-31"],
+    )
+    d = rec.to_dict()
+
+    # New fields present with the right values.
+    assert d["ultimate_payment_due"] == 4974.48
+    assert d["due_dates"] == ["2026-03-31"]
+    # Existing-but-now-first-class fields untouched.
+    assert d["date_paid"] == "2025-12-29"
+    assert d["amount_paid"] == 4974.48
+
+    # Defaults are safe.
+    blank = AccountRecord(account_searched="x")
+    blank_dict = blank.to_dict()
+    assert blank_dict["ultimate_payment_due"] is None
+    assert blank_dict["due_dates"] == []
+
+    # Reconstructing from the serialized dict round-trips exactly.
+    reborn = AccountRecord(**d)
+    assert reborn.ultimate_payment_due == 4974.48
+    assert reborn.due_dates == ["2026-03-31"]
+    assert reborn == rec

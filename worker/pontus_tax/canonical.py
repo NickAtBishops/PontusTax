@@ -46,11 +46,21 @@ class AccountRecord:
     amount_billed: float | None = None
     amount_paid: float | None = None
     amount_due: float | None = None
+    # Final amount actually due on the bill after any current early-payment
+    # discount AND any past-due penalties/interest — the portal's "final
+    # answer". Distinct from amount_due, which is the live owed snapshot;
+    # often equal, but may differ when a discount window is active. None
+    # when no balance remains (fully paid).
+    ultimate_payment_due: float | None = None
     date_paid: str | None = None
     receipt: str | None = None
     paid_by: str | None = None
     assessed_value: float | None = None
     next_due_date: str | None = None
+    # Remaining installment deadlines for the target tax year (ISO yyyy-mm-dd).
+    # Multiple entries for jurisdictions with multiple installments (CA has
+    # two; FL typically one with discount windows). Empty when fully paid.
+    due_dates: list[str] = field(default_factory=list)
     prior_year_balance: bool | None = None
     page_timestamp: str | None = None
     source_url: str | None = None

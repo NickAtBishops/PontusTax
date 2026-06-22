@@ -1,9 +1,14 @@
 """The data-extraction schema handed to Skyvern for every portal task.
 
-FAST MODE: one question per property — the total amount still owed RIGHT
-NOW. No receipts, no payment history, no per-year tables. The only extra
-fields are the identity fields needed to verify the right property was
-read (§6) and the navigation outcome.
+Primary answer remains amount_due_now (the total still owed right now).
+A small set of structured payment fields layer on top for analyst-facing
+clarity: ultimate_payment_due (after-discount/after-penalty final figure),
+payment_date / payment_amount (most recent posted payment), and due_dates
+(remaining installment deadlines). All payment fields are optional and
+nullable; only page_outcome and amount_due_now are required.
+
+Identity fields (owner / situs / parcel) are still here to verify the
+right property was read (§6).
 """
 
 from __future__ import annotations
@@ -45,6 +50,41 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
                 "'Total Amount Due', 'Total Payable', 'Balance Due', 'Amount "
                 "Due'). 0 if everything is paid — that is a normal, correct "
                 "answer. null ONLY if no due figure could be found at all."
+            ),
+        },
+        "ultimate_payment_due": {
+            "type": ["number", "string", "null"],
+            "description": (
+                "The final amount actually due on the bill after any current "
+                "early-payment discount AND any past-due penalties/interest "
+                "— the 'final answer' the portal shows. Often equal to "
+                "amount_due_now; differs when a discount window is active "
+                "(e.g. FL November pay-by-month tiers). Null if the bill is "
+                "fully paid and no balance remains."
+            ),
+        },
+        "payment_date": {
+            "type": ["string", "null"],
+            "description": (
+                "Most recent payment posted date for this bill, ISO "
+                "yyyy-mm-dd preferred. Null if no payment is shown."
+            ),
+        },
+        "payment_amount": {
+            "type": ["number", "string", "null"],
+            "description": (
+                "Amount of the most recent payment posted for this bill. "
+                "Null if no payment is shown."
+            ),
+        },
+        "due_dates": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Remaining installment due dates for this tax year (ISO "
+                "yyyy-mm-dd). Multiple entries when the jurisdiction has "
+                "multiple installments. Empty array when fully paid or no "
+                "future deadlines remain."
             ),
         },
         "includes_delinquency": {

@@ -87,11 +87,18 @@ export interface AccountRecord {
   amount_billed: number | null;
   amount_paid: number | null;
   amount_due: number | null;
+  /** Bill's final due after current discounts and/or past-due penalties — the
+   * portal's "final answer". Often equal to amount_due; differs during a
+   * discount window. Null when fully paid. */
+  ultimate_payment_due: number | null;
   date_paid: string | null;
   receipt: string | null;
   paid_by: string | null;
   assessed_value: number | null;
   next_due_date: string | null;
+  /** Remaining installment deadlines for the target tax year (ISO yyyy-mm-dd).
+   * Multiple entries when the jurisdiction has multiple installments. */
+  due_dates: string[];
   prior_year_balance: boolean | null;
   page_timestamp: string | null;
   source_url: string | null;
