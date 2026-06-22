@@ -193,11 +193,38 @@ def build_account_record(
 # --------------------------------------------------------------------------
 
 def account_phrase(rec: AccountRecord, as_of: dt.date) -> str:
+    # PAID with structured payment evidence → spec wording:
+    #   "PAID in full $X on YYYY-MM-DD (Receipt R, paid by Y)"
+    # PAID without it → preserve the existing short form.
     if rec.status == PAID:
+        if rec.amount_paid is not None and (rec.date_paid or rec.receipt):
+            head = f"PAID in full {fmt_money(rec.amount_paid)}"
+            if rec.date_paid:
+                head += f" on {rec.date_paid}"
+            details = []
+            if rec.receipt:
+                details.append(f"Receipt {rec.receipt}")
+            if rec.paid_by:
+                details.append(f"paid by {rec.paid_by}")
+            if details:
+                head += f" ({', '.join(details)})"
+            return head
         return "Paid — $0.00 due"
+    # DELINQUENT / UNPAID: surface ultimate_payment_due when present (ISO date
+    # in the new wording); otherwise keep the legacy "owed as of M/D/YYYY".
     if rec.status == DELINQUENT:
+        if rec.ultimate_payment_due is not None and rec.ultimate_payment_due > 0.005:
+            return (
+                f"DELINQUENT — ultimate payment due "
+                f"{fmt_money(rec.ultimate_payment_due)} as of {as_of.isoformat()}"
+            )
         return f"DELINQUENT — {fmt_money(rec.amount_due)} owed as of {fmt_date(as_of)}"
     if rec.status == UNPAID:
+        if rec.ultimate_payment_due is not None and rec.ultimate_payment_due > 0.005:
+            return (
+                f"OWES ultimate payment due "
+                f"{fmt_money(rec.ultimate_payment_due)} as of {as_of.isoformat()}"
+            )
         return f"OWES {fmt_money(rec.amount_due)} as of {fmt_date(as_of)}"
     if rec.status == UNREACHABLE:
         return "NEEDS REVIEW — portal unreachable"

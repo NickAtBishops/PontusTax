@@ -86,6 +86,31 @@ def test_writeback_protections_and_new_column(florida_workbook, tmp_path):
     assert ws["N5"].value == 120802.06
 
 
+def test_main_sheet_layout_unchanged(florida_workbook, tmp_path):
+    # The output workbook must contain exactly the input sheets, with only
+    # the two appended columns (Amount Due + monthly-update status) as
+    # additions. No second sheet, no extra columns beyond those two.
+    intake = parse_workbook(florida_workbook)
+    out_path = str(tmp_path / "out.xlsx")
+    write_output(intake, _outcomes(), RUN_DATE, out_path)
+
+    in_wb = load_workbook(florida_workbook)
+    out_wb = load_workbook(out_path)
+
+    # Sheet count + names unchanged — guards against accidental Authorities
+    # / metadata sheets ever sneaking back in.
+    assert out_wb.sheetnames == in_wb.sheetnames == ["Florida Prop Tax"]
+
+    in_ws, out_ws = in_wb["Florida Prop Tax"], out_wb["Florida Prop Tax"]
+    # Header row width: original had 23 cols (A..W); output adds exactly 2.
+    in_header_max = max(c for c in range(1, in_ws.max_column + 1)
+                        if in_ws.cell(row=2, column=c).value is not None)
+    out_header_max = max(c for c in range(1, out_ws.max_column + 1)
+                         if out_ws.cell(row=2, column=c).value is not None)
+    assert in_header_max == 23
+    assert out_header_max == 25
+
+
 def test_unprocessed_rows_are_marked_not_skipped(florida_workbook, tmp_path):
     intake = parse_workbook(florida_workbook)
     outcomes = _outcomes()

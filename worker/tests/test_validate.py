@@ -100,6 +100,48 @@ def test_status_notes_short_form():
     assert all_paid == "All 3 accounts paid — $0.00 due"
 
 
+def test_row_note_includes_ultimate_due_for_delinquent():
+    # ultimate_payment_due present → new wording with ISO date.
+    ext = _extraction(123456.78, delinquent=True)
+    ext["ultimate_payment_due"] = 123456.78
+    rec = build_account_record("504209AB0120", ext, VERDICT)
+    assert build_row_note([rec], DELINQUENT, TODAY) == (
+        "DELINQUENT — ultimate payment due $123,456.78 as of 2026-06-09"
+    )
+
+    # No ultimate_payment_due → legacy wording preserved (the existing
+    # test_status_notes_short_form already covers this; here we cross-check
+    # that an UNPAID with ultimate_payment_due also switches.)
+    ext_unpaid = _extraction(600)
+    ext_unpaid["ultimate_payment_due"] = 600
+    rec_unpaid = build_account_record("999", ext_unpaid, VERDICT)
+    assert build_row_note([rec_unpaid], UNPAID, TODAY) == (
+        "OWES ultimate payment due $600.00 as of 2026-06-09"
+    )
+
+
+def test_row_note_paid_in_full_format_with_receipt():
+    # PAID with payment_amount + payment_date + receipt → spec wording.
+    # Manually construct because Skyvern returns 'receipt' under that key
+    # and build_account_record doesn't (today) overwrite it from extraction
+    # — receipt comes from the existing rich-extraction path. Set it
+    # directly on the record after build to test the formatter cleanly.
+    ext = _extraction(0)
+    ext["payment_amount"] = 4974.48
+    ext["payment_date"] = "2025-12-29"
+    rec = build_account_record("12345", ext, VERDICT)
+    rec.receipt = "N12292025P015431"
+    rec.paid_by = "Robert Machin Jr"
+    assert build_row_note([rec], PAID, TODAY) == (
+        "PAID in full $4,974.48 on 2025-12-29 "
+        "(Receipt N12292025P015431, paid by Robert Machin Jr)"
+    )
+
+    # PAID without payment evidence → legacy short form survives.
+    bare = build_account_record("12345", _extraction(0), VERDICT)
+    assert build_row_note([bare], PAID, TODAY) == "Paid — $0.00 due"
+
+
 def test_ultimate_due_status_contradiction_downgrades_to_needs_review():
     # Page reports $0 owed (so build_account_record decides PAID) but the
     # ultimate_payment_due field says $1,234 is still due — that's a real
