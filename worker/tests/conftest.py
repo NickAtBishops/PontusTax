@@ -97,10 +97,27 @@ def florida_workbook(tmp_path):
     ws["Q5"] = "=N5+O5"
     ws["S5"] = "KEEP-ME-123"  # pre-existing receipt must never be erased
 
-    # Row 6 — totals row: SUM formulas only, no identity → not a data row
-    ws["N6"] = "=SUM(N3:N5)"
-    ws["O6"] = "=SUM(O3:O5)"
-    ws["Q6"] = "=SUM(Q3:Q5)"
+    # Row 6 — Putnam (CLAUDE.md §9): dense bill page, PAID with FL Dec 3%
+    # discount. Single-account, gross $5,128.33 → paid $4,974.48 on 2025-12-29.
+    # Canonical case for ultimate_payment_due < amount_billed + payment
+    # evidence on the same page.
+    ws["A6"] = "800 Reid St"
+    ws["B6"] = "Palatka"
+    ws["C6"] = "FL"
+    ws["D6"] = "32177"
+    ws["E6"] = "Putnam"
+    ws["F6"] = "Pontus EHC Putnam LLC"
+    ws["G6"] = "VP4604"
+    ws["H6"] = "R09-009-009"
+    ws["I6"] = 2025
+    ws["N6"] = 5128.33
+    ws["Q6"] = "=N6+O6"
+    ws["W6"] = "https://putnam.county-taxes.net/public"
+
+    # Row 7 — totals row: SUM formulas only, no identity → not a data row
+    ws["N7"] = "=SUM(N3:N6)"
+    ws["O7"] = "=SUM(O3:O6)"
+    ws["Q7"] = "=SUM(Q3:Q6)"
 
     path = tmp_path / "Property Taxes- Florida.xlsx"
     wb.save(path)

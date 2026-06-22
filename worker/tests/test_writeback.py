@@ -79,7 +79,7 @@ def test_writeback_protections_and_new_column(florida_workbook, tmp_path):
 
     # Formulas everywhere are untouched
     assert ws["Q3"].value == "=N3+O3"
-    assert ws["N6"].value == "=SUM(N3:N5)"
+    assert ws["N7"].value == "=SUM(N3:N6)"
 
     # Live owed amount NOT written into installment grids (multiple amount
     # columns) — it rides the status note instead

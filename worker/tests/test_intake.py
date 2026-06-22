@@ -53,7 +53,7 @@ def test_formula_total_column_protected_but_not_sum_row_columns(florida_workbook
 
 def test_data_rows_exclude_totals_row(florida_workbook):
     sheet = parse_workbook(florida_workbook).sheets[0]
-    assert [r.row_number for r in sheet.rows] == [3, 4, 5]
+    assert [r.row_number for r in sheet.rows] == [3, 4, 5, 6]
 
 
 def test_url_from_hyperlink_and_multi_account_cell(florida_workbook):
