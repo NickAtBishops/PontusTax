@@ -321,24 +321,113 @@ cases the generic engine must reproduce:
 
 ---
 
-## 10. WRITE-BACK SPEC
+## 10. WRITE-BACK SPEC — fixed-layout PTAX_Master model
 
-1. Load/save with openpyxl preserving everything: formatting, widths, merged
-   header rows, hyperlinks, images, ALL formulas.
-2. Write only into detected canonical columns: amounts owed (if unpaid),
-   date_paid, receipt/confirmation, assessed_value (if newly seen) — and a
-   **NEW status column** following the workbook's own naming pattern (Florida
-   uses "<Month> <Year> Update" → add e.g. `June 2026 Update`). One
-   human-readable line per row:
-   `Paid in full $4,974.48 on 12/29/2025 (Receipt N12292025P015431, paid by Robert Machin Jr)` /
-   `DELINQUENT — $123,456.78 owed as of 6/9/2026` /
-   `NEEDS REVIEW — account not found`.
-3. Unverified rows keep old values + a NEEDS_REVIEW note. **No row is ever
-   silently skipped.**
-4. Output = copy with suffix (`… — checked 2026-06-09.xlsx`) to the download
-   path; the original upload is never modified.
-5. Produce a run summary: counts by status, the column mapping used, any new
-   vendor playbook entries (§4.7), rows needing human review and why.
+`templates/PTAX_Master.xlsx` is the canonical column layout going forward.
+Per-run free-text dump columns are gone. The checker writes into fixed
+structured cells the template exposes by header name (NEVER by letter),
+overwritten cleanly every run.
+
+### 10.1 The four checker-target cells (S–V on PTAX_Master)
+
+Detected by header text (case-insensitive, whitespace-tolerant, NOT
+paraphrase-tolerant — `intake.STRICT_HEADERS`):
+
+| Header (verbatim)      | Field                  | Type written      | Format          |
+|------------------------|------------------------|-------------------|-----------------|
+| Ultimate payment due   | `ultimate_payment_due` | number            | `"$"#,##0.00`   |
+| Payment date           | `payment_date` → `date_paid` | datetime    | `yyyy-mm-dd`    |
+| Payment amount         | `payment_amount` → `amount_paid` | number  | `"$"#,##0.00`   |
+| Next due date          | `next_due_date`        | datetime          | `yyyy-mm-dd`    |
+
+Cream-yellow fill (`FFFFF8DC`) on these cells is the analyst's visual cue;
+`_write_structured_cell` saves+restores the per-cell fill/font/alignment
+around every overwrite so the cue survives.
+
+### 10.2 Notes column — single fixed cell, NOT a per-run append
+
+The human-readable status sentence (and any in-run corrections) overwrites
+ONE notes cell per row. Resolution (`_resolve_notes_column`):
+1. Rightmost existing `<Month> YYYY Update` column wins (older Florida-
+   style workbooks; the historical month-stamped columns to its left are
+   left alone as artifacts).
+2. Existing `Last run notes` column from a prior run, by header match.
+3. Otherwise create `Last run notes` exactly ONCE on first run, at
+   `ws.max_column + 1`. Subsequent runs find it via (2) and never grow
+   the sheet again.
+
+Sentences (built by `validate.account_phrase` / `build_row_note`):
+- `PAID in full $4,974.48 on 2025-12-29 (Receipt N12292025P015431, paid by Robert Machin Jr)`
+- `DELINQUENT — ultimate payment due $123,456.78 as of 2026-06-09`
+- `NEEDS REVIEW — contradiction: ultimate due $X but reported PAID — flagged for human review`
+- `NOT CHECKED — run ended before this row`
+
+Portal-receipt corrections append to the sentence:
+- `corrected payment date from 2026-11-13 to 2025-11-13 per portal receipt`
+
+### 10.3 Routing rules
+
+- `row_status in {NEEDS_REVIEW, UNREACHABLE}` → skip every S–V write; the
+  notes sentence carries the reason.
+- `confidence == LOW` → skip every S–V write; notes-only.
+- Otherwise → overwrite each detected S–V cell cleanly, preserving fill.
+- `cross_check_ultimate_due` runs upstream in `build_account_record`:
+  ultimate>0 with status=PAID flips to NEEDS_REVIEW (orchestrator's gate
+  then leaves every `write_*` field unset); ultimate≈0 with payment
+  evidence upgrades UNPAID/PARTIAL → PAID.
+
+### 10.4 Non-overwrite guarantees (§7)
+
+- Blank/None never overwrites a real existing value.
+- The original upload is never modified; output is a dated copy
+  (`… — checked 2026-06-09.xlsx`).
+- Formulas everywhere are left alone (`_safe_write` refuses formula cells).
+- **No row is ever silently skipped** — missing-outcome rows get
+  `NOT CHECKED — run ended before this row` in the notes cell.
+
+### 10.5 PROTECTED COLUMNS — hard rule, enforced by guard
+
+W–AJ on PTAX_Master are reserved for analyst-filled values and formulas.
+**The checker must NEVER write to any of them**:
+
+| Cols | Family                            | Source           |
+|------|-----------------------------------|------------------|
+| W–Y  | Jurisdiction Links                | analyst-filled   |
+| Z–AC | BOV — Single Broker               | analyst-filled   |
+| AD–AF| BOV — Median of Multiple          | analyst-filled   |
+| AG   | Actual assessment                 | analyst-filled (Stage 2: maybe scraped) |
+| AH   | Variance ($)                      | EXCEL FORMULA `=AG-AE` |
+| AI   | Variance (%)                      | EXCEL FORMULA `=IF(AE=0,"",AH/AE)` |
+| AJ   | Appeal flag                       | EXCEL FORMULA — nested IF on 15/10/7% |
+
+`writeback._assert_writable_column` raises `WritebackGuardError` on ANY
+write attempt past column V that isn't the resolved notes column. The
+error message names the offending column letter and header. Touching
+AH/AI/AJ specifically would replace formulas with hardcoded values and
+break the variance chain forever — the guard exists precisely to make
+that bug loud.
+
+Legacy fields whose synonyms happen to land on a protected column
+(notably `assessed_value` matching "Actual assessment" at AG) are
+pre-checked in the writeback loop and skipped silently; the guard
+remains as a safety net for genuinely unintended writes.
+
+### 10.6 Missing-header behavior
+
+If the four S–V headers aren't in the uploaded workbook, the structured
+writes are no-ops for those columns and the run still proceeds; the
+notes sentence carries the verification result. The run summary
+surfaces the column mapping used so a missing template is visible at a
+glance.
+
+### 10.7 Run summary
+
+Counts by status, the column mapping used, any new vendor playbook
+entries (§4.7), rows needing human review and why. `status_column_header`
+in the summary now reports the resolved notes-column name (e.g.
+`May 2026 Update` for legacy Florida workbooks, `Last run notes` for
+PTAX_Master); `amount_column_header` is `null` — no Amount Due column is
+ever appended.
 
 ---
 
