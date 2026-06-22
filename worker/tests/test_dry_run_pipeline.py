@@ -24,17 +24,20 @@ def test_dry_run_full_pipeline(florida_workbook):
     summary = asyncio.run(execute_run(store, cfg, dry_run=True))
 
     assert summary["status_counts"] == {"NEEDS_REVIEW": 4}
-    assert summary["status_column_header"].endswith("Update")
-    assert summary["amount_column_header"].startswith("Amount Due")
+    # Notes column for the legacy Florida fixture is "May 2026 Update" —
+    # the rightmost existing month-update column, overwritten per run.
+    # No per-run Amount Due column anymore.
+    assert summary["status_column_header"] == "May 2026 Update"
+    assert summary["amount_column_header"] is None
     assert len(summary["review_rows"]) == 4
 
     out_dir = os.path.dirname(store.output_local)
     outputs = glob.glob(os.path.join(out_dir, "* — checked *.xlsx"))
     assert outputs, "checked workbook must be produced even on a dry run"
     ws = load_workbook(outputs[0])["Florida Prop Tax"]
+    # Notes land at V (col 22) for the Florida fixture under the new model.
     for row in (3, 4, 5, 6):
-        assert "dry run" in str(ws.cell(row=row, column=25).value)
-        assert ws.cell(row=row, column=24).value is None  # nothing invented
+        assert "dry run" in str(ws.cell(row=row, column=22).value)
 
     summaries = glob.glob(
         os.path.join(os.path.dirname(florida_workbook), "* — summary *.json")
@@ -105,15 +108,14 @@ def test_payment_fields_propagate_end_to_end(florida_workbook, monkeypatch):
     assert saved.amount_paid == 4974.48
     assert saved.date_paid == "2025-12-29"
 
-    # The new wording reaches the workbook's status column.
+    # The new wording reaches the workbook's notes column (V for the
+    # legacy Florida fixture — overwriting "May 2026 Update").
     outputs = glob.glob(
         os.path.join(os.path.dirname(store.output_local), "* — checked *.xlsx")
     )
     ws = load_workbook(outputs[0])["Florida Prop Tax"]
-    assert ws.cell(row=6, column=25).value == (
+    assert ws.cell(row=6, column=22).value == (
         "PAID in full $4,974.48 on 2025-12-29"
     )
-    # Verified-paid → $0.00 in the dedicated Amount Due column.
-    assert ws.cell(row=6, column=24).value == 0.0
     # The relocated SUM row remains intact at row 7.
     assert ws["N7"].value == "=SUM(N3:N6)"

@@ -40,7 +40,14 @@ def _outcomes():
     }
 
 
-def test_writeback_protections_and_new_column(florida_workbook, tmp_path):
+def test_writeback_protections_and_notes_column(florida_workbook, tmp_path):
+    # New layout (§10): no per-run column append. The notes sentence
+    # OVERWRITES the rightmost existing month-update column — here "May
+    # 2026 Update" at column V — every run. The dedicated Amount Due
+    # column has been removed entirely; live owed values reach the
+    # workbook only via the existing canonical amounts column (or, on
+    # installment grids with multiple amount columns, only via the
+    # notes sentence).
     with open(florida_workbook, "rb") as fh:
         original_bytes = fh.read()
 
@@ -52,47 +59,69 @@ def test_writeback_protections_and_new_column(florida_workbook, tmp_path):
     with open(florida_workbook, "rb") as fh:
         assert fh.read() == original_bytes
     assert out_path.endswith("Property Taxes- Florida — checked 2026-06-09.xlsx")
-    assert headers["Florida Prop Tax"]["amount"] == "Amount Due — June 2026"
-    assert headers["Florida Prop Tax"]["status"] == "June 2026 Update"
+    # Return shape now exposes only the notes-column header (no "amount").
+    assert headers["Florida Prop Tax"] == {"status": "May 2026 Update"}
+    assert "amount" not in headers["Florida Prop Tax"]
 
     ws = load_workbook(out_path)["Florida Prop Tax"]
 
-    # Two new columns after Website (W=23): X=Amount Due, Y=status note
-    assert ws["X2"].value == "Amount Due — June 2026"
-    assert ws["Y2"].value == "June 2026 Update"
-    assert ws["Y3"].value.startswith("Paid in full $4,974.48")
-    assert ws["Y4"].value == "NEEDS REVIEW — account not found"
-    assert ws["Y5"].value.startswith("DELINQUENT")
+    # Notes land in V (May 2026 Update) — overwritten cleanly per run.
+    assert ws["V2"].value == "May 2026 Update"  # header itself is untouched
+    assert ws["V3"].value.startswith("Paid in full $4,974.48")
+    assert ws["V4"].value == "NEEDS REVIEW — account not found"
+    assert ws["V5"].value.startswith("DELINQUENT")
 
-    # Amount Due column: $0.00 for verified paid, the live owed figure for
-    # delinquent, BLANK for unverified rows (never invented)
-    assert ws["X3"].value == 0.0
-    assert ws["X4"].value is None
-    assert ws["X5"].value == 123456.78
+    # April 2026 Update (U) is a HISTORICAL artifact — left alone.
+    # The fixture's row 3 has "Paud in full" pre-typed in U; that survives.
+    assert ws["U3"].value == "Paud in full"
 
-    # Verified payment details written into their canonical columns
+    # Verified payment details still write into their canonical columns
+    # (R = Date Paid, S = Paid Confirmation #).
     assert ws["R3"].value == dt.datetime(2025, 12, 29)
     assert ws["S3"].value == "N12292025P015431"
 
-    # LOW/NEEDS_REVIEW results never reach data cells (§7)
+    # LOW/NEEDS_REVIEW results never reach data cells (§7).
     assert ws["S4"].value is None
-
-    # No silent erasure: existing receipt survives a conflicting scrape
+    # No silent erasure: existing receipt survives a conflicting scrape.
     assert ws["S5"].value == "KEEP-ME-123"
 
-    # Formulas everywhere are untouched
+    # Formulas everywhere are untouched.
     assert ws["Q3"].value == "=N3+O3"
     assert ws["N7"].value == "=SUM(N3:N6)"
-
-    # Live owed amount NOT written into installment grids (multiple amount
-    # columns) — it rides the status note instead
+    # Live owed amount NOT written into installment grids (multiple
+    # amounts columns) — it rides the notes sentence instead.
     assert ws["N5"].value == 120802.06
 
 
+def test_no_new_column_appended(florida_workbook, ptax_master_workbook, tmp_path):
+    # Two back-to-back runs on the same output must not grow the sheet.
+    # Florida case: month-update column already exists → no new column
+    # ever. PTAX case: 'Last run notes' is created exactly once on run
+    # one and reused on run two.
+    for label, fixture in (
+        ("florida", florida_workbook),
+        ("ptax", ptax_master_workbook),
+    ):
+        first = str(tmp_path / f"{label}-run1.xlsx")
+        second = str(tmp_path / f"{label}-run2.xlsx")
+        intake = parse_workbook(fixture)
+        write_output(intake, _outcomes(), RUN_DATE, first)
+        # Second run loads the run-1 output as its input — the realistic
+        # repeated-run case.
+        intake2 = parse_workbook(first)
+        write_output(intake2, _outcomes(), RUN_DATE, second)
+        ws1 = load_workbook(first).worksheets[0]
+        ws2 = load_workbook(second).worksheets[0]
+        assert ws1.max_column == ws2.max_column, (
+            f"{label}: max_column grew between back-to-back runs "
+            f"({ws1.max_column} → {ws2.max_column})"
+        )
+
+
 def test_main_sheet_layout_unchanged(florida_workbook, tmp_path):
-    # The output workbook must contain exactly the input sheets, with only
-    # the two appended columns (Amount Due + monthly-update status) as
-    # additions. No second sheet, no extra columns beyond those two.
+    # Under the fixed-layout model (§10) the sheet width never grows on
+    # legacy workbooks: notes overwrite the rightmost existing month-
+    # update column, no per-run column append.
     intake = parse_workbook(florida_workbook)
     out_path = str(tmp_path / "out.xlsx")
     write_output(intake, _outcomes(), RUN_DATE, out_path)
@@ -105,13 +134,12 @@ def test_main_sheet_layout_unchanged(florida_workbook, tmp_path):
     assert out_wb.sheetnames == in_wb.sheetnames == ["Florida Prop Tax"]
 
     in_ws, out_ws = in_wb["Florida Prop Tax"], out_wb["Florida Prop Tax"]
-    # Header row width: original had 23 cols (A..W); output adds exactly 2.
     in_header_max = max(c for c in range(1, in_ws.max_column + 1)
                         if in_ws.cell(row=2, column=c).value is not None)
     out_header_max = max(c for c in range(1, out_ws.max_column + 1)
                          if out_ws.cell(row=2, column=c).value is not None)
     assert in_header_max == 23
-    assert out_header_max == 25
+    assert out_header_max == 23
 
 
 # ---------------------------------------------------------------------------
@@ -189,5 +217,5 @@ def test_unprocessed_rows_are_marked_not_skipped(florida_workbook, tmp_path):
     out_path = str(tmp_path / "out.xlsx")
     write_output(intake, outcomes, RUN_DATE, out_path)
     ws = load_workbook(out_path)["Florida Prop Tax"]
-    assert ws["Y5"].value == "NOT CHECKED — run ended before this row"
-    assert ws["X5"].value is None  # unknown — never invented
+    # Notes column for the legacy Florida fixture is V (May 2026 Update).
+    assert ws["V5"].value == "NOT CHECKED — run ended before this row"

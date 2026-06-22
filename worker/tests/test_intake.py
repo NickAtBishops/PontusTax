@@ -70,9 +70,22 @@ def test_url_from_hyperlink_and_multi_account_cell(florida_workbook):
 
 
 def test_status_column_follows_workbook_pattern(florida_workbook):
+    # Legacy Florida-style workbooks have month-update columns; the new
+    # write-back model OVERWRITES the rightmost one every run instead of
+    # appending a fresh per-run column.
     sheet = parse_workbook(florida_workbook).sheets[0]
     assert sheet.update_columns, "April/May 2026 Update columns should be detected"
-    assert status_column_header(sheet, dt.date(2026, 6, 9)) == "June 2026 Update"
+    assert status_column_header(sheet) == "May 2026 Update"
+
+
+def test_status_column_defaults_to_last_run_notes_on_fresh_template(
+    ptax_master_workbook,
+):
+    # PTAX_Master has no month-update column → the writeback creates
+    # 'Last run notes' once; the header function reports that name.
+    sheet = parse_workbook(ptax_master_workbook).sheets[0]
+    assert sheet.update_columns == []
+    assert status_column_header(sheet) == "Last run notes"
 
 
 # ---------------------------------------------------------------------------

@@ -19,7 +19,7 @@ from openpyxl.utils import get_column_letter
 
 from .canonical import NEEDS_REVIEW, PAID, UNREACHABLE, LOW, RowOutcome
 from .intake import (
-    SheetIntake, WorkbookIntake, amount_column_header, status_column_header,
+    NOTES_HEADER_DEFAULT, SheetIntake, WorkbookIntake, status_column_header,
 )
 from .validate import parse_date, parse_money
 
@@ -129,6 +129,31 @@ def _last_used_column(ws, sheet: SheetIntake) -> int:
     return last or ws.max_column
 
 
+def _resolve_notes_column(ws, sheet: SheetIntake) -> int:
+    """Return the single column index the notes sentence is written into.
+
+    Three-branch rule (§10):
+    1. Rightmost existing '<Month> YYYY Update' column wins (older
+       Florida-style workbooks; historical month-stamped columns to its
+       left are left untouched as artifacts).
+    2. Existing 'Last run notes' column from a prior run on the same
+       workbook (lookup by header text, case-insensitive).
+    3. Otherwise create 'Last run notes' exactly once, at the rightmost
+       column position, with a reasonable width.
+    """
+    if sheet.update_columns:
+        return sheet.update_columns[-1].index
+    target_name = NOTES_HEADER_DEFAULT.strip().lower()
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(row=sheet.header_row, column=c).value
+        if v is not None and str(v).strip().lower() == target_name:
+            return c
+    new_col = _last_used_column(ws, sheet) + 1
+    ws.cell(row=sheet.header_row, column=new_col).value = NOTES_HEADER_DEFAULT
+    ws.column_dimensions[get_column_letter(new_col)].width = 52
+    return new_col
+
+
 def write_output(
     intake: WorkbookIntake,
     outcomes: dict[str, RowOutcome],
@@ -136,7 +161,17 @@ def write_output(
     out_path: str,
 ) -> dict[str, dict[str, str]]:
     """Produce the checked copy. Returns
-    {sheet_name: {"amount": <amount due header>, "status": <status header>}}."""
+    {sheet_name: {"status": <notes column header>}}.
+
+    The new fixed-layout model (§10) does NOT append per-run columns.
+    The status sentence overwrites a single notes cell whose column is
+    resolved by `_resolve_notes_column`: the rightmost pre-existing
+    month-update column on legacy workbooks, or a 'Last run notes'
+    column created exactly once on first run for fresh layouts.
+
+    `run_date` is retained as the as-of date the calling note-builder
+    may use when composing the sentence; the writeback itself no longer
+    derives a per-run column name from it."""
     wb = load_workbook(intake.path, data_only=False)
     headers_added: dict[str, dict[str, str]] = {}
 
@@ -145,34 +180,12 @@ def write_output(
         data_rows = [r.row_number for r in sheet.rows]
         data_start, data_end = min(data_rows), max(data_rows)
 
-        # ---- TWO new columns (§10.2): live Amount Due, then the status
-        # note named after the workbook's own pattern --------------------
-        amount_col = _last_used_column(ws, sheet) + 1
-        status_col = amount_col + 1
-        amount_header = amount_column_header(sheet, run_date)
-        status_header = status_column_header(sheet, run_date)
-        headers_added[sheet.name] = {
-            "amount": amount_header,
-            "status": status_header,
-        }
-
-        def _style_header(col: int, text: str, width: float) -> None:
-            cell = ws.cell(row=sheet.header_row, column=col)
-            cell.value = text
-            if sheet.update_columns:
-                pattern_col = sheet.update_columns[-1]
-                src = ws.cell(row=sheet.header_row, column=pattern_col.index)
-                cell.font = copy(src.font)
-                cell.fill = copy(src.fill)
-                cell.border = copy(src.border)
-                cell.alignment = copy(src.alignment)
-                src_width = ws.column_dimensions[pattern_col.letter].width
-                if src_width and width > 30:
-                    width = src_width
-            ws.column_dimensions[get_column_letter(col)].width = width
-
-        _style_header(amount_col, amount_header, 16)
-        _style_header(status_col, status_header, 52)
+        # ---- Notes column: single, fixed-position, overwritten per run.
+        notes_col = _resolve_notes_column(ws, sheet)
+        notes_header = str(
+            ws.cell(row=sheet.header_row, column=notes_col).value or ""
+        ).strip() or status_column_header(sheet)
+        headers_added[sheet.name] = {"status": notes_header}
 
         date_info = sheet.first_col("date_paid")
         conf_info = sheet.first_col("confirmation")
@@ -193,7 +206,7 @@ def write_output(
         for row in sheet.rows:
             key = f"s{s_idx:02d}_r{row.row_number:04d}"
             outcome = outcomes.get(key)
-            note_cell = ws.cell(row=row.row_number, column=status_col)
+            note_cell = ws.cell(row=row.row_number, column=notes_col)
             if outcome is None:
                 # §10.3 — no row is ever silently skipped.
                 note_cell.value = "NOT CHECKED — run ended before this row"
@@ -205,20 +218,6 @@ def write_output(
                 outcome.row_status not in _WRITABLE_STATUSES_EXCLUDED
                 and outcome.confidence != LOW
             )
-
-            # ---- the dedicated Amount Due column ------------------------
-            # $0.00 = verified paid in full; the live owed total for open/
-            # delinquent rows; BLANK when unverified (never invented).
-            due_value: float | None = None
-            if allowed:
-                if outcome.row_status == PAID:
-                    due_value = 0.0
-                elif outcome.write_amount_due is not None:
-                    due_value = outcome.write_amount_due
-            if due_value is not None:
-                due_cell = ws.cell(row=row.row_number, column=amount_col)
-                due_cell.value = due_value
-                due_cell.number_format = '"$"#,##0.00'
 
             if not allowed:
                 continue

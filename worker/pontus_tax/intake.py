@@ -402,18 +402,20 @@ def parse_workbook(path: str) -> WorkbookIntake:
     return WorkbookIntake(path=path, sheets=sheets)
 
 
-def status_column_header(intake_sheet: SheetIntake, run_date: dt.date) -> str:
-    """New status column name following the workbook's own pattern (§10.2):
-    Florida-style '<Month> <Year> Update' when that pattern exists, else a
-    neutral 'Checked YYYY-MM-DD'."""
-    if intake_sheet.update_columns:
-        return f"{run_date.strftime('%B')} {run_date.year} Update"
-    return f"Checked {run_date.isoformat()}"
+NOTES_HEADER_DEFAULT = "Last run notes"
 
 
-def amount_column_header(intake_sheet: SheetIntake, run_date: dt.date) -> str:
-    """Header for the dedicated live amount-due column written next to the
-    status column: $0.00 = verified paid, blank = could not verify."""
+def status_column_header(intake_sheet: SheetIntake) -> str:
+    """Header text of the notes column write-back will overwrite this run.
+
+    The new fixed-layout model (§10) NEVER appends a per-run column.
+    Instead it overwrites a single notes cell:
+      - The rightmost existing '<Month> YYYY Update' column if any
+        (older Florida-style workbooks); the historical month-stamped
+        columns to its left are left untouched as artifacts.
+      - Otherwise a single 'Last run notes' column the writeback
+        creates exactly once on first run.
+    """
     if intake_sheet.update_columns:
-        return f"Amount Due — {run_date.strftime('%B')} {run_date.year}"
-    return f"Amount Due {run_date.isoformat()}"
+        return intake_sheet.update_columns[-1].header
+    return NOTES_HEADER_DEFAULT
