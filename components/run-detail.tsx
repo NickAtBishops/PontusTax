@@ -28,7 +28,7 @@ import {
   type RowDoc,
   type RunDoc,
 } from "@/lib/types";
-import { fmtDateTime, fmtMoney } from "@/lib/format";
+import { fmtDate, fmtDateTime, fmtMoney } from "@/lib/format";
 import { AppShell } from "@/components/app-shell";
 import { DeleteRunButton } from "@/components/delete-run-button";
 import { StatusBadge } from "@/components/status-badge";
@@ -364,6 +364,45 @@ function rowAmount(row: RowDoc): string {
   return due > 0 ? fmtMoney(due) : "—";
 }
 
+function rowUltimateDue(row: RowDoc): string {
+  const accounts = row.accounts ?? [];
+  if (accounts.length === 0) return "—";
+  if (row.row_status === "PAID") return fmtMoney(0);
+  // Sum only when at least one account reported it; null-only → "—" so we
+  // don't claim "$0 ultimate" for rows where the field wasn't extracted.
+  const reported = accounts.filter((a) => a.ultimate_payment_due !== null);
+  if (reported.length === 0) return "—";
+  const sum = reported.reduce((s, a) => s + (a.ultimate_payment_due ?? 0), 0);
+  return fmtMoney(sum);
+}
+
+function rowLastPayment(row: RowDoc): string {
+  // First account with both an amount and a date; multi-account rows can
+  // be inspected in the side sheet.
+  for (const a of row.accounts ?? []) {
+    if (a.amount_paid !== null && a.date_paid) {
+      return `${fmtMoney(a.amount_paid)} · ${fmtDate(a.date_paid)}`;
+    }
+  }
+  // Fall back to whichever single field is populated.
+  for (const a of row.accounts ?? []) {
+    if (a.amount_paid !== null) return fmtMoney(a.amount_paid);
+    if (a.date_paid) return fmtDate(a.date_paid);
+  }
+  return "—";
+}
+
+function rowNextDueDate(row: RowDoc): string {
+  // Earliest upcoming deadline across every account on the row.
+  const all: string[] = [];
+  for (const a of row.accounts ?? []) {
+    for (const d of a.due_dates ?? []) all.push(d);
+  }
+  if (all.length === 0) return "—";
+  all.sort();  // ISO yyyy-mm-dd sorts lexicographically
+  return fmtDate(all[0]);
+}
+
 function RowsTable({
   rows,
   onSelect,
@@ -386,6 +425,9 @@ function RowsTable({
             <TableHead className="text-right">Year</TableHead>
             <TableHead>Status</TableHead>
             <TableHead className="text-right">Left to pay</TableHead>
+            <TableHead className="text-right">Ultimate due</TableHead>
+            <TableHead className="text-right">Last payment</TableHead>
+            <TableHead className="text-right">Next due</TableHead>
             <TableHead className="text-right">Conf.</TableHead>
           </TableRow>
         </TableHeader>
@@ -393,7 +435,7 @@ function RowsTable({
           {rows.length === 0 ? (
             <TableRow>
               <TableCell
-                colSpan={8}
+                colSpan={11}
                 className="py-8 text-center text-sm text-muted-foreground"
               >
                 Rows appear here as soon as the worker reads the workbook.
@@ -430,6 +472,15 @@ function RowsTable({
                 </TableCell>
                 <TableCell className="text-right font-mono text-sm tabular-nums">
                   {rowAmount(row)}
+                </TableCell>
+                <TableCell className="text-right font-mono text-sm tabular-nums">
+                  {rowUltimateDue(row)}
+                </TableCell>
+                <TableCell className="text-right font-mono text-xs tabular-nums text-muted-foreground">
+                  {rowLastPayment(row)}
+                </TableCell>
+                <TableCell className="text-right font-mono text-xs tabular-nums text-muted-foreground">
+                  {rowNextDueDate(row)}
                 </TableCell>
                 <TableCell className="text-right text-xs text-muted-foreground">
                   {row.confidence ? row.confidence[0] : "—"}
