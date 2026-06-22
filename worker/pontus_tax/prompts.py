@@ -1,6 +1,8 @@
 """Skyvern prompt builders — one parameterized workflow per taxonomy type
-(CLAUDE.md §4 + hard rules §11). FAST MODE: the agent answers exactly one
-question — the total amount still owed now — and stops.
+(CLAUDE.md §4 + hard rules §11). The primary answer is still ONE number
+(total still owed now) and the agent still stops on the first summary it
+finds; a small set of structured payment fields layer on top, filled
+best-effort from that same summary without extra navigation.
 """
 
 from __future__ import annotations
@@ -84,6 +86,29 @@ def _speed_rule() -> str:
     )
 
 
+def _payment_fields_rule() -> str:
+    # The new structured payment fields layer on top of amount_due_now —
+    # fill them WITHOUT extra navigation. They almost always sit on the
+    # same summary the speed rule already lands on; leave them null when
+    # they aren't.
+    return (
+        "PAYMENT FIELDS (best-effort from the SAME page; do not dig)\n"
+        "- ultimate_payment_due: the bill's final figure AFTER any current "
+        "early-payment discount (e.g. FL November 4% / December 3% / January "
+        "2% / February 1%) AND any past-due penalties/interest. Usually this "
+        "is what the page already calls 'Total Due' / 'Pay This Amount' / "
+        "'Amount Due'. Often equal to amount_due_now; differs only when a "
+        "discount window is active. Null when fully paid (no balance).\n"
+        "- payment_date / payment_amount: ONLY if the same summary surfaces "
+        "the most recent payment (a 'Paid' line, a posted-date column visible "
+        "without expanding a section). ISO yyyy-mm-dd preferred. Otherwise "
+        "null — do not open payment history to find them.\n"
+        "- due_dates: any remaining installment deadlines shown on the page "
+        "for this tax year (ISO yyyy-mm-dd), in order. Empty list when "
+        "nothing further is due or none is shown."
+    )
+
+
 def _search_path(ctx: PromptContext) -> str:
     return (
         "NAVIGATION — search portal\n"
@@ -160,11 +185,15 @@ everything is paid).
 {path_builder(ctx)}
 
 {_speed_rule()}
+
+{_payment_fields_rule()}
 {playbook_block}
 {_hard_rules()}
 
 COMPLETION
 Fill the extraction schema: amount_due_now (the one number), whether any of
-it is delinquent, the owner/situs/parcel shown (for verification), and the
-final page URL — or the precise page_outcome for why you could not.
+it is delinquent, ultimate_payment_due / payment_date / payment_amount /
+due_dates if visible on the same summary, the owner/situs/parcel shown
+(for verification), and the final page URL — or the precise page_outcome
+for why you could not.
 """
