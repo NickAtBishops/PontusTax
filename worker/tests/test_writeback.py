@@ -215,6 +215,164 @@ def test_template_fill_preserved(ptax_master_workbook, tmp_path):
         )
 
 
+def _ptax_notes_col_letter():
+    # PTAX_Master has no month-update column, so 'Last run notes' is
+    # created at ws.max_column + 1. With the template's 47 cols of styling
+    # (the header band on row 2 spans into the AU column even though row
+    # 3 only fills A:AJ), the resolver lands at AU based on the row-2
+    # group header span. We resolve it dynamically in tests rather than
+    # hard-coding, but record the column once for legibility.
+    return None  # tests look it up via parse_workbook.write_output
+
+
+def _ptax_notes_col(out_path):
+    ws = load_workbook(out_path)["Property Tax"]
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(3, c).value
+        if v and str(v).strip().lower() == "last run notes":
+            return c
+        if v and "update" in str(v).lower():
+            return c
+    raise AssertionError("notes column not found")
+
+
+def test_contradiction_routes_to_notes_only(ptax_master_workbook, tmp_path):
+    # ultimate_payment_due > 0 with status PAID is the cross_check
+    # contradiction case: cross_check_ultimate_due flips status to
+    # NEEDS_REVIEW upstream, the orchestrator's gate leaves every
+    # write_* field unset, and the writeback skips all S–V writes. The
+    # contradiction sentence reaches the notes column with the
+    # 'flagged for human review' marker so analysts see WHY.
+    record = AccountRecord(
+        account_searched="09-05-24-005954-056-00",
+        status=NEEDS_REVIEW,
+        ultimate_payment_due=1234.0,
+        confidence=LOW,
+        evidence=(
+            "matched by account + owner; contradiction: ultimate due "
+            "$1,234.00 but reported PAID — flagged for human review"
+        ),
+    )
+    outcome = RowOutcome(
+        row_key="s00_r0004",
+        sheet_name="Property Tax",
+        row_number=4,
+        accounts=[record],
+        row_status=NEEDS_REVIEW,
+        confidence=LOW,
+        evidence=record.evidence,
+        status_note=(
+            "NEEDS REVIEW — contradiction: ultimate due $1,234.00 but "
+            "reported PAID — flagged for human review"
+        ),
+        # All write_* deliberately None — the orchestrator's NEEDS_REVIEW
+        # gate would not have populated them.
+    )
+
+    intake = parse_workbook(ptax_master_workbook)
+    out_path = str(tmp_path / "out.xlsx")
+    write_output(intake, {"s00_r0004": outcome}, RUN_DATE, out_path)
+    ws = load_workbook(out_path)["Property Tax"]
+
+    # S/T/U/V keep the template's pre-existing row-4 values byte-for-byte.
+    assert ws["S4"].value == 0
+    assert ws["T4"].value == "2025-11-15"
+    assert ws["U4"].value == 19937
+    assert ws["V4"].value == "2026-11-23"
+
+    notes = ws.cell(4, _ptax_notes_col(out_path)).value
+    assert "contradiction" in notes
+    assert "flagged for human review" in notes
+
+
+def test_low_confidence_writes_only_to_notes(ptax_master_workbook, tmp_path):
+    # LOW confidence outcome — even with write_* set — must not touch
+    # S–V (the existing `allowed` gate blocks every structured write).
+    # The status note still reaches the notes column.
+    outcome = RowOutcome(
+        row_key="s00_r0004",
+        sheet_name="Property Tax",
+        row_number=4,
+        accounts=[AccountRecord(account_searched="x", status=PAID, confidence=LOW)],
+        row_status=PAID,
+        confidence=LOW,
+        status_note="LOW confidence — could not verify",
+        write_ultimate_payment_due=9999.99,  # would be ignored
+        write_payment_date="2099-12-31",
+        write_payment_amount=9999.99,
+        write_next_due_date="2099-12-31",
+    )
+
+    intake = parse_workbook(ptax_master_workbook)
+    out_path = str(tmp_path / "out.xlsx")
+    write_output(intake, {"s00_r0004": outcome}, RUN_DATE, out_path)
+    ws = load_workbook(out_path)["Property Tax"]
+
+    assert ws["S4"].value == 0           # template's pre-existing value
+    assert ws["T4"].value == "2025-11-15"
+    assert ws["U4"].value == 19937
+    assert ws["V4"].value == "2026-11-23"
+    assert ws.cell(4, _ptax_notes_col(out_path)).value == (
+        "LOW confidence — could not verify"
+    )
+
+
+def test_no_overwrite_with_blank(ptax_master_workbook, tmp_path):
+    # Outcome with every write_* = None — a parse glitch that yielded no
+    # values. The template's pre-existing row-4 values must survive
+    # untouched (§7: no silent erasure).
+    outcome = RowOutcome(
+        row_key="s00_r0004",
+        sheet_name="Property Tax",
+        row_number=4,
+        accounts=[AccountRecord(account_searched="x", status=PAID, confidence=HIGH)],
+        row_status=PAID,
+        confidence=HIGH,
+        status_note="Parse returned nothing — prior values preserved",
+        # All write_* left None.
+    )
+
+    intake = parse_workbook(ptax_master_workbook)
+    out_path = str(tmp_path / "out.xlsx")
+    write_output(intake, {"s00_r0004": outcome}, RUN_DATE, out_path)
+    ws = load_workbook(out_path)["Property Tax"]
+
+    assert ws["S4"].value == 0
+    assert ws["T4"].value == "2025-11-15"
+    assert ws["U4"].value == 19937
+    assert ws["V4"].value == "2026-11-23"
+
+
+def test_date_correction_writes_and_notes(ptax_master_workbook, tmp_path):
+    # T4 is pre-populated as '2025-11-15' in the template. A portal
+    # receipt of 2025-12-29 should (a) overwrite T4 with a real datetime,
+    # and (b) ride a "corrected payment date from ... to ... per portal
+    # receipt" sentence into the notes column.
+    outcome = RowOutcome(
+        row_key="s00_r0004",
+        sheet_name="Property Tax",
+        row_number=4,
+        accounts=[AccountRecord(account_searched="x", status=PAID, confidence=HIGH)],
+        row_status=PAID,
+        confidence=HIGH,
+        status_note="PAID in full $4,974.48 on 2025-12-29",
+        write_payment_date="2025-12-29",
+        write_payment_amount=4974.48,
+    )
+
+    intake = parse_workbook(ptax_master_workbook)
+    out_path = str(tmp_path / "out.xlsx")
+    write_output(intake, {"s00_r0004": outcome}, RUN_DATE, out_path)
+    ws = load_workbook(out_path)["Property Tax"]
+
+    assert ws["T4"].value == dt.datetime(2025, 12, 29)
+    assert ws["U4"].value == 4974.48
+
+    notes = ws.cell(4, _ptax_notes_col(out_path)).value
+    assert "corrected payment date from 2025-11-15 to 2025-12-29 per portal receipt" in notes
+    assert "corrected payment amount from 19937 to 4974.48 per portal receipt" in notes
+
+
 def test_writeback_guard_blocks_protected_columns(ptax_master_workbook):
     # _assert_writable_column raises on any column past V except the
     # resolved notes column. The error message names the offending header

@@ -140,6 +140,66 @@ def _iso_to_datetime(iso: str | None) -> dt.datetime | None:
     return dt.datetime(d.year, d.month, d.day) if d else None
 
 
+def _collect_correction(cell, new_value: Any, header_label: str) -> str | None:
+    """Compare an existing cell's value to a new value about to overwrite it.
+
+    Returns a correction sentence when the portal contradicts a real
+    prior value ("corrected <field> from <old> to <new> per portal
+    receipt"). Returns None when the existing cell is empty, when both
+    represent the same logical value (so an unchanged write looks like
+    no-op), or when comparison isn't meaningful.
+    """
+    existing = cell.value
+    if existing is None or (isinstance(existing, str) and not existing.strip()):
+        return None
+
+    def _fmt(v) -> str:
+        if isinstance(v, dt.datetime):
+            return v.date().isoformat()
+        if isinstance(v, dt.date):
+            return v.isoformat()
+        if isinstance(v, float) and v.is_integer():
+            return str(int(v))
+        return str(v).strip()
+
+    # Date-vs-date / date-vs-iso-string normalization.
+    new_d = (
+        new_value.date() if isinstance(new_value, dt.datetime)
+        else new_value if isinstance(new_value, dt.date)
+        else None
+    )
+    if new_d is not None:
+        e_d = (
+            existing.date() if isinstance(existing, dt.datetime)
+            else existing if isinstance(existing, dt.date)
+            else parse_date(existing) if isinstance(existing, str)
+            else None
+        )
+        if e_d is not None and e_d == new_d:
+            return None
+        return (
+            f"corrected {header_label} from {_fmt(existing)} to "
+            f"{new_d.isoformat()} per portal receipt"
+        )
+
+    # Number-vs-number tolerance (cents-level).
+    if isinstance(new_value, (int, float)) and isinstance(existing, (int, float)):
+        if abs(float(existing) - float(new_value)) < 0.005:
+            return None
+        return (
+            f"corrected {header_label} from {_fmt(existing)} to "
+            f"{_fmt(new_value)} per portal receipt"
+        )
+
+    # Mixed types or strings — string-normalized equality.
+    if _fmt(existing).lower() == _fmt(new_value).lower():
+        return None
+    return (
+        f"corrected {header_label} from {_fmt(existing)} to "
+        f"{_fmt(new_value)} per portal receipt"
+    )
+
+
 def _column_number_format(ws, col: int, data_start: int, data_end: int) -> str | None:
     for r in range(data_start, min(data_end, data_start + 40) + 1):
         cell = ws.cell(row=r, column=col)
@@ -257,76 +317,99 @@ def write_output(
                 # §10.3 — no row is ever silently skipped.
                 note_cell.value = "NOT CHECKED — run ended before this row"
                 continue
-            note_cell.value = outcome.status_note or "NOT CHECKED"
-            note_cell.alignment = copy(note_cell.alignment)
 
             allowed = (
                 outcome.row_status not in _WRITABLE_STATUSES_EXCLUDED
                 and outcome.confidence != LOW
             )
+            # Corrections accumulate during the structured writes below
+            # and append to the notes sentence at the end of this row.
+            corrections: list[str] = []
 
-            if not allowed:
-                continue
-
-            if _writable(date_info) and outcome.write_date_paid:
-                d = parse_date(outcome.write_date_paid)
-                if d:
-                    _assert_writable_column(ws, sheet, date_info.index, notes_col)
-                    _safe_write(ws, row.row_number, date_info.index, d, date_fmt)
-            if _writable(conf_info) and outcome.write_receipt:
-                _assert_writable_column(ws, sheet, conf_info.index, notes_col)
-                _safe_write(ws, row.row_number, conf_info.index, outcome.write_receipt)
-            if _writable(assessed_info) and outcome.write_assessed_value is not None:
-                _assert_writable_column(ws, sheet, assessed_info.index, notes_col)
-                _safe_write(
-                    ws, row.row_number, assessed_info.index,
-                    outcome.write_assessed_value,
-                )
-            # Live amount owed goes into the amounts column ONLY when the
-            # sheet has exactly one (installment grids stay untouched).
-            if (
-                len(amount_cols) == 1
-                and outcome.write_amount_due is not None
-                and _writable(amount_cols[0])
-            ):
-                _assert_writable_column(ws, sheet, amount_cols[0].index, notes_col)
-                _safe_write(
-                    ws, row.row_number, amount_cols[0].index,
-                    outcome.write_amount_due,
-                )
-
-            # ---- PTAX_Master structured cells (S–V) ----------------------
-            # Fixed-position overwrites every run, preserving cream fill.
-            # Only writes when the header was detected on this sheet; the
-            # older monthly-update Florida workbook lacks them and is
-            # unaffected by this block. Guards are redundant here (S–V
-            # always pass) but kept for defensive symmetry.
-            if ultimate_info and outcome.write_ultimate_payment_due is not None:
-                _assert_writable_column(ws, sheet, ultimate_info.index, notes_col)
-                _write_structured_cell(
-                    ws, row.row_number, ultimate_info.index,
-                    outcome.write_ultimate_payment_due, _CURRENCY_FMT,
-                )
-            if paydate_info and outcome.write_payment_date:
-                pd = _iso_to_datetime(outcome.write_payment_date)
-                if pd:
-                    _assert_writable_column(ws, sheet, paydate_info.index, notes_col)
-                    _write_structured_cell(
-                        ws, row.row_number, paydate_info.index, pd, _DATE_FMT,
+            if allowed:
+                if _writable(date_info) and outcome.write_date_paid:
+                    d = parse_date(outcome.write_date_paid)
+                    if d:
+                        _assert_writable_column(ws, sheet, date_info.index, notes_col)
+                        _safe_write(ws, row.row_number, date_info.index, d, date_fmt)
+                if _writable(conf_info) and outcome.write_receipt:
+                    _assert_writable_column(ws, sheet, conf_info.index, notes_col)
+                    _safe_write(ws, row.row_number, conf_info.index, outcome.write_receipt)
+                if _writable(assessed_info) and outcome.write_assessed_value is not None:
+                    _assert_writable_column(ws, sheet, assessed_info.index, notes_col)
+                    _safe_write(
+                        ws, row.row_number, assessed_info.index,
+                        outcome.write_assessed_value,
                     )
-            if payamt_info and outcome.write_payment_amount is not None:
-                _assert_writable_column(ws, sheet, payamt_info.index, notes_col)
-                _write_structured_cell(
-                    ws, row.row_number, payamt_info.index,
-                    outcome.write_payment_amount, _CURRENCY_FMT,
-                )
-            if nextdue_info and outcome.write_next_due_date:
-                nd = _iso_to_datetime(outcome.write_next_due_date)
-                if nd:
-                    _assert_writable_column(ws, sheet, nextdue_info.index, notes_col)
-                    _write_structured_cell(
-                        ws, row.row_number, nextdue_info.index, nd, _DATE_FMT,
+                if (
+                    len(amount_cols) == 1
+                    and outcome.write_amount_due is not None
+                    and _writable(amount_cols[0])
+                ):
+                    _assert_writable_column(ws, sheet, amount_cols[0].index, notes_col)
+                    _safe_write(
+                        ws, row.row_number, amount_cols[0].index,
+                        outcome.write_amount_due,
                     )
+
+                # ---- PTAX_Master structured cells (S–V). Fixed-position
+                # overwrites every run, preserving cream fill. Each write
+                # collects a correction note when the portal contradicts a
+                # real prior value, so analysts can see what changed and why.
+                if ultimate_info and outcome.write_ultimate_payment_due is not None:
+                    cell = ws.cell(row=row.row_number, column=ultimate_info.index)
+                    c = _collect_correction(
+                        cell, outcome.write_ultimate_payment_due, "ultimate payment due",
+                    )
+                    if c:
+                        corrections.append(c)
+                    _assert_writable_column(ws, sheet, ultimate_info.index, notes_col)
+                    _write_structured_cell(
+                        ws, row.row_number, ultimate_info.index,
+                        outcome.write_ultimate_payment_due, _CURRENCY_FMT,
+                    )
+                if paydate_info and outcome.write_payment_date:
+                    pd = _iso_to_datetime(outcome.write_payment_date)
+                    if pd:
+                        cell = ws.cell(row=row.row_number, column=paydate_info.index)
+                        c = _collect_correction(cell, pd, "payment date")
+                        if c:
+                            corrections.append(c)
+                        _assert_writable_column(ws, sheet, paydate_info.index, notes_col)
+                        _write_structured_cell(
+                            ws, row.row_number, paydate_info.index, pd, _DATE_FMT,
+                        )
+                if payamt_info and outcome.write_payment_amount is not None:
+                    cell = ws.cell(row=row.row_number, column=payamt_info.index)
+                    c = _collect_correction(
+                        cell, outcome.write_payment_amount, "payment amount",
+                    )
+                    if c:
+                        corrections.append(c)
+                    _assert_writable_column(ws, sheet, payamt_info.index, notes_col)
+                    _write_structured_cell(
+                        ws, row.row_number, payamt_info.index,
+                        outcome.write_payment_amount, _CURRENCY_FMT,
+                    )
+                if nextdue_info and outcome.write_next_due_date:
+                    nd = _iso_to_datetime(outcome.write_next_due_date)
+                    if nd:
+                        cell = ws.cell(row=row.row_number, column=nextdue_info.index)
+                        c = _collect_correction(cell, nd, "next due date")
+                        if c:
+                            corrections.append(c)
+                        _assert_writable_column(ws, sheet, nextdue_info.index, notes_col)
+                        _write_structured_cell(
+                            ws, row.row_number, nextdue_info.index, nd, _DATE_FMT,
+                        )
+
+            # Write the notes cell LAST so any corrections collected during
+            # the structured writes ride along on the same line analysts
+            # already read for run status.
+            base = outcome.status_note or "NOT CHECKED"
+            note_cell.value = (
+                f"{base} | " + " | ".join(corrections) if corrections else base
+            )
 
     wb.save(out_path)
     log.info("wrote checked workbook: %s", out_path)

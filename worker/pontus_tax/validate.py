@@ -117,7 +117,7 @@ def cross_check_ultimate_due(rec: AccountRecord) -> tuple[str, str | None]:
     if rec.ultimate_payment_due > 0.005 and rec.status == PAID:
         note = (
             f"contradiction: ultimate due {fmt_money(rec.ultimate_payment_due)}"
-            " but status PAID"
+            " but reported PAID — flagged for human review"
         )
         return NEEDS_REVIEW, note
 
