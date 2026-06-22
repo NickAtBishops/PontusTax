@@ -1,6 +1,6 @@
 import datetime as dt
 
-from pontus_tax.intake import parse_workbook, status_column_header
+from pontus_tax.intake import _match_field, parse_workbook, status_column_header
 
 
 def test_header_detection_two_stacked_rows(florida_workbook):
@@ -73,3 +73,72 @@ def test_status_column_follows_workbook_pattern(florida_workbook):
     sheet = parse_workbook(florida_workbook).sheets[0]
     assert sheet.update_columns, "April/May 2026 Update columns should be detected"
     assert status_column_header(sheet, dt.date(2026, 6, 9)) == "June 2026 Update"
+
+
+# ---------------------------------------------------------------------------
+# PTAX_Master template — fixed-cell layout (the new canonical workbook).
+# ---------------------------------------------------------------------------
+
+
+def test_ptax_master_header_detection(ptax_master_workbook):
+    # README sheet has no detectable header row → skipped naturally.
+    # Property Tax sheet: group row 2, field-header row 3, data from row 4.
+    intake = parse_workbook(ptax_master_workbook)
+    assert [s.name for s in intake.sheets] == ["Property Tax"]
+    sheet = intake.sheets[0]
+    assert sheet.header_row == 3
+    assert sheet.group_row == 2
+
+
+def test_ptax_master_structured_field_mapping(ptax_master_workbook):
+    # The four structured cells the checker writes to are detected by
+    # header text and end up at S, T, U, V exactly per the template.
+    sheet = parse_workbook(ptax_master_workbook).sheets[0]
+    assert sheet.first_col("ultimate_payment_due").letter == "S"
+    assert sheet.first_col("payment_date").letter == "T"
+    assert sheet.first_col("payment_amount").letter == "U"
+    assert sheet.first_col("next_due_date").letter == "V"
+
+
+def test_ptax_master_original_tracker_columns_still_map(ptax_master_workbook):
+    # The strict-header additions must not break the existing fuzzy mapping
+    # for the A–R analyst-maintained columns the checker READS.
+    m = parse_workbook(ptax_master_workbook).sheets[0].mapping_doc()
+    assert m["address"] == "A"
+    assert m["city"] == "B"
+    assert m["state"] == "C"
+    assert m["zip"] == "D"
+    assert m["owner_entity"] == "E"
+    assert m["internal_id"] == "F"     # PID
+    assert m["account_number"] == "G"  # Account #
+    assert m["installments"] == "H"
+    assert m["confirmation"] == "N"
+    assert m["responsible_party"] == "O"
+    assert m["website"] == "R"
+
+
+def test_strict_match_beats_fuzzy_for_payment_amount():
+    # "Payment amount" contains the word "amount" which the fuzzy table
+    # would otherwise route to the loose `amounts` bucket. Strict wins.
+    field, spec, tied = _match_field("Payment amount")
+    assert field == "payment_amount"
+    assert tied == []
+    assert spec >= 1000
+
+
+def test_strict_match_beats_fuzzy_for_next_due_date():
+    # "Next due date" contains "due date" — the fuzzy table would otherwise
+    # route to `due_dates`. Strict wins.
+    field, _, tied = _match_field("Next due date")
+    assert field == "next_due_date"
+    assert tied == []
+
+
+def test_strict_header_is_case_and_whitespace_tolerant():
+    # Case + extra whitespace must still match strictly. Paraphrase must not.
+    assert _match_field("ULTIMATE   PAYMENT  DUE")[0] == "ultimate_payment_due"
+    assert _match_field("  Payment Date  ")[0] == "payment_date"
+    # NOT tolerant of paraphrase — "Amount due now" should not become
+    # ultimate_payment_due. (It falls through to a fuzzy match elsewhere
+    # or returns None; here we just assert the strict path doesn't fire.)
+    assert _match_field("Amount due now")[0] != "ultimate_payment_due"

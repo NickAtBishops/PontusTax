@@ -51,6 +51,20 @@ SYNONYMS: list[tuple[str, list[str], bool]] = [
 # Fields that may legitimately map to several columns.
 MULTI_FIELDS = {"due_dates", "amounts", "status_notes"}
 
+# PTAX_Master template (and future fixed-cell workbooks) names four
+# structured cells the checker writes to. These headers are matched
+# STRICTLY — case-insensitive and tolerant of extra whitespace, but
+# NOT tolerant of paraphrase ("Amount due now" ≠ "Ultimate payment due").
+# Strict matches always beat the fuzzy synonym table below, so e.g.
+# "Payment amount" never falls through to the loose "amounts" bucket.
+STRICT_HEADERS: dict[str, str] = {
+    "ultimate payment due": "ultimate_payment_due",
+    "payment date":         "payment_date",
+    "payment amount":       "payment_amount",
+    "next due date":        "next_due_date",
+}
+_STRICT_SPECIFICITY = 1000  # any strict hit beats every fuzzy hit
+
 UPDATE_PATTERN = re.compile(
     r"^(january|february|march|april|may|june|july|august|september|october|"
     r"november|december)\s+(\d{4})\s+update$",
@@ -135,11 +149,15 @@ def _clean(value: Any) -> str:
 
 def _match_field(text: str) -> tuple[str | None, int, list[str]]:
     """Best canonical field for a header text. Returns (field, specificity,
-    tied_fields). Longer synonym = more specific; ties across different
+    tied_fields). STRICT_HEADERS map wins on exact (normalized) match;
+    otherwise the longest fuzzy synonym wins. Ties across different fuzzy
     fields are reported as ambiguous."""
     t = " ".join(text.lower().split())
     if not t:
         return None, 0, []
+    strict_hit = STRICT_HEADERS.get(t)
+    if strict_hit is not None:
+        return strict_hit, _STRICT_SPECIFICITY, []
     best: str | None = None
     best_len = 0
     tied: list[str] = []

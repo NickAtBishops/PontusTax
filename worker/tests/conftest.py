@@ -9,12 +9,32 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import shutil
 import sys
 
 import pytest
 from openpyxl import Workbook
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+# templates/ lives at the repo root, one level above worker/.
+_TEMPLATES_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "templates")
+)
+
+
+@pytest.fixture
+def ptax_master_workbook(tmp_path):
+    """A throwaway copy of the canonical PTAX_Master.xlsx in tmp_path.
+
+    The template itself is never mutated — every test that touches it
+    reads from tmp_path. Adjacent tests sharing the same template path
+    would otherwise corrupt each other and the source file.
+    """
+    src = os.path.join(_TEMPLATES_DIR, "PTAX_Master.xlsx")
+    dst = tmp_path / "PTAX_Master.xlsx"
+    shutil.copy(src, dst)
+    return str(dst)
 
 
 @pytest.fixture
