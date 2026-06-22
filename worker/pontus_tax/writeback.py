@@ -29,6 +29,39 @@ from .validate import parse_date, parse_money
 _CURRENCY_FMT = '"$"#,##0.00'
 _DATE_FMT = "yyyy-mm-dd"
 
+# PTAX_Master reserves W..AJ for analyst-filled values and formulas:
+#   W–Y    Jurisdiction Links              (analyst-filled)
+#   Z–AC   BOV — Single Broker             (analyst-filled)
+#   AD–AF  BOV — Median of Multiple        (analyst-filled)
+#   AG     Actual assessment               (analyst-filled today; Stage 2 may scrape)
+#   AH/AI/AJ  Variance ($) / (%) / Appeal flag — EXCEL FORMULAS the
+#              variance chain depends on. Replacing them with hardcoded
+#              values breaks the chain forever.
+# The writeback must never touch any of these. The single exception is
+# the resolved notes column (which may sit past V on fresh layouts that
+# require creating "Last run notes" once at ws.max_column + 1).
+_PROTECTED_RANGE_START = 23  # W (1-indexed)
+
+
+class WritebackGuardError(RuntimeError):
+    """Raised when write-back attempts to touch a column past V that is not
+    the resolved notes column. Surfaces with the offending column letter
+    and header text so the misconfigured caller is obvious."""
+
+
+def _assert_writable_column(
+    ws, sheet: SheetIntake, target_col: int, notes_col: int,
+) -> None:
+    if target_col < _PROTECTED_RANGE_START or target_col == notes_col:
+        return
+    header = ws.cell(row=sheet.header_row, column=target_col).value
+    raise WritebackGuardError(
+        f"refusing to write into protected column "
+        f"{get_column_letter(target_col)} ({header!r}) — "
+        f"columns W..AJ are analyst-filled or formula columns; the "
+        f"writeback must only touch S–V or the resolved notes column"
+    )
+
 log = logging.getLogger("pontus_tax.writeback")
 
 # Statuses whose data values are allowed into data cells (§7: LOW/NEEDS_REVIEW
@@ -203,9 +236,22 @@ def write_output(
             else None
         ) or "MM/DD/YYYY"
 
+        # Resolve which legacy-canonical fields are safe to write to:
+        # one of them (assessed_value) maps to AG on PTAX_Master via the
+        # fuzzy synonym table — that's the analyst-filled "Actual
+        # assessment" column and the writeback must skip it. The guard
+        # exists for *any* would-be write past V; the pre-checks below
+        # turn the legacy fields into clean no-ops when their detected
+        # column happens to land in the protected range.
+        def _writable(info) -> bool:
+            return info is not None and (
+                info.index < _PROTECTED_RANGE_START or info.index == notes_col
+            )
+
         for row in sheet.rows:
             key = f"s{s_idx:02d}_r{row.row_number:04d}"
             outcome = outcomes.get(key)
+            _assert_writable_column(ws, sheet, notes_col, notes_col)
             note_cell = ws.cell(row=row.row_number, column=notes_col)
             if outcome is None:
                 # §10.3 — no row is ever silently skipped.
@@ -222,20 +268,28 @@ def write_output(
             if not allowed:
                 continue
 
-            if date_info and outcome.write_date_paid:
+            if _writable(date_info) and outcome.write_date_paid:
                 d = parse_date(outcome.write_date_paid)
                 if d:
+                    _assert_writable_column(ws, sheet, date_info.index, notes_col)
                     _safe_write(ws, row.row_number, date_info.index, d, date_fmt)
-            if conf_info and outcome.write_receipt:
+            if _writable(conf_info) and outcome.write_receipt:
+                _assert_writable_column(ws, sheet, conf_info.index, notes_col)
                 _safe_write(ws, row.row_number, conf_info.index, outcome.write_receipt)
-            if assessed_info and outcome.write_assessed_value is not None:
+            if _writable(assessed_info) and outcome.write_assessed_value is not None:
+                _assert_writable_column(ws, sheet, assessed_info.index, notes_col)
                 _safe_write(
                     ws, row.row_number, assessed_info.index,
                     outcome.write_assessed_value,
                 )
             # Live amount owed goes into the amounts column ONLY when the
             # sheet has exactly one (installment grids stay untouched).
-            if len(amount_cols) == 1 and outcome.write_amount_due is not None:
+            if (
+                len(amount_cols) == 1
+                and outcome.write_amount_due is not None
+                and _writable(amount_cols[0])
+            ):
+                _assert_writable_column(ws, sheet, amount_cols[0].index, notes_col)
                 _safe_write(
                     ws, row.row_number, amount_cols[0].index,
                     outcome.write_amount_due,
@@ -245,8 +299,10 @@ def write_output(
             # Fixed-position overwrites every run, preserving cream fill.
             # Only writes when the header was detected on this sheet; the
             # older monthly-update Florida workbook lacks them and is
-            # unaffected by this block.
+            # unaffected by this block. Guards are redundant here (S–V
+            # always pass) but kept for defensive symmetry.
             if ultimate_info and outcome.write_ultimate_payment_due is not None:
+                _assert_writable_column(ws, sheet, ultimate_info.index, notes_col)
                 _write_structured_cell(
                     ws, row.row_number, ultimate_info.index,
                     outcome.write_ultimate_payment_due, _CURRENCY_FMT,
@@ -254,10 +310,12 @@ def write_output(
             if paydate_info and outcome.write_payment_date:
                 pd = _iso_to_datetime(outcome.write_payment_date)
                 if pd:
+                    _assert_writable_column(ws, sheet, paydate_info.index, notes_col)
                     _write_structured_cell(
                         ws, row.row_number, paydate_info.index, pd, _DATE_FMT,
                     )
             if payamt_info and outcome.write_payment_amount is not None:
+                _assert_writable_column(ws, sheet, payamt_info.index, notes_col)
                 _write_structured_cell(
                     ws, row.row_number, payamt_info.index,
                     outcome.write_payment_amount, _CURRENCY_FMT,
@@ -265,6 +323,7 @@ def write_output(
             if nextdue_info and outcome.write_next_due_date:
                 nd = _iso_to_datetime(outcome.write_next_due_date)
                 if nd:
+                    _assert_writable_column(ws, sheet, nextdue_info.index, notes_col)
                     _write_structured_cell(
                         ws, row.row_number, nextdue_info.index, nd, _DATE_FMT,
                     )

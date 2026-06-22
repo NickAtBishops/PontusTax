@@ -1,13 +1,18 @@
 import datetime as dt
 
+import pytest
 from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 
 from pontus_tax.canonical import (
     DELINQUENT, NEEDS_REVIEW, PAID, HIGH, LOW, MEDIUM,
     AccountRecord, RowOutcome,
 )
 from pontus_tax.intake import parse_workbook
-from pontus_tax.writeback import output_filename, write_output
+from pontus_tax.writeback import (
+    WritebackGuardError, _assert_writable_column,
+    output_filename, write_output,
+)
 
 RUN_DATE = dt.date(2026, 6, 9)
 
@@ -208,6 +213,62 @@ def test_template_fill_preserved(ptax_master_workbook, tmp_path):
         assert after[f"{col}4"].fill.fgColor.rgb == "FFFFF8DC", (
             f"{col}4 lost the cream fill after writeback"
         )
+
+
+def test_writeback_guard_blocks_protected_columns(ptax_master_workbook):
+    # _assert_writable_column raises on any column past V except the
+    # resolved notes column. The error message names the offending header
+    # so a misconfigured caller is obvious.
+    intake = parse_workbook(ptax_master_workbook)
+    sheet = intake.sheets[0]
+    wb = load_workbook(ptax_master_workbook)
+    ws = wb[sheet.name]
+
+    # Use a notes_col past the protected range so the guard's "target is
+    # the notes column" carve-out doesn't accidentally pass these targets.
+    notes_col = 999
+
+    # Probe each protected family — analyst-filled (W, AD), formula (AH).
+    for col in (23, 30, 34):  # W, AD, AH
+        with pytest.raises(WritebackGuardError) as exc:
+            _assert_writable_column(ws, sheet, col, notes_col)
+        header = str(ws.cell(sheet.header_row, col).value)
+        assert header in str(exc.value), (
+            f"col {get_column_letter(col)}: error must name header "
+            f"{header!r}, got: {exc.value!s}"
+        )
+
+    # Sanity: V (22) and the notes_col itself are both writable.
+    _assert_writable_column(ws, sheet, 22, notes_col)
+    _assert_writable_column(ws, sheet, notes_col, notes_col)
+
+
+def test_template_columns_untouched(ptax_master_workbook, tmp_path):
+    # The full W..AJ range must round-trip byte-for-byte through a real
+    # write_output run: every (value, data_type) pair preserved. Catches
+    # accidental writes AND, critically, formula-to-value replacements in
+    # AH/AI/AJ that would silently break the variance chain forever.
+    ws_before = load_workbook(ptax_master_workbook)["Property Tax"]
+    before: dict[tuple[int, int], tuple] = {}
+    for r in range(4, ws_before.max_row + 1):
+        for col in range(23, 37):  # W..AJ
+            c = ws_before.cell(r, col)
+            before[(r, col)] = (c.value, c.data_type)
+
+    intake = parse_workbook(ptax_master_workbook)
+    out_path = str(tmp_path / "out.xlsx")
+    write_output(intake, {"s00_r0004": _ptax_paid_putnam_outcome()}, RUN_DATE, out_path)
+
+    ws_after = load_workbook(out_path)["Property Tax"]
+    drifted: list[str] = []
+    for (r, col), expected in before.items():
+        c = ws_after.cell(r, col)
+        if (c.value, c.data_type) != expected:
+            drifted.append(
+                f"{get_column_letter(col)}{r}: {expected} → "
+                f"{(c.value, c.data_type)}"
+            )
+    assert not drifted, "protected columns drifted:\n  " + "\n  ".join(drifted)
 
 
 def test_unprocessed_rows_are_marked_not_skipped(florida_workbook, tmp_path):
