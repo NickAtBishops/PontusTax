@@ -23,6 +23,12 @@ from .intake import (
 )
 from .validate import parse_date, parse_money
 
+# Number formats used when overwriting PTAX_Master's S–V cells. Excel will
+# round-trip the underlying datetime / number; the template already sets
+# these formats on the sample rows, but we re-apply for sheets that don't.
+_CURRENCY_FMT = '"$"#,##0.00'
+_DATE_FMT = "yyyy-mm-dd"
+
 log = logging.getLogger("pontus_tax.writeback")
 
 # Statuses whose data values are allowed into data cells (§7: LOW/NEEDS_REVIEW
@@ -68,6 +74,37 @@ def _safe_write(ws, row: int, col: int, value: Any, number_format: str | None = 
     if number_format:
         cell.number_format = number_format
     return True
+
+
+def _write_structured_cell(ws, row: int, col: int, value: Any, number_format: str) -> bool:
+    """Overwrite a fixed structured cell (S–V on PTAX_Master), preserving the
+    template's per-cell fill (cream FFFFF8DC), font, and alignment.
+    cell.number_format = ... can drop style attributes on some openpyxl
+    versions, so save and restore explicitly. None / empty string never
+    overwrites (§7: no silent erasure). The richer correction rules —
+    no $0 over an existing nonzero, date-correction-with-note — layer on
+    in a later commit; this helper handles the basic write."""
+    cell = ws.cell(row=row, column=col)
+    if _is_formula(cell):
+        return False
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return False
+    saved_fill = copy(cell.fill)
+    saved_font = copy(cell.font)
+    saved_align = copy(cell.alignment)
+    cell.value = value
+    cell.number_format = number_format
+    cell.fill = saved_fill
+    cell.font = saved_font
+    cell.alignment = saved_align
+    return True
+
+
+def _iso_to_datetime(iso: str | None) -> dt.datetime | None:
+    """Parse an ISO-ish date string into datetime.datetime at midnight, the
+    form openpyxl writes as a real Excel date value (not a string)."""
+    d = parse_date(iso) if iso else None
+    return dt.datetime(d.year, d.month, d.day) if d else None
 
 
 def _column_number_format(ws, col: int, data_start: int, data_end: int) -> str | None:
@@ -141,6 +178,12 @@ def write_output(
         conf_info = sheet.first_col("confirmation")
         assessed_info = sheet.first_col("assessed_value")
         amount_cols = sheet.columns.get("amounts", [])
+        # PTAX_Master structured cells (S–V). Absent on legacy workbooks
+        # like the older Florida sheet; present on the master template.
+        ultimate_info = sheet.first_col("ultimate_payment_due")
+        paydate_info = sheet.first_col("payment_date")
+        payamt_info = sheet.first_col("payment_amount")
+        nextdue_info = sheet.first_col("next_due_date")
         date_fmt = (
             _column_number_format(ws, date_info.index, data_start, data_end)
             if date_info
@@ -198,6 +241,34 @@ def write_output(
                     ws, row.row_number, amount_cols[0].index,
                     outcome.write_amount_due,
                 )
+
+            # ---- PTAX_Master structured cells (S–V) ----------------------
+            # Fixed-position overwrites every run, preserving cream fill.
+            # Only writes when the header was detected on this sheet; the
+            # older monthly-update Florida workbook lacks them and is
+            # unaffected by this block.
+            if ultimate_info and outcome.write_ultimate_payment_due is not None:
+                _write_structured_cell(
+                    ws, row.row_number, ultimate_info.index,
+                    outcome.write_ultimate_payment_due, _CURRENCY_FMT,
+                )
+            if paydate_info and outcome.write_payment_date:
+                pd = _iso_to_datetime(outcome.write_payment_date)
+                if pd:
+                    _write_structured_cell(
+                        ws, row.row_number, paydate_info.index, pd, _DATE_FMT,
+                    )
+            if payamt_info and outcome.write_payment_amount is not None:
+                _write_structured_cell(
+                    ws, row.row_number, payamt_info.index,
+                    outcome.write_payment_amount, _CURRENCY_FMT,
+                )
+            if nextdue_info and outcome.write_next_due_date:
+                nd = _iso_to_datetime(outcome.write_next_due_date)
+                if nd:
+                    _write_structured_cell(
+                        ws, row.row_number, nextdue_info.index, nd, _DATE_FMT,
+                    )
 
     wb.save(out_path)
     log.info("wrote checked workbook: %s", out_path)

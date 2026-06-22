@@ -2,7 +2,10 @@ import datetime as dt
 
 from openpyxl import load_workbook
 
-from pontus_tax.canonical import DELINQUENT, NEEDS_REVIEW, PAID, HIGH, LOW, MEDIUM, RowOutcome
+from pontus_tax.canonical import (
+    DELINQUENT, NEEDS_REVIEW, PAID, HIGH, LOW, MEDIUM,
+    AccountRecord, RowOutcome,
+)
 from pontus_tax.intake import parse_workbook
 from pontus_tax.writeback import output_filename, write_output
 
@@ -109,6 +112,74 @@ def test_main_sheet_layout_unchanged(florida_workbook, tmp_path):
                          if out_ws.cell(row=2, column=c).value is not None)
     assert in_header_max == 23
     assert out_header_max == 25
+
+
+# ---------------------------------------------------------------------------
+# PTAX_Master template — fixed-cell write path (S–V).
+# ---------------------------------------------------------------------------
+
+
+def _ptax_paid_putnam_outcome():
+    # Synthesizes the canonical PAID-with-discount Putnam outcome targeting
+    # PTAX_Master row 4 (the template's first data row): ultimate=0, paid
+    # $4,974.48 on 2025-12-29, next deadline 2026-03-31.
+    rec = AccountRecord(
+        account_searched="09-05-24-005954-056-00",
+        status=PAID,
+        amount_due=0.0,
+        ultimate_payment_due=0.0,
+        amount_paid=4974.48,
+        date_paid="2025-12-29",
+        next_due_date="2026-03-31",
+        confidence=HIGH,
+    )
+    return RowOutcome(
+        row_key="s00_r0004",
+        sheet_name="Property Tax",
+        row_number=4,
+        accounts=[rec],
+        row_status=PAID,
+        confidence=HIGH,
+        status_note="PAID in full $4,974.48 on 2025-12-29",
+        write_ultimate_payment_due=0.0,
+        write_payment_date="2025-12-29",
+        write_payment_amount=4974.48,
+        write_next_due_date="2026-03-31",
+    )
+
+
+def test_structured_cells_written(ptax_master_workbook, tmp_path):
+    intake = parse_workbook(ptax_master_workbook)
+    out_path = str(tmp_path / "out.xlsx")
+    write_output(intake, {"s00_r0004": _ptax_paid_putnam_outcome()}, RUN_DATE, out_path)
+    ws = load_workbook(out_path)["Property Tax"]
+
+    # The four structured cells carry typed Excel values (number for $, real
+    # datetime for dates), not strings.
+    assert ws["S4"].value == 0.0
+    assert ws["T4"].value == dt.datetime(2025, 12, 29)
+    assert ws["U4"].value == 4974.48
+    assert ws["V4"].value == dt.datetime(2026, 3, 31)
+
+
+def test_template_fill_preserved(ptax_master_workbook, tmp_path):
+    # Cream fill (FFFFF8DC) is the visual cue the analyst uses to spot the
+    # auto-populated columns. Overwriting the value must not strip it.
+    before = load_workbook(ptax_master_workbook)["Property Tax"]
+    assert before["S4"].fill.fgColor.rgb == "FFFFF8DC"
+    assert before["T4"].fill.fgColor.rgb == "FFFFF8DC"
+    assert before["U4"].fill.fgColor.rgb == "FFFFF8DC"
+    assert before["V4"].fill.fgColor.rgb == "FFFFF8DC"
+
+    intake = parse_workbook(ptax_master_workbook)
+    out_path = str(tmp_path / "out.xlsx")
+    write_output(intake, {"s00_r0004": _ptax_paid_putnam_outcome()}, RUN_DATE, out_path)
+    after = load_workbook(out_path)["Property Tax"]
+
+    for col in ("S", "T", "U", "V"):
+        assert after[f"{col}4"].fill.fgColor.rgb == "FFFFF8DC", (
+            f"{col}4 lost the cream fill after writeback"
+        )
 
 
 def test_unprocessed_rows_are_marked_not_skipped(florida_workbook, tmp_path):

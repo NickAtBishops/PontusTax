@@ -93,6 +93,12 @@ class RowOutcome:
     write_receipt: str | None = None
     write_assessed_value: float | None = None
     write_amount_due: float | None = None
+    # PTAX_Master structured cells (S–V) — fixed-position overwrites every
+    # run. ISO yyyy-mm-dd for dates; coerced to datetime at write time.
+    write_ultimate_payment_due: float | None = None
+    write_payment_date: str | None = None
+    write_payment_amount: float | None = None
+    write_next_due_date: str | None = None
     discovered_url: str | None = None
 
     def to_dict(self) -> dict[str, Any]:

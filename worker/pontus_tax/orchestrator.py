@@ -209,6 +209,32 @@ class RowProcessor:
             if outcome.row_status in (UNPAID, PARTIAL, DELINQUENT) and dues:
                 outcome.write_amount_due = round(sum(dues), 2)
 
+            # ---- PTAX_Master structured cells (S–V) — aggregated from
+            # the per-account records the same way the live amount-due
+            # is aggregated. PAID rows are valid here too: a paid bill
+            # has ultimate=0 and a posted payment date/amount worth
+            # writing into the template.
+            uds = [r.ultimate_payment_due for r in records
+                   if r.ultimate_payment_due is not None]
+            if uds:
+                outcome.write_ultimate_payment_due = round(sum(uds), 2)
+            paid_amts = [r.amount_paid for r in records if r.amount_paid is not None]
+            if paid_amts:
+                outcome.write_payment_amount = round(sum(paid_amts), 2)
+            # Most recent posted payment date wins (max ISO string).
+            paid_dates = sorted(r.date_paid for r in records if r.date_paid)
+            if paid_dates:
+                outcome.write_payment_date = paid_dates[-1]
+            # Earliest upcoming deadline wins (min ISO string), pulling
+            # from each account's next_due_date and due_dates[*].
+            upcoming: list[str] = []
+            for r in records:
+                if r.next_due_date:
+                    upcoming.append(r.next_due_date)
+                upcoming.extend(r.due_dates or [])
+            if upcoming:
+                outcome.write_next_due_date = min(upcoming)
+
         return outcome
 
     # ------------------------------------------------------------------
