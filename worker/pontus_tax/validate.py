@@ -13,7 +13,7 @@ import re
 from typing import Any
 
 from .canonical import (
-    PAID, UNPAID, DELINQUENT, NEEDS_REVIEW, UNREACHABLE,
+    PAID, PARTIAL, UNPAID, DELINQUENT, NEEDS_REVIEW, UNREACHABLE,
     LOW,
     AccountRecord,
 )
@@ -73,6 +73,65 @@ def fmt_date(d: dt.date | None) -> str:
     return f"{d.month}/{d.day}/{d.year}" if d else "—"
 
 
+def _parse_iso_date(v: Any) -> str | None:
+    """Coerce assorted date strings into ISO yyyy-mm-dd; return None on fail."""
+    d = parse_date(v)
+    return d.isoformat() if d else None
+
+
+def _parse_due_dates(raw: Any) -> list[str]:
+    """Accept list[str|date] (preferred) or a single string; drop unparseables."""
+    if raw is None:
+        return []
+    items = raw if isinstance(raw, list) else [raw]
+    out: list[str] = []
+    for item in items:
+        iso = _parse_iso_date(item)
+        if iso:
+            out.append(iso)
+    return out
+
+
+def _round_money_or_none(raw: Any) -> float | None:
+    m = parse_money(raw)
+    return round(m, 2) if m is not None else None
+
+
+def cross_check_ultimate_due(rec: AccountRecord) -> tuple[str, str | None]:
+    """Reconcile rec.ultimate_payment_due with rec.status.
+
+    Returns (new_status, evidence_note_or_None). The caller is responsible
+    for applying the new_status and appending the note.
+
+    Rules (spec):
+    - ultimate_payment_due > 0 with status PAID → NEEDS_REVIEW
+      (contradiction; cannot trust a $0-due claim when the bill still owes)
+    - ultimate_payment_due ≈ 0 with non-null date_paid or amount_paid
+      and current status UNPAID/PARTIAL → upgrade to PAID
+      (payment evidence backs a zero balance; the live amount was stale)
+    - Otherwise, no change.
+    """
+    if rec.ultimate_payment_due is None:
+        return rec.status, None
+
+    if rec.ultimate_payment_due > 0.005 and rec.status == PAID:
+        note = (
+            f"contradiction: ultimate due {fmt_money(rec.ultimate_payment_due)}"
+            " but status PAID"
+        )
+        return NEEDS_REVIEW, note
+
+    if (
+        rec.ultimate_payment_due <= 0.005
+        and rec.status in (UNPAID, PARTIAL)
+        and (rec.date_paid or rec.amount_paid is not None)
+    ):
+        note = "ultimate due $0 with payment evidence → upgraded to PAID"
+        return PAID, note
+
+    return rec.status, None
+
+
 def build_account_record(
     account_display: str,
     extraction: dict[str, Any],
@@ -102,6 +161,28 @@ def build_account_record(
             DELINQUENT if extraction.get("includes_delinquency") else UNPAID
         )
         rec.confidence = verdict.confidence_hint
+
+    # Structured payment fields layer on top of the status decision. Skyvern
+    # may return them under the spec's external names (payment_date /
+    # payment_amount) — map onto the canonical date_paid / amount_paid so
+    # downstream code keeps reading the existing field names.
+    rec.ultimate_payment_due = _round_money_or_none(
+        extraction.get("ultimate_payment_due")
+    )
+    rec.amount_paid = _round_money_or_none(extraction.get("payment_amount"))
+    pay_date = _parse_iso_date(extraction.get("payment_date"))
+    if pay_date:
+        rec.date_paid = pay_date
+    rec.due_dates = _parse_due_dates(extraction.get("due_dates"))
+
+    new_status, note = cross_check_ultimate_due(rec)
+    if note:
+        rec.status = new_status
+        bits.append(note)
+        # A NEEDS_REVIEW from contradiction is uncertain by definition;
+        # never let it ride at HIGH confidence into the dashboard.
+        if new_status == NEEDS_REVIEW:
+            rec.confidence = LOW
 
     rec.evidence = "; ".join(bits)
     return rec

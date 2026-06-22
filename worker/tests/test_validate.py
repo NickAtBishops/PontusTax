@@ -100,6 +100,43 @@ def test_status_notes_short_form():
     assert all_paid == "All 3 accounts paid — $0.00 due"
 
 
+def test_ultimate_due_status_contradiction_downgrades_to_needs_review():
+    # Page reports $0 owed (so build_account_record decides PAID) but the
+    # ultimate_payment_due field says $1,234 is still due — that's a real
+    # contradiction; trust nothing, send to human review.
+    ext = _extraction(0)
+    ext["ultimate_payment_due"] = 1234.00
+    rec = build_account_record("12345", ext, VERDICT)
+
+    assert rec.status == NEEDS_REVIEW
+    assert rec.confidence == LOW
+    assert "contradiction" in rec.evidence
+    assert "$1,234.00" in rec.evidence
+    # The "after" snapshot retains the raw extracted values for the analyst.
+    assert rec.ultimate_payment_due == 1234.00
+
+
+def test_ultimate_due_zero_with_payment_evidence_upgrades_to_paid():
+    # Page reports $500 owed (live UNPAID) but ultimate_payment_due is $0
+    # AND a payment date/amount are present — the live figure was stale;
+    # the payment evidence backs a zero balance. Upgrade to PAID.
+    ext = _extraction(500)
+    ext["ultimate_payment_due"] = 0
+    ext["payment_date"] = "2025-12-29"
+    ext["payment_amount"] = 500.00
+    rec = build_account_record("12345", ext, VERDICT)
+
+    assert rec.status == PAID
+    assert rec.date_paid == "2025-12-29"
+    assert rec.amount_paid == 500.00
+    assert "upgraded to PAID" in rec.evidence
+    # No payment evidence → no upgrade, even with ultimate_payment_due == 0.
+    ext_no_evidence = _extraction(500)
+    ext_no_evidence["ultimate_payment_due"] = 0
+    rec2 = build_account_record("12345", ext_no_evidence, VERDICT)
+    assert rec2.status == UNPAID
+
+
 def test_account_record_roundtrip_includes_new_fields():
     # New optional fields default safely and roundtrip through to_dict /
     # constructor without drift — store._outcome_doc relies on asdict for
