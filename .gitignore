@@ -27,3 +27,9 @@ python/
 # Test artifacts
 .pytest_cache/
 .vercel
+
+# One-off template backups + ad-hoc workbook output artifacts dropped
+# at the repo root during local testing (e.g. "* — checked YYYY-MM-DD.xlsx")
+templates/*.bak
+/PTAX_Master copy*.xlsx
+/PTAX_Master*— checked*.xlsx

@@ -104,13 +104,14 @@ def test_ptax_master_header_detection(ptax_master_workbook):
 
 
 def test_ptax_master_structured_field_mapping(ptax_master_workbook):
-    # The four structured cells the checker writes to are detected by
-    # header text and end up at S, T, U, V exactly per the template.
+    # The five structured cells the checker writes to are detected by
+    # header text and end up at S–W exactly per the template.
     sheet = parse_workbook(ptax_master_workbook).sheets[0]
     assert sheet.first_col("ultimate_payment_due").letter == "S"
-    assert sheet.first_col("payment_date").letter == "T"
-    assert sheet.first_col("payment_amount").letter == "U"
-    assert sheet.first_col("next_due_date").letter == "V"
+    assert sheet.first_col("run_confidence").letter == "T"
+    assert sheet.first_col("payment_date").letter == "U"
+    assert sheet.first_col("payment_amount").letter == "V"
+    assert sheet.first_col("next_due_date").letter == "W"
 
 
 def test_ptax_master_original_tracker_columns_still_map(ptax_master_workbook):

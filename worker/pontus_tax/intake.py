@@ -59,6 +59,7 @@ MULTI_FIELDS = {"due_dates", "amounts", "status_notes"}
 # "Payment amount" never falls through to the loose "amounts" bucket.
 STRICT_HEADERS: dict[str, str] = {
     "ultimate payment due": "ultimate_payment_due",
+    "confidence":           "run_confidence",
     "payment date":         "payment_date",
     "payment amount":       "payment_amount",
     "next due date":        "next_due_date",

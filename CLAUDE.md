@@ -328,7 +328,7 @@ Per-run free-text dump columns are gone. The checker writes into fixed
 structured cells the template exposes by header name (NEVER by letter),
 overwritten cleanly every run.
 
-### 10.1 The four checker-target cells (S–V on PTAX_Master)
+### 10.1 The five checker-target cells (S–W on PTAX_Master)
 
 Detected by header text (case-insensitive, whitespace-tolerant, NOT
 paraphrase-tolerant — `intake.STRICT_HEADERS`):
@@ -336,6 +336,7 @@ paraphrase-tolerant — `intake.STRICT_HEADERS`):
 | Header (verbatim)      | Field                  | Type written      | Format          |
 |------------------------|------------------------|-------------------|-----------------|
 | Ultimate payment due   | `ultimate_payment_due` | number            | `"$"#,##0.00`   |
+| Confidence             | `run_confidence`       | string            | `@`             |
 | Payment date           | `payment_date` → `date_paid` | datetime    | `yyyy-mm-dd`    |
 | Payment amount         | `payment_amount` → `amount_paid` | number  | `"$"#,##0.00`   |
 | Next due date          | `next_due_date`        | datetime          | `yyyy-mm-dd`    |
@@ -343,6 +344,12 @@ paraphrase-tolerant — `intake.STRICT_HEADERS`):
 Cream-yellow fill (`FFFFF8DC`) on these cells is the analyst's visual cue;
 `_write_structured_cell` saves+restores the per-cell fill/font/alignment
 around every overwrite so the cue survives.
+
+Confidence (HIGH / MEDIUM / LOW) is informational and writes OUTSIDE the
+"allowed" gate — LOW and NEEDS_REVIEW rows still get their confidence
+marker so analysts see at a glance what the system trusted (blank ≠ LOW;
+blank means "never ran"). Every other S/U/V/W structured write respects
+the gate.
 
 ### 10.2 Notes column — single fixed cell, NOT a per-run append
 
@@ -387,28 +394,28 @@ Portal-receipt corrections append to the sentence:
 
 ### 10.5 PROTECTED COLUMNS — hard rule, enforced by guard
 
-W–AJ on PTAX_Master are reserved for analyst-filled values and formulas.
+X–AK on PTAX_Master are reserved for analyst-filled values and formulas.
 **The checker must NEVER write to any of them**:
 
 | Cols | Family                            | Source           |
 |------|-----------------------------------|------------------|
-| W–Y  | Jurisdiction Links                | analyst-filled   |
-| Z–AC | BOV — Single Broker               | analyst-filled   |
-| AD–AF| BOV — Median of Multiple          | analyst-filled   |
-| AG   | Actual assessment                 | analyst-filled (Stage 2: maybe scraped) |
-| AH   | Variance ($)                      | EXCEL FORMULA `=AG-AE` |
-| AI   | Variance (%)                      | EXCEL FORMULA `=IF(AE=0,"",AH/AE)` |
-| AJ   | Appeal flag                       | EXCEL FORMULA — nested IF on 15/10/7% |
+| X–Z  | Jurisdiction Links                | analyst-filled   |
+| AA–AD| BOV — Single Broker               | analyst-filled   |
+| AE–AG| BOV — Median of Multiple          | analyst-filled   |
+| AH   | Actual assessment                 | analyst-filled (Stage 2: maybe scraped) |
+| AI   | Variance ($)                      | EXCEL FORMULA `=AH-AF` |
+| AJ   | Variance (%)                      | EXCEL FORMULA `=IF(AF=0,"",AI/AF)` |
+| AK   | Appeal flag                       | EXCEL FORMULA — nested IF on 15/10/7% |
 
 `writeback._assert_writable_column` raises `WritebackGuardError` on ANY
-write attempt past column V that isn't the resolved notes column. The
-error message names the offending column letter and header. Touching
-AH/AI/AJ specifically would replace formulas with hardcoded values and
-break the variance chain forever — the guard exists precisely to make
-that bug loud.
+write attempt past column W that isn't the resolved notes column
+(`_PROTECTED_RANGE_START = 24`). The error message names the offending
+column letter and header. Touching AI/AJ/AK specifically would replace
+formulas with hardcoded values and break the variance chain forever —
+the guard exists precisely to make that bug loud.
 
 Legacy fields whose synonyms happen to land on a protected column
-(notably `assessed_value` matching "Actual assessment" at AG) are
+(notably `assessed_value` matching "Actual assessment" at AH) are
 pre-checked in the writeback loop and skipped silently; the guard
 remains as a safety net for genuinely unintended writes.
 

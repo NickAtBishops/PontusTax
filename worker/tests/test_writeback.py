@@ -155,7 +155,8 @@ def test_main_sheet_layout_unchanged(florida_workbook, tmp_path):
 def _ptax_paid_putnam_outcome():
     # Synthesizes the canonical PAID-with-discount Putnam outcome targeting
     # PTAX_Master row 4 (the template's first data row): ultimate=0, paid
-    # $4,974.48 on 2025-12-29, next deadline 2026-03-31.
+    # $4,974.48 on 2025-12-29, next deadline 2026-03-31. Confidence HIGH
+    # rides into the new T column.
     rec = AccountRecord(
         account_searched="09-05-24-005954-056-00",
         status=PAID,
@@ -187,29 +188,30 @@ def test_structured_cells_written(ptax_master_workbook, tmp_path):
     write_output(intake, {"s00_r0004": _ptax_paid_putnam_outcome()}, RUN_DATE, out_path)
     ws = load_workbook(out_path)["Property Tax"]
 
-    # The four structured cells carry typed Excel values (number for $, real
-    # datetime for dates), not strings.
+    # Five structured cells carry typed Excel values (number for $, real
+    # datetime for dates, plain string for confidence).
     assert ws["S4"].value == 0.0
-    assert ws["T4"].value == dt.datetime(2025, 12, 29)
-    assert ws["U4"].value == 4974.48
-    assert ws["V4"].value == dt.datetime(2026, 3, 31)
+    assert ws["T4"].value == "HIGH"
+    assert ws["U4"].value == dt.datetime(2025, 12, 29)
+    assert ws["V4"].value == 4974.48
+    assert ws["W4"].value == dt.datetime(2026, 3, 31)
 
 
 def test_template_fill_preserved(ptax_master_workbook, tmp_path):
     # Cream fill (FFFFF8DC) is the visual cue the analyst uses to spot the
     # auto-populated columns. Overwriting the value must not strip it.
     before = load_workbook(ptax_master_workbook)["Property Tax"]
-    assert before["S4"].fill.fgColor.rgb == "FFFFF8DC"
-    assert before["T4"].fill.fgColor.rgb == "FFFFF8DC"
-    assert before["U4"].fill.fgColor.rgb == "FFFFF8DC"
-    assert before["V4"].fill.fgColor.rgb == "FFFFF8DC"
+    for col in ("S", "T", "U", "V", "W"):
+        assert before[f"{col}4"].fill.fgColor.rgb == "FFFFF8DC", (
+            f"template missing cream fill at {col}4"
+        )
 
     intake = parse_workbook(ptax_master_workbook)
     out_path = str(tmp_path / "out.xlsx")
     write_output(intake, {"s00_r0004": _ptax_paid_putnam_outcome()}, RUN_DATE, out_path)
     after = load_workbook(out_path)["Property Tax"]
 
-    for col in ("S", "T", "U", "V"):
+    for col in ("S", "T", "U", "V", "W"):
         assert after[f"{col}4"].fill.fgColor.rgb == "FFFFF8DC", (
             f"{col}4 lost the cream fill after writeback"
         )
@@ -274,11 +276,15 @@ def test_contradiction_routes_to_notes_only(ptax_master_workbook, tmp_path):
     write_output(intake, {"s00_r0004": outcome}, RUN_DATE, out_path)
     ws = load_workbook(out_path)["Property Tax"]
 
-    # S/T/U/V keep the template's pre-existing row-4 values byte-for-byte.
+    # Pay date / amt / next due keep the template's pre-existing row-4
+    # values byte-for-byte. (Ultimate stays at 0 from the template too.)
     assert ws["S4"].value == 0
-    assert ws["T4"].value == "2025-11-15"
-    assert ws["U4"].value == 19937
-    assert ws["V4"].value == "2026-11-23"
+    # T is the new Confidence column — LOW gets written even for
+    # NEEDS_REVIEW rows (it's informational, runs outside the gate).
+    assert ws["T4"].value == "LOW"
+    assert ws["U4"].value == "2025-11-15"
+    assert ws["V4"].value == 19937
+    assert ws["W4"].value == "2026-11-23"
 
     notes = ws.cell(4, _ptax_notes_col(out_path)).value
     assert "contradiction" in notes
@@ -309,9 +315,10 @@ def test_low_confidence_writes_only_to_notes(ptax_master_workbook, tmp_path):
     ws = load_workbook(out_path)["Property Tax"]
 
     assert ws["S4"].value == 0           # template's pre-existing value
-    assert ws["T4"].value == "2025-11-15"
-    assert ws["U4"].value == 19937
-    assert ws["V4"].value == "2026-11-23"
+    assert ws["T4"].value == "LOW"       # Confidence ALWAYS writes
+    assert ws["U4"].value == "2025-11-15"
+    assert ws["V4"].value == 19937
+    assert ws["W4"].value == "2026-11-23"
     assert ws.cell(4, _ptax_notes_col(out_path)).value == (
         "LOW confidence — could not verify"
     )
@@ -338,16 +345,17 @@ def test_no_overwrite_with_blank(ptax_master_workbook, tmp_path):
     ws = load_workbook(out_path)["Property Tax"]
 
     assert ws["S4"].value == 0
-    assert ws["T4"].value == "2025-11-15"
-    assert ws["U4"].value == 19937
-    assert ws["V4"].value == "2026-11-23"
+    assert ws["T4"].value == "HIGH"          # Confidence writes regardless
+    assert ws["U4"].value == "2025-11-15"
+    assert ws["V4"].value == 19937
+    assert ws["W4"].value == "2026-11-23"
 
 
 def test_date_correction_writes_and_notes(ptax_master_workbook, tmp_path):
-    # T4 is pre-populated as '2025-11-15' in the template. A portal
-    # receipt of 2025-12-29 should (a) overwrite T4 with a real datetime,
-    # and (b) ride a "corrected payment date from ... to ... per portal
-    # receipt" sentence into the notes column.
+    # U4 (payment_date) is pre-populated as '2025-11-15' in the template.
+    # A portal receipt of 2025-12-29 should (a) overwrite U4 with a real
+    # datetime, and (b) ride a "corrected payment date from ... to ...
+    # per portal receipt" sentence into the notes column.
     outcome = RowOutcome(
         row_key="s00_r0004",
         sheet_name="Property Tax",
@@ -365,8 +373,8 @@ def test_date_correction_writes_and_notes(ptax_master_workbook, tmp_path):
     write_output(intake, {"s00_r0004": outcome}, RUN_DATE, out_path)
     ws = load_workbook(out_path)["Property Tax"]
 
-    assert ws["T4"].value == dt.datetime(2025, 12, 29)
-    assert ws["U4"].value == 4974.48
+    assert ws["U4"].value == dt.datetime(2025, 12, 29)
+    assert ws["V4"].value == 4974.48
 
     notes = ws.cell(4, _ptax_notes_col(out_path)).value
     assert "corrected payment date from 2025-11-15 to 2025-12-29 per portal receipt" in notes
@@ -374,7 +382,7 @@ def test_date_correction_writes_and_notes(ptax_master_workbook, tmp_path):
 
 
 def test_writeback_guard_blocks_protected_columns(ptax_master_workbook):
-    # _assert_writable_column raises on any column past V except the
+    # _assert_writable_column raises on any column past W except the
     # resolved notes column. The error message names the offending header
     # so a misconfigured caller is obvious.
     intake = parse_workbook(ptax_master_workbook)
@@ -386,8 +394,8 @@ def test_writeback_guard_blocks_protected_columns(ptax_master_workbook):
     # the notes column" carve-out doesn't accidentally pass these targets.
     notes_col = 999
 
-    # Probe each protected family — analyst-filled (W, AD), formula (AH).
-    for col in (23, 30, 34):  # W, AD, AH
+    # Probe each protected family — analyst-filled (X, AE), formula (AI).
+    for col in (24, 31, 35):  # X (Jurisdiction primary), AE (BOV med high), AI (Variance $)
         with pytest.raises(WritebackGuardError) as exc:
             _assert_writable_column(ws, sheet, col, notes_col)
         header = str(ws.cell(sheet.header_row, col).value)
@@ -396,20 +404,20 @@ def test_writeback_guard_blocks_protected_columns(ptax_master_workbook):
             f"{header!r}, got: {exc.value!s}"
         )
 
-    # Sanity: V (22) and the notes_col itself are both writable.
-    _assert_writable_column(ws, sheet, 22, notes_col)
+    # Sanity: W (23, Next due date) and the notes_col itself are writable.
+    _assert_writable_column(ws, sheet, 23, notes_col)
     _assert_writable_column(ws, sheet, notes_col, notes_col)
 
 
 def test_template_columns_untouched(ptax_master_workbook, tmp_path):
-    # The full W..AJ range must round-trip byte-for-byte through a real
+    # The full X..AK range must round-trip byte-for-byte through a real
     # write_output run: every (value, data_type) pair preserved. Catches
     # accidental writes AND, critically, formula-to-value replacements in
-    # AH/AI/AJ that would silently break the variance chain forever.
+    # AI/AJ/AK that would silently break the variance chain forever.
     ws_before = load_workbook(ptax_master_workbook)["Property Tax"]
     before: dict[tuple[int, int], tuple] = {}
     for r in range(4, ws_before.max_row + 1):
-        for col in range(23, 37):  # W..AJ
+        for col in range(24, 38):  # X..AK
             c = ws_before.cell(r, col)
             before[(r, col)] = (c.value, c.data_type)
 

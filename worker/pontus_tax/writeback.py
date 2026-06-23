@@ -29,18 +29,19 @@ from .validate import parse_date, parse_money
 _CURRENCY_FMT = '"$"#,##0.00'
 _DATE_FMT = "yyyy-mm-dd"
 
-# PTAX_Master reserves W..AJ for analyst-filled values and formulas:
-#   W–Y    Jurisdiction Links              (analyst-filled)
-#   Z–AC   BOV — Single Broker             (analyst-filled)
-#   AD–AF  BOV — Median of Multiple        (analyst-filled)
-#   AG     Actual assessment               (analyst-filled today; Stage 2 may scrape)
-#   AH/AI/AJ  Variance ($) / (%) / Appeal flag — EXCEL FORMULAS the
+# PTAX_Master reserves X..AK for analyst-filled values and formulas:
+#   X–Z    Jurisdiction Links              (analyst-filled)
+#   AA–AD  BOV — Single Broker             (analyst-filled)
+#   AE–AG  BOV — Median of Multiple        (analyst-filled)
+#   AH     Actual assessment               (analyst-filled today; Stage 2 may scrape)
+#   AI/AJ/AK  Variance ($) / (%) / Appeal flag — EXCEL FORMULAS the
 #              variance chain depends on. Replacing them with hardcoded
 #              values breaks the chain forever.
 # The writeback must never touch any of these. The single exception is
-# the resolved notes column (which may sit past V on fresh layouts that
+# the resolved notes column (which may sit past W on fresh layouts that
 # require creating "Last run notes" once at ws.max_column + 1).
-_PROTECTED_RANGE_START = 23  # W (1-indexed)
+_PROTECTED_RANGE_START = 24  # X (1-indexed) — first column past the
+                             # five-cell Payment Status band (S..W).
 
 
 class WritebackGuardError(RuntimeError):
@@ -284,9 +285,10 @@ def write_output(
         conf_info = sheet.first_col("confirmation")
         assessed_info = sheet.first_col("assessed_value")
         amount_cols = sheet.columns.get("amounts", [])
-        # PTAX_Master structured cells (S–V). Absent on legacy workbooks
+        # PTAX_Master structured cells (S–W). Absent on legacy workbooks
         # like the older Florida sheet; present on the master template.
         ultimate_info = sheet.first_col("ultimate_payment_due")
+        confidence_info = sheet.first_col("run_confidence")
         paydate_info = sheet.first_col("payment_date")
         payamt_info = sheet.first_col("payment_amount")
         nextdue_info = sheet.first_col("next_due_date")
@@ -325,6 +327,18 @@ def write_output(
             # Corrections accumulate during the structured writes below
             # and append to the notes sentence at the end of this row.
             corrections: list[str] = []
+
+            # Confidence is informational and runs OUTSIDE the `allowed`
+            # gate — LOW / NEEDS_REVIEW rows should still surface "LOW"
+            # in the T column so analysts see at a glance what the
+            # system trusted. Without this, LOW rows would have a blank
+            # Confidence cell, indistinguishable from "never ran".
+            if confidence_info and outcome.confidence:
+                _assert_writable_column(ws, sheet, confidence_info.index, notes_col)
+                _write_structured_cell(
+                    ws, row.row_number, confidence_info.index,
+                    outcome.confidence, "@",  # plain text
+                )
 
             if allowed:
                 if _writable(date_info) and outcome.write_date_paid:
