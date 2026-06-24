@@ -71,3 +71,32 @@ export function getTenantLabelAliases(tenantId: string): LabelAliases {
   }
   return TENANT_LABEL_ALIASES[tenantId];
 }
+
+// Map a display name from column A of the uploaded tracker (e.g.
+// "Pinnacle Oil & Gas Holdings, Inc.") to one of our configured
+// tenant_ids ("pinnacle"). Returns null when no recipe exists yet so
+// the UI can grey out the row in the picker. Matching is intentionally
+// loose: column-A spellings drift across quarters ("Pinnacle Oil & Gas
+// Holdings, Inc" vs "Pinnacle Oil & Gas Holdings, Inc." vs sometimes
+// just "Pinnacle Oil & Gas Holdings"), and we always want to recognize
+// the same tenant. Strategy: bidirectional substring on the normalized
+// names, then fall back to the first whitespace/comma-separated token
+// of the config name (so "Pinnacle" alone still matches).
+export function findTenantIdByDisplayName(
+  displayName: string,
+): string | null {
+  const normalized = displayName.trim().toLowerCase();
+  if (!normalized) return null;
+  for (const [tenantId, config] of Object.entries(TENANT_CONFIGS)) {
+    const configName = config.tenant_name.trim().toLowerCase();
+    if (!configName) continue;
+    if (configName.includes(normalized) || normalized.includes(configName)) {
+      return tenantId;
+    }
+    const firstWord = configName.split(/[\s,]+/, 1)[0] ?? "";
+    if (firstWord.length >= 4 && normalized.includes(firstWord)) {
+      return tenantId;
+    }
+  }
+  return null;
+}

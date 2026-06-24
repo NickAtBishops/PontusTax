@@ -61,11 +61,14 @@ type ExtractResponse = {
   passed_through: string[];
 };
 
-// The roster the user picks from. Hardcoded for Phase 4 since Pinnacle
-// is the only tenant; Phase 8 will fetch from /api/tenants or similar.
-const TENANT_OPTIONS = [
-  { value: "pinnacle", label: "Pinnacle Oil & Gas Holdings" },
-] as const;
+// Shape of the picker entry returned by /api/tenant-credit/tenants.
+// Mirrors the route's TenantPickerEntry; redeclared here so the client
+// bundle doesn't pull the server route module.
+type TenantPickerEntry = {
+  display_name: string;
+  row: number;
+  tenant_id: string | null;
+};
 
 // Shape of the Past Runs entries returned by /api/runs.
 type RunSummary = {
@@ -130,7 +133,13 @@ function guessQuarter(sourcePeriod: string): QuarterId {
 }
 
 export default function DashboardPage() {
-  const [tenantId, setTenantId] = useState<string>(TENANT_OPTIONS[0].value);
+  // Tracker is uploaded once per session; the browser holds the original
+  // File and re-sends it on writeback. We never persist it server-side
+  // between requests.
+  const [trackerFile, setTrackerFile] = useState<File | null>(null);
+  const [tenants, setTenants] = useState<TenantPickerEntry[]>([]);
+  const [tenantsLoading, setTenantsLoading] = useState<boolean>(false);
+  const [tenantId, setTenantId] = useState<string>("");
   const [file, setFile] = useState<File | null>(null);
   const [running, setRunning] = useState<boolean>(false);
   const [extract, setExtract] = useState<ExtractResponse | null>(null);
@@ -138,6 +147,10 @@ export default function DashboardPage() {
   const [quarterId, setQuarterId] = useState<QuarterId>("Q1_2026");
   const [writing, setWriting] = useState<boolean>(false);
   const [runs, setRuns] = useState<RunSummary[]>([]);
+
+  // The picker uses tenant_id as its value (matches what the recipe
+  // registry keys by). Look up the full entry for downstream calls.
+  const selectedTenant = tenants.find((t) => t.tenant_id === tenantId) ?? null;
 
   // Pull Past Runs on mount and after each successful writeback. Errors
   // are swallowed because the section is informational; a noisy toast
@@ -175,9 +188,66 @@ export default function DashboardPage() {
     };
   }, []);
 
+  // Upload the corporate-financials tracker and ask the server for the
+  // roster in column A. We keep the File object in component state so
+  // the writeback step can re-send the same bytes; storing it on the
+  // server between requests would mean session state we don't have.
+  async function handleTrackerUpload(next: File | null) {
+    setTrackerFile(next);
+    setTenants([]);
+    setTenantId("");
+    if (!next) return;
+    if (!next.name.toLowerCase().endsWith(".xlsx")) {
+      toast.error("Tracker must be an .xlsx file.");
+      setTrackerFile(null);
+      return;
+    }
+    setTenantsLoading(true);
+    try {
+      const form = new FormData();
+      form.append("tracker_xlsx", next);
+      const res = await fetch("/api/tenant-credit/tenants", {
+        method: "POST",
+        body: form,
+      });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(
+          detail.error ?? `Tracker parse failed (${res.status}).`,
+        );
+      }
+      const data = (await res.json()) as { tenants: TenantPickerEntry[] };
+      setTenants(data.tenants);
+      const ready = data.tenants.filter((t) => t.tenant_id !== null);
+      if (ready.length === 0) {
+        toast.warning(
+          `Parsed ${data.tenants.length} tenants but no recipes are configured yet.`,
+        );
+      } else {
+        // Pre-select the first tenant with a working recipe so the
+        // analyst doesn't have to open the picker just to see who's
+        // ready.
+        setTenantId(ready[0].tenant_id!);
+        toast.success(
+          `Loaded ${data.tenants.length} tenants (${ready.length} ready).`,
+        );
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Tracker parse failed.";
+      toast.error(msg);
+      setTrackerFile(null);
+    } finally {
+      setTenantsLoading(false);
+    }
+  }
+
   async function handleRun() {
     if (!file) {
       toast.error("Select a PDF first.");
+      return;
+    }
+    if (!tenantId) {
+      toast.error("Pick a tenant first.");
       return;
     }
     setRunning(true);
@@ -230,6 +300,14 @@ export default function DashboardPage() {
 
   async function handleWriteback() {
     if (!compute || !extract || !file) return;
+    if (!trackerFile) {
+      toast.error("Upload the corporate financials tracker first.");
+      return;
+    }
+    if (!selectedTenant) {
+      toast.error("Pick a tenant first.");
+      return;
+    }
     setWriting(true);
     try {
       // Hash the PDF in the browser so the audit record records what
@@ -237,41 +315,48 @@ export default function DashboardPage() {
       // PDF (30 KB) digests in under a millisecond.
       const sourcePdfHash = await sha256Hex(file);
 
+      const payload = {
+        tenant_id: tenantId,
+        quarter_id: quarterId,
+        // tracker_row is authoritative: it comes from the user's own
+        // file (column A row index), not the per-recipe default.
+        tracker_row: selectedTenant.row,
+        sales: compute.sales,
+        ebitda: compute.ebitda,
+        // Audit payload (Phase 6).
+        source_pdf_filename: file.name,
+        source_pdf_hash: sourcePdfHash,
+        source_entity: extract.source_entity,
+        source_period: extract.source_period,
+        line_items: extract.line_items,
+        normalization_applied: extract.normalization_applied,
+        passed_through: extract.passed_through,
+        unused_labels: compute.unused_labels,
+        intercompany_observed: compute.intercompany_observed,
+        calculations: {
+          sales: {
+            formula: compute.calculations.sales.formula,
+            inputs: compute.calculations.sales.inputs,
+            total_tracker_unrounded:
+              compute.calculations.sales.total_tracker_unrounded,
+            result: compute.calculations.sales.result_tracker,
+          },
+          ebitda: {
+            formula: compute.calculations.ebitda.formula,
+            inputs: compute.calculations.ebitda.inputs,
+            total_tracker_unrounded:
+              compute.calculations.ebitda.total_tracker_unrounded,
+            result: compute.calculations.ebitda.result_tracker,
+          },
+        },
+      };
+
+      const writebackForm = new FormData();
+      writebackForm.append("tracker_xlsx", trackerFile);
+      writebackForm.append("payload", JSON.stringify(payload));
       const res = await fetch("/api/tenant-credit/writeback", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          tenant_id: tenantId,
-          quarter_id: quarterId,
-          sales: compute.sales,
-          ebitda: compute.ebitda,
-          // Audit payload (Phase 6).
-          source_pdf_filename: file.name,
-          source_pdf_hash: sourcePdfHash,
-          source_entity: extract.source_entity,
-          source_period: extract.source_period,
-          line_items: extract.line_items,
-          normalization_applied: extract.normalization_applied,
-          passed_through: extract.passed_through,
-          unused_labels: compute.unused_labels,
-          intercompany_observed: compute.intercompany_observed,
-          calculations: {
-            sales: {
-              formula: compute.calculations.sales.formula,
-              inputs: compute.calculations.sales.inputs,
-              total_tracker_unrounded:
-                compute.calculations.sales.total_tracker_unrounded,
-              result: compute.calculations.sales.result_tracker,
-            },
-            ebitda: {
-              formula: compute.calculations.ebitda.formula,
-              inputs: compute.calculations.ebitda.inputs,
-              total_tracker_unrounded:
-                compute.calculations.ebitda.total_tracker_unrounded,
-              result: compute.calculations.ebitda.result_tracker,
-            },
-          },
-        }),
+        body: writebackForm,
       });
       if (!res.ok) {
         const detail = await res.json().catch(() => ({}));
@@ -319,14 +404,24 @@ export default function DashboardPage() {
           writing them to the corporate tracker.
         </p>
 
-        <UploadCard
-          tenantId={tenantId}
-          onTenantChange={setTenantId}
-          file={file}
-          onFileChange={setFile}
-          running={running}
-          onRun={handleRun}
+        <TrackerCard
+          file={trackerFile}
+          loading={tenantsLoading}
+          tenants={tenants}
+          onFileChange={handleTrackerUpload}
         />
+
+        {trackerFile && tenants.length > 0 && (
+          <UploadCard
+            tenants={tenants}
+            tenantId={tenantId}
+            onTenantChange={setTenantId}
+            file={file}
+            onFileChange={setFile}
+            running={running}
+            onRun={handleRun}
+          />
+        )}
 
         {extract && compute && (
           <ResultCard extract={extract} compute={compute} />
@@ -350,6 +445,49 @@ export default function DashboardPage() {
         <PastRunsCard runs={runs} />
       </AppShell>
     </ConfigGate>
+  );
+}
+
+function TrackerCard(props: {
+  file: File | null;
+  loading: boolean;
+  tenants: TenantPickerEntry[];
+  onFileChange: (next: File | null) => void;
+}) {
+  const ready = props.tenants.filter((t) => t.tenant_id !== null).length;
+  const totalRecipes = props.tenants.length;
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Step 1 — Upload tracker</CardTitle>
+        <CardDescription>
+          Drop the latest <span className="font-mono">Corporate_Financials_and_P_Ls.xlsx</span>{" "}
+          here. We read column A of the{" "}
+          <span className="font-mono">Corp Financials</span> sheet to
+          populate the tenant picker below.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <Input
+          type="file"
+          accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+          onChange={(e) =>
+            props.onFileChange(e.target.files?.[0] ?? null)
+          }
+          disabled={props.loading}
+        />
+        {props.file && (
+          <p className="text-xs text-neutral-500">
+            {props.file.name} - {formatBytes(props.file.size)}
+            {props.loading
+              ? " - parsing..."
+              : totalRecipes > 0
+                ? ` - ${totalRecipes} tenants found, ${ready} with recipes`
+                : ""}
+          </p>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 
@@ -513,6 +651,7 @@ function WritebackCard(props: {
 }
 
 function UploadCard(props: {
+  tenants: TenantPickerEntry[];
   tenantId: string;
   onTenantChange: (id: string) => void;
   file: File | null;
@@ -523,10 +662,11 @@ function UploadCard(props: {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Upload statement</CardTitle>
+        <CardTitle>Step 2 — Upload statement</CardTitle>
         <CardDescription>
           Pick the tenant, attach the quarter&rsquo;s income statement PDF,
           then run. The PDF is sent to Anthropic Claude for extraction.
+          Tenants without a recipe yet are listed but disabled.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-5">
@@ -541,21 +681,42 @@ function UploadCard(props: {
             <Select
               value={props.tenantId}
               onValueChange={(value) => {
-                // Base UI's Select union-types the value as string | null
-                // for the "no selection" case; the picker is single-select
-                // with a default, so we ignore null.
-                if (value !== null) props.onTenantChange(value);
+                // shadcn / radix Select round-trips the chosen value as
+                // a string. We still guard for the rare "" case the
+                // disabled placeholder might trigger.
+                if (value) props.onTenantChange(value);
               }}
             >
               <SelectTrigger id="tenant" className="w-full">
-                <SelectValue />
+                <SelectValue placeholder="Pick a tenant" />
               </SelectTrigger>
               <SelectContent>
-                {TENANT_OPTIONS.map((opt) => (
-                  <SelectItem key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </SelectItem>
-                ))}
+                {props.tenants.map((opt) => {
+                  // Disabled rows surface in the dropdown so the analyst
+                  // can see who's missing a recipe; they just can't be
+                  // selected. Use display_name as the key because that's
+                  // unique within column A of the tracker.
+                  const disabled = opt.tenant_id === null;
+                  return (
+                    <SelectItem
+                      key={opt.display_name}
+                      value={opt.tenant_id ?? `__disabled__${opt.display_name}`}
+                      disabled={disabled}
+                    >
+                      <span className="flex items-center gap-2">
+                        <span className="font-mono text-xs text-neutral-500">
+                          row {opt.row}
+                        </span>
+                        {opt.display_name}
+                        {disabled && (
+                          <Badge variant="outline" className="ml-1">
+                            no recipe yet
+                          </Badge>
+                        )}
+                      </span>
+                    </SelectItem>
+                  );
+                })}
               </SelectContent>
             </Select>
           </div>

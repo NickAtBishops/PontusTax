@@ -1,21 +1,30 @@
-// POST /api/writeback
-// Phase 5/6. Takes a tenant + quarter + the two computed values, reads
-// the master tracker from samples/, posts to the Cloud Run worker (or
+// POST /api/tenant-credit/writeback
+// Phase 5/6. Takes a tenant + quarter + the two computed values + the
+// analyst's uploaded master tracker, posts to the Cloud Run worker (or
 // localhost in dev), streams the modified xlsx back to the browser for
 // download, AND writes a Firestore audit record (Phase 6) capturing the
 // full extract+compute trace so we can answer "what did we write last
 // Tuesday?" later.
 //
-// Request body (JSON). Required fields:
+// Request:
+//   multipart/form-data
+//     tracker_xlsx:  the master tracker .xlsx the analyst uploaded
+//                    earlier (required). The bundled samples/ copy is
+//                    no longer used at runtime; the analyst owns the
+//                    source of truth, which sidesteps the "the
+//                    repo-bundled tracker is six months stale" trap.
+//     payload:       JSON-encoded request body (string). Schema below.
+//
+// Payload (JSON, required fields):
 //   {
-//     tenant_id:  string,
-//     quarter_id: QuarterId,
-//     sales:      number,
-//     ebitda:     number,
+//     tenant_id:    string,
+//     quarter_id:   QuarterId,
+//     tracker_row:  number,   // 1-indexed row, resolved by /tenants
+//     sales:        number,
+//     ebitda:       number,
 //   }
 //
-// Optional audit fields (the dashboard always sends them; legacy clients
-// or test scripts can omit them and get a partial audit record):
+// Payload (optional audit fields; the dashboard always sends them):
 //   {
 //     source_pdf_filename?:    string,
 //     source_pdf_hash?:        string,   // sha-256 hex from the browser
@@ -35,8 +44,6 @@
 // error; the file isn't returned. The user can retry.
 
 import { NextResponse } from "next/server";
-import { promises as fs } from "node:fs";
-import path from "node:path";
 
 import { getTenantConfig } from "@/lib/tenant-credit/tenant-configs";
 import {
@@ -65,11 +72,10 @@ const WORKER_SHARED_SECRET = process.env.WORKER_SHARED_SECRET ?? "";
 // trip should comfortably fit.
 const WORKER_TIMEOUT_MS = 50_000;
 
-const MASTER_XLSX_PATH = path.join(
-  process.cwd(),
-  "samples",
-  "Corporate_Financials_and_P_Ls.xlsx",
-);
+// The corporate-financials tracker is ~200 KB. Cap at 8 MB so a
+// fat-finger upload of the wrong workbook (or a rich-media variant)
+// doesn't tie up the function.
+const MAX_TRACKER_BYTES = 8 * 1024 * 1024;
 
 // Same justification as /api/extract: force Node.js runtime and give
 // the route enough budget for the Cloud Run round-trip + audit write.
@@ -142,18 +148,65 @@ function asCalculationTrace(x: unknown): AuditCalculationTrace {
 }
 
 export async function POST(req: Request) {
-  let body: unknown;
+  // The route is multipart now: tracker_xlsx as a file + payload as a
+  // single JSON-encoded string field. Using a JSON sub-field keeps the
+  // schema parity with the legacy route (callers stringify the same
+  // object they used before) without inventing a new field per scalar.
+  let form: FormData;
   try {
-    body = await req.json();
+    form = await req.formData();
   } catch {
     return NextResponse.json(
-      { error: "Request body must be valid JSON." },
+      {
+        error:
+          "Request body must be multipart/form-data with `tracker_xlsx` and `payload`.",
+      },
+      { status: 400 },
+    );
+  }
+
+  const trackerFile = form.get("tracker_xlsx");
+  if (!(trackerFile instanceof File)) {
+    return NextResponse.json(
+      { error: "Missing or invalid `tracker_xlsx` field. Must be an .xlsx upload." },
+      { status: 400 },
+    );
+  }
+  if (trackerFile.size === 0) {
+    return NextResponse.json(
+      { error: "Uploaded tracker is empty." },
+      { status: 400 },
+    );
+  }
+  if (trackerFile.size > MAX_TRACKER_BYTES) {
+    return NextResponse.json(
+      {
+        error:
+          `Tracker is ${trackerFile.size} bytes; max accepted is ${MAX_TRACKER_BYTES}.`,
+      },
+      { status: 413 },
+    );
+  }
+
+  const payloadRaw = form.get("payload");
+  if (typeof payloadRaw !== "string") {
+    return NextResponse.json(
+      { error: "Missing `payload` field (JSON string)." },
+      { status: 400 },
+    );
+  }
+  let body: unknown;
+  try {
+    body = JSON.parse(payloadRaw);
+  } catch {
+    return NextResponse.json(
+      { error: "`payload` must be valid JSON." },
       { status: 400 },
     );
   }
   if (!body || typeof body !== "object") {
     return NextResponse.json(
-      { error: "Request body must be a JSON object." },
+      { error: "`payload` must be a JSON object." },
       { status: 400 },
     );
   }
@@ -175,6 +228,19 @@ export async function POST(req: Request) {
       { status: 400 },
     );
   }
+  // tracker_row comes from /tenants and is authoritative; the per-tenant
+  // recipe's hardcoded tracker_row is a default for unit tests only and
+  // would silently mis-write the wrong row if the spreadsheet drifted.
+  if (
+    typeof o.tracker_row !== "number" ||
+    !Number.isInteger(o.tracker_row) ||
+    o.tracker_row < 1
+  ) {
+    return NextResponse.json(
+      { error: "Missing or invalid `tracker_row` (must be a positive integer)." },
+      { status: 400 },
+    );
+  }
   if (
     typeof o.sales !== "number" ||
     !Number.isFinite(o.sales) ||
@@ -188,6 +254,7 @@ export async function POST(req: Request) {
   }
   const tenantId = o.tenant_id;
   const quarterId = o.quarter_id;
+  const trackerRow = o.tracker_row;
   const sales = o.sales;
   const ebitda = o.ebitda;
 
@@ -203,46 +270,38 @@ export async function POST(req: Request) {
 
   const target = trackerColumnsForQuarter(quarterId);
 
-  let xlsxBuffer: Buffer;
-  try {
-    xlsxBuffer = await fs.readFile(MASTER_XLSX_PATH);
-  } catch (err) {
-    return NextResponse.json(
-      {
-        error:
-          `Could not read master tracker at ${MASTER_XLSX_PATH}: ` +
-          (err instanceof Error ? err.message : String(err)),
-      },
-      { status: 500 },
-    );
-  }
+  // Read the analyst-uploaded tracker once. We forward the same bytes
+  // to the worker; the worker writes two cells and streams the modified
+  // workbook back. The original upload is never modified server-side
+  // (it lives only in this request scope).
+  const xlsxBuffer = Buffer.from(await trackerFile.arrayBuffer());
 
   // Build the multipart payload for the worker. Note that the worker's
   // form fields are exactly the WriteRequest fields.
-  const form = new FormData();
-  form.append(
+  const workerForm = new FormData();
+  workerForm.append(
     "xlsx_file",
     new Blob([new Uint8Array(xlsxBuffer)], {
       type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     }),
     "tracker.xlsx",
   );
-  form.append("sheet_name", target.sheet_name);
-  form.append("row", String(tenant.tracker_row));
-  form.append(
+  workerForm.append("sheet_name", target.sheet_name);
+  workerForm.append("row", String(trackerRow));
+  workerForm.append(
     "expected_tenant_substring",
     tenantNameSubstring(tenant.tenant_name),
   );
-  form.append("sales_col", String(target.sales_col));
-  form.append("ebitda_col", String(target.ebitda_col));
-  form.append("sales_value", String(sales));
-  form.append("ebitda_value", String(ebitda));
-  form.append("sales_header_expected", target.sales_header_expected);
-  form.append("ebitda_header_expected", target.ebitda_header_expected);
+  workerForm.append("sales_col", String(target.sales_col));
+  workerForm.append("ebitda_col", String(target.ebitda_col));
+  workerForm.append("sales_value", String(sales));
+  workerForm.append("ebitda_value", String(ebitda));
+  workerForm.append("sales_header_expected", target.sales_header_expected);
+  workerForm.append("ebitda_header_expected", target.ebitda_header_expected);
   if (target.ebitda_header_alternate) {
-    form.append("ebitda_header_alternate", target.ebitda_header_alternate);
+    workerForm.append("ebitda_header_alternate", target.ebitda_header_alternate);
   }
-  form.append("header_row", String(target.header_row));
+  workerForm.append("header_row", String(target.header_row));
 
   // Pull the audit payload from the body before contacting the worker
   // so we can log either outcome.
@@ -283,7 +342,7 @@ export async function POST(req: Request) {
   try {
     workerRes = await fetch(`${WORKER_URL}/writeback`, {
       method: "POST",
-      body: form,
+      body: workerForm,
       headers: workerHeaders,
       // AbortSignal.timeout aborts the underlying socket if the worker
       // doesn't respond inside the window. Without it a hung worker
