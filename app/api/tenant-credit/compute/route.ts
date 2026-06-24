@@ -20,8 +20,8 @@
 
 import { NextResponse } from "next/server";
 
-import { computeFromLineItems, type LineItem } from "@/lib/tenant-credit/methodology";
-import { getTenantConfig } from "@/lib/tenant-credit/tenant-configs";
+import type { LineItem } from "@/lib/tenant-credit/methodology";
+import { computeGeneric } from "@/lib/tenant-credit/generic-methodology";
 
 // Defense-in-depth shape check. The route is server-only but the body
 // crosses an HTTP boundary, so we don't trust the client.
@@ -78,32 +78,28 @@ export async function POST(req: Request) {
       );
     }
   }
-  const tenantId = o.tenant_id;
+  // tenant_id is accepted in the request body so the audit log can
+  // attribute the run, but the generic engine doesn't need it: it
+  // categorizes lines via keyword rules that don't depend on which
+  // tenant produced them. If a per-tenant override ever matters we'd
+  // look it up here.
   const lineItems = o.line_items as LineItem[];
 
-  let config;
+  // The generic engine can't fail on "missing required line" the way
+  // the strict per-tenant engine could — it produces a best-effort
+  // result from whatever it found. The only error path is a thrown
+  // exception from the heuristic itself (e.g. strictSigns: true with a
+  // negative Sales total). 500 is correct for that; 4xx would imply
+  // client error, which this isn't.
   try {
-    config = getTenantConfig(tenantId);
-  } catch (err) {
-    return NextResponse.json(
-      { error: err instanceof Error ? err.message : "Unknown tenant_id." },
-      { status: 400 },
-    );
-  }
-
-  // Engine throws on bad input (missing required line, duplicate,
-  // negative addback, etc.). Those are analyst-actionable, not server
-  // bugs, so they map to 422 (Unprocessable Entity) and the engine's
-  // own error message goes back verbatim so the UI can show it.
-  try {
-    const result = computeFromLineItems(config, lineItems);
+    const result = computeGeneric(lineItems);
     return NextResponse.json(result);
   } catch (err) {
     return NextResponse.json(
       {
         error: err instanceof Error ? err.message : "Computation failed.",
       },
-      { status: 422 },
+      { status: 500 },
     );
   }
 }

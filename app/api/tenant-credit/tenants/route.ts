@@ -21,7 +21,6 @@ import { NextResponse } from "next/server";
 import ExcelJS from "exceljs";
 
 import { TRACKER_LAYOUT } from "@/lib/tenant-credit/tracker-layout";
-import { findTenantIdByDisplayName } from "@/lib/tenant-credit/tenant-configs";
 
 // The corporate-financials master xlsx is ~200 KB. Cap at 8 MB so a
 // fat-finger upload of the wrong workbook (or a rich-media variant)
@@ -32,16 +31,28 @@ const MAX_TRACKER_BYTES = 8 * 1024 * 1024;
 export type TenantPickerEntry = {
   // Column-A spelling exactly as the spreadsheet has it. Used as the
   // display label and round-tripped in the writeback payload so the
-  // worker can sanity-check the row before writing.
+  // writer can sanity-check the row before writing.
   display_name: string;
-  // 1-indexed row number in the Corp Financials sheet. Authoritative;
-  // overrides the tracker_row baked into each tenant's recipe (the
-  // recipe value is just a default for unit tests).
+  // 1-indexed row number in the Corp Financials sheet. Authoritative
+  // for the writeback target cell.
   row: number;
-  // Configured tenant_id (e.g. "pinnacle") if we recognize the name,
-  // null otherwise. Null entries are listed but disabled in the picker.
-  tenant_id: string | null;
+  // Slug derived from the display name (lowercase, hyphenated). Used
+  // as a stable key in the picker and on the audit-log records; the
+  // generic engine doesn't need it for computation, but the audit
+  // log shouldn't lose track of "which tenant did this run target".
+  tenant_id: string;
 };
+
+// Build a slug like "fairfield-automotive-partners-llc" from the
+// display name so each picker row has a stable, URL-safe identifier
+// the audit log can sort and filter on. We strip punctuation and
+// collapse whitespace.
+function slugify(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
 
 // Next.js function tuning. The tracker is small, but ExcelJS still
 // needs Node APIs, and 60s gives us comfortable headroom over a cold
@@ -136,7 +147,7 @@ export async function POST(req: Request) {
     tenants.push({
       display_name: text,
       row: r,
-      tenant_id: findTenantIdByDisplayName(text),
+      tenant_id: slugify(text),
     });
   }
 

@@ -67,7 +67,7 @@ type ExtractResponse = {
 type TenantPickerEntry = {
   display_name: string;
   row: number;
-  tenant_id: string | null;
+  tenant_id: string;
 };
 
 // Shape of the Past Runs entries returned by /api/runs.
@@ -218,19 +218,12 @@ export default function DashboardPage() {
       }
       const data = (await res.json()) as { tenants: TenantPickerEntry[] };
       setTenants(data.tenants);
-      const ready = data.tenants.filter((t) => t.tenant_id !== null);
-      if (ready.length === 0) {
-        toast.warning(
-          `Parsed ${data.tenants.length} tenants but no recipes are configured yet.`,
-        );
+      if (data.tenants.length === 0) {
+        toast.warning("No tenants found in column A of the tracker.");
       } else {
-        // Pre-select the first tenant with a working recipe so the
-        // analyst doesn't have to open the picker just to see who's
-        // ready.
-        setTenantId(ready[0].tenant_id!);
-        toast.success(
-          `Loaded ${data.tenants.length} tenants (${ready.length} ready).`,
-        );
+        // Pre-select the first tenant so the picker isn't blank.
+        setTenantId(data.tenants[0].tenant_id);
+        toast.success(`Loaded ${data.tenants.length} tenants.`);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Tracker parse failed.";
@@ -317,9 +310,14 @@ export default function DashboardPage() {
 
       const payload = {
         tenant_id: tenantId,
+        // tenant_display_name is column-A text from the analyst's own
+        // tracker; the writeback uses its first whitespace/comma-
+        // separated token as the substring the server checks against
+        // column A of the target row.
+        tenant_display_name: selectedTenant.display_name,
         quarter_id: quarterId,
         // tracker_row is authoritative: it comes from the user's own
-        // file (column A row index), not the per-recipe default.
+        // file (column A row index), not a per-recipe default.
         tracker_row: selectedTenant.row,
         sales: compute.sales,
         ebitda: compute.ebitda,
@@ -454,8 +452,7 @@ function TrackerCard(props: {
   tenants: TenantPickerEntry[];
   onFileChange: (next: File | null) => void;
 }) {
-  const ready = props.tenants.filter((t) => t.tenant_id !== null).length;
-  const totalRecipes = props.tenants.length;
+  const total = props.tenants.length;
   return (
     <Card>
       <CardHeader>
@@ -481,8 +478,8 @@ function TrackerCard(props: {
             {props.file.name} - {formatBytes(props.file.size)}
             {props.loading
               ? " - parsing..."
-              : totalRecipes > 0
-                ? ` - ${totalRecipes} tenants found, ${ready} with recipes`
+              : total > 0
+                ? ` - ${total} tenants found`
                 : ""}
           </p>
         )}
@@ -666,7 +663,9 @@ function UploadCard(props: {
         <CardDescription>
           Pick the tenant, attach the quarter&rsquo;s income statement PDF,
           then run. The PDF is sent to Anthropic Claude for extraction.
-          Tenants without a recipe yet are listed but disabled.
+          The compute step uses a generic rule that classifies each line
+          by keyword (operating revenue, net income, addbacks); audit the
+          numbers before writing.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-5">
@@ -681,9 +680,6 @@ function UploadCard(props: {
             <Select
               value={props.tenantId}
               onValueChange={(value) => {
-                // shadcn / radix Select round-trips the chosen value as
-                // a string. We still guard for the rare "" case the
-                // disabled placeholder might trigger.
                 if (value) props.onTenantChange(value);
               }}
             >
@@ -691,32 +687,16 @@ function UploadCard(props: {
                 <SelectValue placeholder="Pick a tenant" />
               </SelectTrigger>
               <SelectContent>
-                {props.tenants.map((opt) => {
-                  // Disabled rows surface in the dropdown so the analyst
-                  // can see who's missing a recipe; they just can't be
-                  // selected. Use display_name as the key because that's
-                  // unique within column A of the tracker.
-                  const disabled = opt.tenant_id === null;
-                  return (
-                    <SelectItem
-                      key={opt.display_name}
-                      value={opt.tenant_id ?? `__disabled__${opt.display_name}`}
-                      disabled={disabled}
-                    >
-                      <span className="flex items-center gap-2">
-                        <span className="font-mono text-xs text-neutral-500">
-                          row {opt.row}
-                        </span>
-                        {opt.display_name}
-                        {disabled && (
-                          <Badge variant="outline" className="ml-1">
-                            no recipe yet
-                          </Badge>
-                        )}
+                {props.tenants.map((opt) => (
+                  <SelectItem key={opt.display_name} value={opt.tenant_id}>
+                    <span className="flex items-center gap-2">
+                      <span className="font-mono text-xs text-neutral-500">
+                        row {opt.row}
                       </span>
-                    </SelectItem>
-                  );
-                })}
+                      {opt.display_name}
+                    </span>
+                  </SelectItem>
+                ))}
               </SelectContent>
             </Select>
           </div>

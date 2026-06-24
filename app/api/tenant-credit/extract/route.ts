@@ -26,11 +26,6 @@ import { NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 
 import { extractFromPdf } from "@/lib/tenant-credit/extraction";
-import { normalizeLineItems } from "@/lib/tenant-credit/normalization";
-import {
-  getTenantConfig,
-  getTenantLabelAliases,
-} from "@/lib/tenant-credit/tenant-configs";
 
 // Anthropic's inline document content block accepts PDFs up to ~32 MB
 // before requiring the Files API. Reject larger uploads at the door
@@ -77,30 +72,12 @@ export async function POST(req: Request) {
   }
   const tenantId = tenantIdRaw;
 
-  // Resolve config + aliases before touching the upload. If the tenant
-  // doesn't exist, fail fast and cheap.
-  try {
-    getTenantConfig(tenantId);
-  } catch (err) {
-    return NextResponse.json(
-      { error: err instanceof Error ? err.message : "Unknown tenant_id." },
-      { status: 400 },
-    );
-  }
-  let aliases;
-  try {
-    aliases = getTenantLabelAliases(tenantId);
-  } catch (err) {
-    return NextResponse.json(
-      {
-        error:
-          err instanceof Error
-            ? err.message
-            : "Tenant has no label aliases configured.",
-      },
-      { status: 400 },
-    );
-  }
+  // The route no longer looks up a per-tenant config. The generic
+  // engine classifies each line item via keyword rules, so we can
+  // process any tenant in the corp financials tracker without first
+  // writing a recipe for them. Accuracy goes down for tenants whose
+  // line-item naming drifts from the common patterns; the analyst is
+  // expected to audit every run for now.
 
   // Size + content-type checks. We accept any PDF MIME the browser
   // might tag, but require the file actually claim to be one.
@@ -172,29 +149,17 @@ export async function POST(req: Request) {
     );
   }
 
-  // Normalize labels. Throws on collision (two raw labels mapping to
-  // the same canonical), which is a "needs analyst review" case, not
-  // something the route should hide.
-  let normResult;
-  try {
-    normResult = normalizeLineItems(raw.line_items, aliases);
-  } catch (err) {
-    return NextResponse.json(
-      {
-        error:
-          err instanceof Error ? err.message : "Normalization failed.",
-        raw_extraction: raw,
-      },
-      { status: 422 },
-    );
-  }
-
+  // No label normalization in the generic flow. The classifier in
+  // lib/tenant-credit/generic-methodology matches on keyword patterns
+  // directly, so we don't need to rewrite "D&A" to "Depreciation
+  // Expense" etc. Surface every label as "passed_through" so the audit
+  // record still shows what the extractor saw.
   return NextResponse.json({
     tenant_id: tenantId,
     source_entity: raw.source_entity,
     source_period: raw.source_period,
-    line_items: normResult.normalized,
-    normalization_applied: normResult.applied,
-    passed_through: normResult.passed_through,
+    line_items: raw.line_items,
+    normalization_applied: [],
+    passed_through: raw.line_items.map((i) => i.label),
   });
 }

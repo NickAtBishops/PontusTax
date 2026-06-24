@@ -46,7 +46,6 @@
 import { NextResponse } from "next/server";
 import ExcelJS from "exceljs";
 
-import { getTenantConfig } from "@/lib/tenant-credit/tenant-configs";
 import {
   ALL_QUARTER_IDS,
   trackerColumnsForQuarter,
@@ -245,15 +244,17 @@ export async function POST(req: Request) {
   const sales = o.sales;
   const ebitda = o.ebitda;
 
-  let tenant;
-  try {
-    tenant = getTenantConfig(tenantId);
-  } catch (err) {
+  // The expected tenant name comes directly from the picker, which got
+  // it from column A of the uploaded tracker. We don't need a per-tenant
+  // config in the generic-engine world; we just need the display name
+  // so the writer can verify it's about to touch the right row.
+  if (typeof o.tenant_display_name !== "string" || !o.tenant_display_name) {
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : "Unknown tenant_id." },
+      { error: "Missing `tenant_display_name`." },
       { status: 400 },
     );
   }
+  const tenantDisplayName = o.tenant_display_name;
 
   const target = trackerColumnsForQuarter(quarterId);
 
@@ -304,7 +305,7 @@ export async function POST(req: Request) {
       xlsxBuffer,
       sheetName: target.sheet_name,
       row: trackerRow,
-      expectedTenantSubstring: tenantNameSubstring(tenant.tenant_name),
+      expectedTenantSubstring: tenantNameSubstring(tenantDisplayName),
       salesCol: target.sales_col,
       ebitdaCol: target.ebitda_col,
       salesValue: sales,
