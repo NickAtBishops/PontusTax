@@ -5,7 +5,7 @@ import { COLLECTIONS } from "@/lib/types";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// GET /api/runs/:id
+// GET /api/tax/runs/:id
 export async function GET(
   _req: Request,
   { params }: { params: Promise<{ id: string }> },
@@ -18,7 +18,7 @@ export async function GET(
   return NextResponse.json({ id: doc.id, ...doc.data() });
 }
 
-// DELETE /api/runs/:id — permanently remove a run and everything attached to
+// DELETE /api/tax/runs/:id — permanently remove a run and everything attached to
 // it: the run doc + its rows/events subcollections, its scrape_state entries,
 // and the uploaded + output files in Storage. Active runs can't be deleted —
 // cancel first (deleting a live run mid-flight would break the worker).

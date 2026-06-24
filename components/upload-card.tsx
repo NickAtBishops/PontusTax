@@ -31,7 +31,7 @@ export function UploadCard() {
     try {
       const form = new FormData();
       form.append("file", file);
-      const res = await fetch("/api/runs", {
+      const res = await fetch("/api/tax/runs", {
         method: "POST",
         body: form,
       });
@@ -48,7 +48,7 @@ export function UploadCard() {
       } else {
         toast.success("Run started");
       }
-      router.push(`/runs/${run.id}`);
+      router.push(`/tax/runs/${run.id}`);
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Upload failed");
     } finally {

@@ -1,55 +1,71 @@
-"use client";
+import Link from "next/link";
+import { Building2, FileSpreadsheet, ReceiptText } from "lucide-react";
 
-import { useState } from "react";
-import { ConfigGate } from "@/components/config-gate";
-import { AppShell } from "@/components/app-shell";
-import { UploadCard } from "@/components/upload-card";
-import { RunsTable } from "@/components/runs-table";
-import { StatCard } from "@/components/stat-card";
-import { fmtMoney } from "@/lib/format";
-import type { RunDoc } from "@/lib/types";
+import { Card } from "@/components/ui/card";
 
-export default function DashboardPage() {
-  const [runs, setRuns] = useState<RunDoc[]>([]);
+export const metadata = {
+  title: "Pontus Capital — Internal Tools",
+};
 
-  const active = runs.filter((r) =>
-    ["queued", "running", "writing_back"].includes(r.status),
-  ).length;
-  const latest = runs.find((r) =>
-    ["done", "done_with_errors"].includes(r.status),
-  );
-  const latestReview = latest
-    ? (latest.totals?.needs_review ?? 0) + (latest.totals?.unreachable ?? 0)
-    : null;
-  const latestDue = latest?.totals?.amount_due ?? null;
-
+// Root landing page. The two tools (Property Tax Checker and Tenant
+// Credit Tracker) used to live in separate repos and on separate Vercel
+// projects. They are now folded into one app behind this picker so the
+// analyst lands on a tools list and clicks through, instead of bouncing
+// between domains.
+export default function HomePage() {
   return (
-    <ConfigGate>
-      <AppShell title="Dashboard">
-        <UploadCard />
-        <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-          <StatCard
-            label="Left to pay"
-            value={latestDue === null ? "—" : fmtMoney(latestDue)}
-            valueClassName={
-              latestDue !== null && latestDue > 0
-                ? "text-red-600"
-                : latestDue === 0
-                  ? "text-emerald-600"
-                  : undefined
-            }
-            sub={latest ? `last finished: ${latest.file_name}` : undefined}
-          />
-          <StatCard
-            label="Needs review"
-            value={latestReview ?? "—"}
-            sub={latest ? "in last finished run" : undefined}
-          />
-          <StatCard label="Active now" value={active} />
-          <StatCard label="Runs" value={runs.length} />
+    <div className="flex min-h-screen flex-col items-center justify-center bg-neutral-50 px-6 py-12">
+      <header className="mb-8 flex flex-col items-center gap-2 text-center">
+        <div className="flex h-10 w-10 items-center justify-center rounded-md bg-primary text-primary-foreground">
+          <Building2 className="h-5 w-5" />
         </div>
-        <RunsTable onRuns={setRuns} />
-      </AppShell>
-    </ConfigGate>
+        <p className="text-[11px] font-medium tracking-wide text-muted-foreground uppercase">
+          Pontus Capital · Internal
+        </p>
+        <h1 className="text-2xl font-semibold tracking-tight">Pick a tool</h1>
+      </header>
+
+      <div className="grid w-full max-w-3xl grid-cols-1 gap-4 md:grid-cols-2">
+        <ToolCard
+          href="/tax"
+          title="Property Tax Checker"
+          description="Upload a property-tax Excel tracker. Each row is looked up on its county portal and a checked copy is produced for download."
+          Icon={FileSpreadsheet}
+        />
+        <ToolCard
+          href="/tenant-credit"
+          title="Tenant Credit Tracker"
+          description="Upload a tenant's quarterly income statement PDF. Computes Sales and EBITDA and writes them into the corporate tracker."
+          Icon={ReceiptText}
+        />
+      </div>
+    </div>
+  );
+}
+
+function ToolCard({
+  href,
+  title,
+  description,
+  Icon,
+}: {
+  href: string;
+  title: string;
+  description: string;
+  Icon: React.ComponentType<{ className?: string }>;
+}) {
+  return (
+    <Link href={href} className="group">
+      <Card className="h-full gap-3 p-6 shadow-none transition-colors group-hover:border-primary group-hover:bg-accent/40">
+        <div className="flex h-9 w-9 items-center justify-center rounded-md border bg-card">
+          <Icon className="h-4.5 w-4.5 text-foreground" />
+        </div>
+        <h2 className="text-base font-semibold">{title}</h2>
+        <p className="text-sm text-muted-foreground">{description}</p>
+        <p className="mt-1 text-xs font-medium text-primary opacity-0 transition-opacity group-hover:opacity-100">
+          Open →
+        </p>
+      </Card>
+    </Link>
   );
 }

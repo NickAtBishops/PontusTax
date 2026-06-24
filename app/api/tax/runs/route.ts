@@ -11,7 +11,7 @@ export const dynamic = "force-dynamic";
 // trackers are far smaller. Anything bigger is almost certainly not a tracker.
 const MAX_FILE_BYTES = 4 * 1024 * 1024;
 
-// GET /api/runs — list runs (newest first)
+// GET /api/tax/runs — list runs (newest first)
 export async function GET() {
   try {
     const snapshot = await adminDb()
@@ -27,7 +27,7 @@ export async function GET() {
   }
 }
 
-// POST /api/runs — upload a workbook and queue a check run
+// POST /api/tax/runs — upload a workbook and queue a check run
 export async function POST(req: Request) {
   try {
     const form = await req.formData();

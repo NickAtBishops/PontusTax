@@ -98,7 +98,7 @@ export function RunsTable({
                 <TableRow
                   key={run.id}
                   className="cursor-pointer"
-                  onClick={() => router.push(`/runs/${run.id}`)}
+                  onClick={() => router.push(`/tax/runs/${run.id}`)}
                 >
                   <TableCell className="max-w-64">
                     <span className="block truncate font-medium">

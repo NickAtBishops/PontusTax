@@ -5,7 +5,7 @@ import { COLLECTIONS } from "@/lib/types";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// GET /api/runs/:id/download — short-lived signed URL for the checked workbook
+// GET /api/tax/runs/:id/download — short-lived signed URL for the checked workbook
 export async function GET(
   _req: Request,
   { params }: { params: Promise<{ id: string }> },

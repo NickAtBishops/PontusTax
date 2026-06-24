@@ -5,9 +5,9 @@ import { Toaster } from "@/components/ui/sonner";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Property Tax Checker — Pontus Capital",
+  title: "Pontus Capital — Internal Tools",
   description:
-    "Excel in → county portal lookup per row → Excel out. Internal tool.",
+    "Property Tax Checker and Tenant Credit Tracker. Pontus Capital internal tooling.",
 };
 
 export default function RootLayout({

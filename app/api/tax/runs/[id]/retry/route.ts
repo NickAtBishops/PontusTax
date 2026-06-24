@@ -7,7 +7,7 @@ import { COLLECTIONS } from "@/lib/types";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// POST /api/runs/:id/retry — re-queue technically failed rows (worker crash,
+// POST /api/tax/runs/:id/retry — re-queue technically failed rows (worker crash,
 // portal unreachable) and start a new worker execution. Business outcomes
 // like NEEDS_REVIEW are deliberate results and are NOT retried automatically.
 export async function POST(

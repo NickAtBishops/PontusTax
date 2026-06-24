@@ -54,3 +54,22 @@ export function adminBucket(): Bucket {
 export function adminProjectId(): string {
   return JSON.parse(serviceAccountRaw()).project_id as string;
 }
+
+// Tenant Credit Tracker uses this graceful-null helper rather than
+// throwing when no credentials are configured. That lets local dev run
+// the extract + compute flow without setting up Firebase; audit writes
+// silently no-op. In production VERCEL_ENV the tenant audit module
+// upgrades the no-op to a hard error so we never write the tracker
+// without a trail. Keep both helpers; the tax checker prefers the
+// throwing adminDb() so its API routes fail loudly when Firestore is
+// misconfigured.
+let cachedAdminDbNullable: Firestore | null | undefined;
+export function getAdminDb(): Firestore | null {
+  if (cachedAdminDbNullable !== undefined) return cachedAdminDbNullable;
+  try {
+    cachedAdminDbNullable = adminDb();
+  } catch {
+    cachedAdminDbNullable = null;
+  }
+  return cachedAdminDbNullable;
+}

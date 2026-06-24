@@ -1,5 +1,5 @@
 {
-  "name": "pontus-tax-checker",
+  "name": "pontus-internal-tools",
   "version": "0.1.0",
   "private": true,
   "scripts": {
@@ -7,13 +7,18 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
     "deploy:firebase": "npx -y firebase-tools deploy --only firestore:rules,firestore:indexes,storage",
-    "worker:test": "cd worker && .venv/bin/python -m pytest tests -q",
-    "worker:dry-run": "cd worker && .venv/bin/python main.py --dry-run --local-xlsx",
+    "worker:tax:test": "cd worker/tax && .venv/bin/python -m pytest tests -q",
+    "worker:tax:dry-run": "cd worker/tax && .venv/bin/python main.py --dry-run --local-xlsx",
     "deploy:rules": "node scripts/deploy-rules.js",
-    "deploy:worker": "gcloud run jobs deploy tax-checker-worker --source worker --region us-west1"
+    "deploy:worker:tax": "gcloud run jobs deploy tax-checker-worker --source worker/tax --region us-west1",
+    "deploy:worker:tenant-credit": "gcloud run deploy tenant-tracker-worker --source worker/tenant-credit --region us-west1"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.105.0",
     "@tanstack/react-table": "^8.21.3",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
@@ -39,9 +44,11 @@
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@vitest/coverage-v8": "^4.1.9",
     "eslint": "^9",
     "eslint-config-next": "16.2.9",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vitest": "^4.1.9"
   }
 }

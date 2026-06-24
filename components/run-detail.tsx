@@ -119,7 +119,7 @@ export function RunDetail({ runId }: { runId: string }) {
   async function download() {
     setBusy("download");
     try {
-      const res = await fetch(`/api/runs/${runId}/download`);
+      const res = await fetch(`/api/tax/runs/${runId}/download`);
       if (!res.ok) {
         toast.error(await readError(res));
         return;
@@ -154,7 +154,7 @@ export function RunDetail({ runId }: { runId: string }) {
               variant="ghost"
               size="sm"
               disabled={busy !== null || run?.cancel_requested}
-              onClick={() => act(`/api/runs/${runId}/cancel`, "Cancel requested")}
+              onClick={() => act(`/api/tax/runs/${runId}/cancel`, "Cancel requested")}
             >
               <OctagonX className="h-4 w-4" />
               {run?.cancel_requested ? "Canceling…" : "Cancel"}
@@ -165,7 +165,7 @@ export function RunDetail({ runId }: { runId: string }) {
               variant="outline"
               size="sm"
               disabled={busy !== null}
-              onClick={() => act(`/api/runs/${runId}/retry`, "Retry queued")}
+              onClick={() => act(`/api/tax/runs/${runId}/retry`, "Retry queued")}
             >
               <RotateCcw className="h-4 w-4" />
               Retry failed rows
@@ -183,7 +183,7 @@ export function RunDetail({ runId }: { runId: string }) {
               fileName={run.file_name}
               status={run.status}
               variant="full"
-              onDeleted={() => router.push("/")}
+              onDeleted={() => router.push("/tax")}
             />
           )}
         </>
@@ -258,7 +258,7 @@ export function RunDetail({ runId }: { runId: string }) {
 function BackLink() {
   return (
     <Link
-      href="/"
+      href="/tax"
       className="inline-flex items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
     >
       <ArrowLeft className="h-3.5 w-3.5" />

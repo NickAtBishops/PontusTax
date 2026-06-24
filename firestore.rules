@@ -38,5 +38,26 @@ service cloud.firestore {
     match /tax_checker_scrape_state/{stateId} {
       allow read, write: if false;
     }
+
+    // Tenant Credit Tracker collections. Every write goes through the
+    // Next.js API routes (Admin SDK), never the browser, so client
+    // writes are denied. Reads stay denied until a Phase 8 dashboard
+    // wants live updates; the current Past Runs view fetches via
+    // /api/tenant-credit/runs (server-side) and doesn't need client
+    // Firestore access.
+    match /tenant_tracker_runs/{runId} {
+      allow read, write: if false;
+
+      match /line_items/{itemId} {
+        allow read, write: if false;
+      }
+      match /calculations/{calcId} {
+        allow read, write: if false;
+      }
+    }
+
+    match /tenant_tracker_configs/{tenantId} {
+      allow read, write: if false;
+    }
   }
 }

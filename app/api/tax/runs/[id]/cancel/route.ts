@@ -6,7 +6,7 @@ import { COLLECTIONS } from "@/lib/types";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// POST /api/runs/:id/cancel — ask the worker to stop after the current row.
+// POST /api/tax/runs/:id/cancel — ask the worker to stop after the current row.
 // Already-checked rows are still written back to the output workbook.
 export async function POST(
   _req: Request,

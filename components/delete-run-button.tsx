@@ -41,7 +41,7 @@ export function DeleteRunButton({
   async function remove() {
     setBusy(true);
     try {
-      const res = await fetch(`/api/runs/${runId}`, { method: "DELETE" });
+      const res = await fetch(`/api/tax/runs/${runId}`, { method: "DELETE" });
       if (!res.ok) {
         toast.error(await readError(res));
         return;

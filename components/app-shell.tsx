@@ -2,11 +2,21 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Building2, LayoutDashboard } from "lucide-react";
+import { Building2, FileSpreadsheet, ReceiptText } from "lucide-react";
 import { Separator } from "@/components/ui/separator";
 import { cn } from "@/lib/utils";
 
-const NAV = [{ href: "/", label: "Dashboard", icon: LayoutDashboard }];
+// One entry per tool. Each entry highlights when pathname matches the
+// tool's prefix exactly OR starts with `<prefix>/`, so /tax/runs/<id>
+// still keeps "Property Tax" lit.
+const NAV = [
+  { href: "/tax", label: "Property Tax", icon: FileSpreadsheet },
+  { href: "/tenant-credit", label: "Tenant Credit", icon: ReceiptText },
+];
+
+function isActive(pathname: string, href: string): boolean {
+  return pathname === href || pathname.startsWith(`${href}/`);
+}
 
 export function AppShell({
   title,
@@ -22,7 +32,7 @@ export function AppShell({
   return (
     <div className="flex min-h-screen">
       <aside className="hidden w-60 shrink-0 flex-col border-r bg-sidebar md:flex">
-        <div className="flex items-center gap-2.5 px-5 py-5">
+        <Link href="/" className="flex items-center gap-2.5 px-5 py-5">
           <div className="flex h-8 w-8 items-center justify-center rounded-md bg-primary text-primary-foreground">
             <Building2 className="h-4 w-4" />
           </div>
@@ -30,9 +40,9 @@ export function AppShell({
             <p className="text-[11px] font-medium tracking-wide text-muted-foreground uppercase">
               Pontus Capital
             </p>
-            <p className="text-sm font-semibold">Property Tax Checker</p>
+            <p className="text-sm font-semibold">Internal Tools</p>
           </div>
-        </div>
+        </Link>
         <Separator />
         <nav className="flex-1 space-y-0.5 p-3">
           {NAV.map(({ href, label, icon: Icon }) => (
@@ -41,7 +51,7 @@ export function AppShell({
               href={href}
               className={cn(
                 "flex items-center gap-2.5 rounded-md px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground",
-                pathname === href && "bg-accent text-foreground",
+                isActive(pathname, href) && "bg-accent text-foreground",
               )}
             >
               <Icon className="h-4 w-4" />
