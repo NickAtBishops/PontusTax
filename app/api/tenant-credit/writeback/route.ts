@@ -44,6 +44,7 @@
 // error; the file isn't returned. The user can retry.
 
 import { NextResponse } from "next/server";
+import ExcelJS from "exceljs";
 
 import { getTenantConfig } from "@/lib/tenant-credit/tenant-configs";
 import {
@@ -57,20 +58,6 @@ import {
   type AuditIntercompany,
   type AuditNormalization,
 } from "@/lib/tenant-credit/audit";
-
-const WORKER_URL = process.env.WORKER_URL ?? "http://localhost:8080";
-
-// Shared bearer token used to authenticate Vercel -> Cloud Run calls.
-// Optional in local dev so you can boot the worker without setting it,
-// but required in production: the worker rejects unauthenticated
-// requests if it has a secret configured and Vercel doesn't send one.
-const WORKER_SHARED_SECRET = process.env.WORKER_SHARED_SECRET ?? "";
-
-// 50s ceiling for the worker call. Leaves ~10s headroom under our
-// 60s maxDuration so the response can still be streamed back even if
-// the worker takes the full window. Cold-start + a 200kb xlsx round-
-// trip should comfortably fit.
-const WORKER_TIMEOUT_MS = 50_000;
 
 // The corporate-financials tracker is ~200 KB. Cap at 8 MB so a
 // fat-finger upload of the wrong workbook (or a rich-media variant)
@@ -270,38 +257,12 @@ export async function POST(req: Request) {
 
   const target = trackerColumnsForQuarter(quarterId);
 
-  // Read the analyst-uploaded tracker once. We forward the same bytes
-  // to the worker; the worker writes two cells and streams the modified
-  // workbook back. The original upload is never modified server-side
-  // (it lives only in this request scope).
-  const xlsxBuffer = Buffer.from(await trackerFile.arrayBuffer());
-
-  // Build the multipart payload for the worker. Note that the worker's
-  // form fields are exactly the WriteRequest fields.
-  const workerForm = new FormData();
-  workerForm.append(
-    "xlsx_file",
-    new Blob([new Uint8Array(xlsxBuffer)], {
-      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    }),
-    "tracker.xlsx",
-  );
-  workerForm.append("sheet_name", target.sheet_name);
-  workerForm.append("row", String(trackerRow));
-  workerForm.append(
-    "expected_tenant_substring",
-    tenantNameSubstring(tenant.tenant_name),
-  );
-  workerForm.append("sales_col", String(target.sales_col));
-  workerForm.append("ebitda_col", String(target.ebitda_col));
-  workerForm.append("sales_value", String(sales));
-  workerForm.append("ebitda_value", String(ebitda));
-  workerForm.append("sales_header_expected", target.sales_header_expected);
-  workerForm.append("ebitda_header_expected", target.ebitda_header_expected);
-  if (target.ebitda_header_alternate) {
-    workerForm.append("ebitda_header_alternate", target.ebitda_header_alternate);
-  }
-  workerForm.append("header_row", String(target.header_row));
+  // Read the analyst-uploaded tracker once. The original upload is
+  // never modified server-side; we build a brand-new buffer in memory
+  // and return it to the browser, so the user's original file on disk
+  // is untouched. ExcelJS's typings want a plain ArrayBuffer (not the
+  // Node Buffer alias) on the load() entry point.
+  const xlsxBuffer = await trackerFile.arrayBuffer();
 
   // Pull the audit payload from the body before contacting the worker
   // so we can log either outcome.
@@ -331,86 +292,47 @@ export async function POST(req: Request) {
     written_by: asString(o.written_by, DEFAULT_WRITTEN_BY),
   };
 
-  // Contact the worker. The Authorization header is only set when the
-  // shared secret is configured; the worker enforces the policy on its
-  // side based on whether IT has a secret set.
-  const workerHeaders: Record<string, string> = {};
-  if (WORKER_SHARED_SECRET) {
-    workerHeaders.Authorization = `Bearer ${WORKER_SHARED_SECRET}`;
-  }
-  let workerRes: Response;
-  try {
-    workerRes = await fetch(`${WORKER_URL}/writeback`, {
-      method: "POST",
-      body: workerForm,
-      headers: workerHeaders,
-      // AbortSignal.timeout aborts the underlying socket if the worker
-      // doesn't respond inside the window. Without it a hung worker
-      // would silently consume the entire 60s maxDuration.
-      signal: AbortSignal.timeout(WORKER_TIMEOUT_MS),
-    });
-  } catch (err) {
-    const reason = err instanceof Error ? err.message : String(err);
-    const isTimeout =
-      err instanceof Error &&
-      (err.name === "TimeoutError" || err.name === "AbortError");
-    // Only surface the local-dev hint outside production so the demo
-    // never shows it. In a deployed Vercel + Cloud Run setup the
-    // boss should see a neutral worker-unreachable message.
-    const devHint =
-      process.env.NODE_ENV !== "production"
-        ? " Boot it with `uvicorn main:app --port 8080` from worker/."
-        : "";
-    const errorMsg = isTimeout
-      ? `Writeback worker at ${WORKER_URL} did not respond within ` +
-        `${WORKER_TIMEOUT_MS / 1000}s.${devHint}`
-      : `Could not reach the writeback worker at ${WORKER_URL}: ${reason}.` +
-        devHint;
-    // The worker is unreachable; we don't have a written_filename
-    // because no file was produced. Still write a failure audit so the
-    // run shows up in Past Runs.
-    await tryWriteAudit({
-      ...auditBase,
-      status: "writeback_failed",
-      worker_warnings: [],
-      error: errorMsg,
-      written_filename: "",
-    });
-    return NextResponse.json({ error: errorMsg }, { status: 502 });
-  }
-
-  if (!workerRes.ok) {
-    const detail = await workerRes.json().catch(() => ({}));
-    const errorMsg =
-      detail.error ?? `Worker returned ${workerRes.status}.`;
-    await tryWriteAudit({
-      ...auditBase,
-      status: "writeback_failed",
-      worker_warnings: [],
-      error: errorMsg,
-      written_filename: "",
-    });
-    return NextResponse.json(
-      { error: errorMsg },
-      { status: workerRes.status },
-    );
-  }
-
-  // Success path. Read the xlsx + headers BEFORE writing audit because
-  // the audit write needs the filename.
-  const newXlsx = await workerRes.arrayBuffer();
-  const warningsHeader = workerRes.headers.get("X-Worker-Warnings");
+  // Run the write in-process using exceljs. We used to round-trip to a
+  // Python (openpyxl) service on Cloud Run, which had two ongoing costs
+  // (a second deploy target + a localhost worker every dev session) for
+  // a payoff that only mattered for complex multi-cell writes. This
+  // route writes exactly two cells, so the JS library handles it.
+  let newXlsx: ArrayBuffer;
   let workerWarnings: string[] = [];
-  if (warningsHeader) {
-    try {
-      const parsed = JSON.parse(warningsHeader);
-      if (Array.isArray(parsed)) {
-        workerWarnings = parsed.filter((s) => typeof s === "string");
-      }
-    } catch {
-      workerWarnings = [warningsHeader];
-    }
+  try {
+    const result = await writeQuarterlyValues({
+      xlsxBuffer,
+      sheetName: target.sheet_name,
+      row: trackerRow,
+      expectedTenantSubstring: tenantNameSubstring(tenant.tenant_name),
+      salesCol: target.sales_col,
+      ebitdaCol: target.ebitda_col,
+      salesValue: sales,
+      ebitdaValue: ebitda,
+      salesHeaderExpected: target.sales_header_expected,
+      ebitdaHeaderExpected: target.ebitda_header_expected,
+      ebitdaHeaderAlternate: target.ebitda_header_alternate ?? null,
+      headerRow: target.header_row,
+    });
+    newXlsx = result.xlsx.buffer.slice(
+      result.xlsx.byteOffset,
+      result.xlsx.byteOffset + result.xlsx.byteLength,
+    ) as ArrayBuffer;
+    workerWarnings = result.warnings;
+  } catch (err) {
+    const refused = err instanceof WritebackRefusedError;
+    const status = refused ? 422 : 500;
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    await tryWriteAudit({
+      ...auditBase,
+      status: "writeback_failed",
+      worker_warnings: [],
+      error: errorMsg,
+      written_filename: "",
+    });
+    return NextResponse.json({ error: errorMsg }, { status });
   }
+
   const filename =
     `Corporate_Financials_and_P_Ls_${quarterId}_${timestamp()}.xlsx`;
 
@@ -430,7 +352,7 @@ export async function POST(req: Request) {
     return NextResponse.json(
       {
         error:
-          `Worker wrote ${filename} but the audit-log write to Firestore ` +
+          `The xlsx was written but the audit-log write to Firestore ` +
           `failed: ${msg}. Re-run after fixing Firestore; the master ` +
           "tracker was not modified.",
       },
@@ -443,14 +365,19 @@ export async function POST(req: Request) {
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "Content-Disposition": `attachment; filename="${filename}"`,
   });
-  if (warningsHeader) headers.set("X-Worker-Warnings", warningsHeader);
+  // Keep the X-Worker-Warnings header name so the existing client-side
+  // toast logic still works; the warnings now come from the in-process
+  // writer instead of the Python worker.
+  if (workerWarnings.length > 0) {
+    headers.set("X-Worker-Warnings", JSON.stringify(workerWarnings));
+  }
 
   return new Response(newXlsx, { status: 200, headers });
 }
 
-// Audit on failure paths is best-effort. We never want a 502 from the
-// worker to be masked by a Firestore outage, and we already returned
-// useful information to the caller before reaching this point.
+// Audit on failure paths is best-effort. We never want a 422/500 to be
+// masked by a Firestore outage; we already returned useful information
+// to the caller before reaching this point.
 async function tryWriteAudit(
   payload: Parameters<typeof writeAuditRun>[0],
 ): Promise<void> {
@@ -459,4 +386,193 @@ async function tryWriteAudit(
   } catch (err) {
     console.error("[audit] failed to write failure record:", err);
   }
+}
+
+// ----------------------------------------------------------------------------
+// In-process xlsx writer (replaces the openpyxl Cloud Run service)
+// ----------------------------------------------------------------------------
+
+// Raised when a precondition fails (wrong sheet, wrong tenant, target
+// cell already populated, etc.). Mapped to HTTP 422 by the caller. The
+// distinction from a plain Error keeps the response code informative.
+class WritebackRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WritebackRefusedError";
+  }
+}
+
+type WriteQuarterlyValuesInput = {
+  xlsxBuffer: ArrayBuffer;
+  sheetName: string;
+  row: number;
+  expectedTenantSubstring: string;
+  salesCol: number;
+  ebitdaCol: number;
+  salesValue: number;
+  ebitdaValue: number;
+  salesHeaderExpected: string;
+  ebitdaHeaderExpected: string;
+  // The AI3 column on the actual tracker reads "Q4 26" instead of
+  // "Q1 26" because of a typo in the source. When set, the writer
+  // accepts that string in place of the expected one and emits a
+  // soft warning rather than refusing.
+  ebitdaHeaderAlternate: string | null;
+  headerRow: number;
+};
+
+type WriteQuarterlyValuesResult = {
+  xlsx: Uint8Array;
+  warnings: string[];
+};
+
+// Validate the workbook and write the two cells. Mirrors the Python
+// openpyxl service one-for-one so the safety guarantees are unchanged:
+// refuse to overwrite a formula, refuse to overwrite a non-empty cell,
+// refuse to write if the row's tenant or the column's header doesn't
+// match what was requested. Returns the new bytes and any soft warnings.
+async function writeQuarterlyValues(
+  input: WriteQuarterlyValuesInput,
+): Promise<WriteQuarterlyValuesResult> {
+  const wb = new ExcelJS.Workbook();
+  try {
+    await wb.xlsx.load(input.xlsxBuffer);
+  } catch (err) {
+    throw new WritebackRefusedError(
+      `Could not parse the uploaded tracker: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  const sheet = wb.getWorksheet(input.sheetName);
+  if (!sheet) {
+    const seen = wb.worksheets.map((w) => `"${w.name}"`).join(", ");
+    throw new WritebackRefusedError(
+      `Sheet "${input.sheetName}" not in workbook. Sheets seen: [${seen}].`,
+    );
+  }
+
+  const warnings: string[] = [];
+
+  // --- 1. Tenant identity check on column A of the target row. -------------
+  const nameText = cellPlainText(sheet.getCell(input.row, 1).value);
+  if (
+    !nameText.toLowerCase().includes(input.expectedTenantSubstring.toLowerCase())
+  ) {
+    throw new WritebackRefusedError(
+      `Row ${input.row} column A is ${JSON.stringify(nameText)}, which does ` +
+        `not contain expected tenant substring ` +
+        `${JSON.stringify(input.expectedTenantSubstring)}. Refusing to write ` +
+        "to a row that may belong to a different tenant.",
+    );
+  }
+
+  // --- 2. Sales column header check. --------------------------------------
+  const salesHeader = cellPlainText(
+    sheet.getCell(input.headerRow, input.salesCol).value,
+  );
+  if (salesHeader !== input.salesHeaderExpected) {
+    throw new WritebackRefusedError(
+      `Sales column header at row ${input.headerRow} col ${input.salesCol} ` +
+        `is ${JSON.stringify(salesHeader)}, expected ` +
+        `${JSON.stringify(input.salesHeaderExpected)}. Refusing to write to ` +
+        "a column that doesn't match the requested quarter.",
+    );
+  }
+
+  // --- 3. EBITDA column header check (with allowlisted typo). -------------
+  const ebitdaHeader = cellPlainText(
+    sheet.getCell(input.headerRow, input.ebitdaCol).value,
+  );
+  if (ebitdaHeader === input.ebitdaHeaderExpected) {
+    // good
+  } else if (
+    input.ebitdaHeaderAlternate !== null &&
+    ebitdaHeader === input.ebitdaHeaderAlternate
+  ) {
+    warnings.push(
+      `EBITDA column header at row ${input.headerRow} col ${input.ebitdaCol} ` +
+        `is ${JSON.stringify(ebitdaHeader)}, the known typo for ` +
+        `${JSON.stringify(input.ebitdaHeaderExpected)}. Writing anyway; ` +
+        "consider fixing the header in the spreadsheet.",
+    );
+  } else {
+    const altSuffix =
+      input.ebitdaHeaderAlternate !== null
+        ? ` (or alternate ${JSON.stringify(input.ebitdaHeaderAlternate)})`
+        : "";
+    throw new WritebackRefusedError(
+      `EBITDA column header at row ${input.headerRow} col ${input.ebitdaCol} ` +
+        `is ${JSON.stringify(ebitdaHeader)}, expected ` +
+        `${JSON.stringify(input.ebitdaHeaderExpected)}${altSuffix}. ` +
+        "Refusing to write.",
+    );
+  }
+
+  // --- 4. Target cells must be empty and must not be formulas. -------------
+  const salesCell = sheet.getCell(input.row, input.salesCol);
+  const ebitdaCell = sheet.getCell(input.row, input.ebitdaCol);
+  for (const [label, cell, col] of [
+    ["Sales", salesCell, input.salesCol] as const,
+    ["EBITDA", ebitdaCell, input.ebitdaCol] as const,
+  ]) {
+    if (isFormulaCell(cell)) {
+      throw new WritebackRefusedError(
+        `${label} target cell (row ${input.row}, col ${col}) contains a ` +
+          `formula: ${JSON.stringify(cell.formula ?? cell.value)}. ` +
+          "Refusing to overwrite a formula.",
+      );
+    }
+    if (!isCellEmpty(cell)) {
+      throw new WritebackRefusedError(
+        `${label} target cell (row ${input.row}, col ${col}) already holds ` +
+          `the value ${JSON.stringify(cell.value)}. Refusing to overwrite a ` +
+          "non-empty cell; clear it first if you really intend to overwrite.",
+      );
+    }
+  }
+
+  // --- 5. Write the values. ----------------------------------------------
+  salesCell.value = input.salesValue;
+  ebitdaCell.value = input.ebitdaValue;
+
+  // --- 6. Serialize back to bytes. ---------------------------------------
+  const out = await wb.xlsx.writeBuffer();
+  return { xlsx: new Uint8Array(out), warnings };
+}
+
+// Coerce ExcelJS cell values to plain text for header/identity checks.
+// Tracker cells may be plain strings, dates, numbers, rich-text arrays,
+// formula objects, or hyperlinks; we want the displayed text in all of
+// those cases.
+function cellPlainText(value: ExcelJS.CellValue): string {
+  if (value == null) return "";
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number") return String(value).trim();
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === "object") {
+    if ("richText" in value && Array.isArray(value.richText)) {
+      return value.richText.map((r) => r.text ?? "").join("").trim();
+    }
+    if ("text" in value && typeof value.text === "string") {
+      return value.text.trim();
+    }
+    if ("result" in value && (value as { result?: unknown }).result != null) {
+      return cellPlainText((value as { result: ExcelJS.CellValue }).result);
+    }
+  }
+  return "";
+}
+
+function isFormulaCell(cell: ExcelJS.Cell): boolean {
+  if (cell.formula) return true;
+  const v = cell.value;
+  if (v && typeof v === "object" && "formula" in v) return true;
+  return false;
+}
+
+function isCellEmpty(cell: ExcelJS.Cell): boolean {
+  const v = cell.value;
+  if (v == null) return true;
+  if (typeof v === "string" && v.trim() === "") return true;
+  return false;
 }
