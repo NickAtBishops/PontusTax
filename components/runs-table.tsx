@@ -84,7 +84,7 @@ export function RunsTable({
                 colSpan={7}
                 className="py-8 text-center text-sm text-muted-foreground"
               >
-                No runs yet — upload a tracker above.
+                No runs yet.
               </TableCell>
             </TableRow>
           ) : (

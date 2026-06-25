@@ -4,7 +4,7 @@ import { Building2, FileSpreadsheet, ReceiptText } from "lucide-react";
 import { Card } from "@/components/ui/card";
 
 export const metadata = {
-  title: "Pontus Capital — Internal Tools",
+  title: "Pontus Capital",
 };
 
 // Root landing page. The two tools (Property Tax Checker and Tenant
@@ -28,14 +28,14 @@ export default function HomePage() {
       <div className="grid w-full max-w-3xl grid-cols-1 gap-4 md:grid-cols-2">
         <ToolCard
           href="/tax"
-          title="Property Tax Checker"
-          description="Upload a property-tax Excel tracker. Each row is looked up on its county portal and a checked copy is produced for download."
+          title="Property Tax"
+          description="Check tax status per county portal."
           Icon={FileSpreadsheet}
         />
         <ToolCard
           href="/tenant-credit"
-          title="Tenant Credit Tracker"
-          description="Upload a tenant's quarterly income statement PDF. Computes Sales and EBITDA and writes them into the corporate tracker."
+          title="Tenant Credit"
+          description="Read PDFs, fill the tracker."
           Icon={ReceiptText}
         />
       </div>

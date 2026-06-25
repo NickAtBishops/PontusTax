@@ -41,12 +41,12 @@ export function UploadCard() {
       }
       const run = await res.json();
       if (run.trigger && !run.trigger.triggered) {
-        toast.warning("Run queued — worker not auto-started", {
+        toast.warning("Queued. Worker not started.", {
           description: run.trigger.detail,
           duration: 10000,
         });
       } else {
-        toast.success("Run started");
+        toast.success("Started.");
       }
       router.push(`/tax/runs/${run.id}`);
     } catch (e) {
@@ -61,9 +61,8 @@ export function UploadCard() {
       <div>
         <h2 className="text-sm font-semibold">Check a tracker</h2>
         <p className="text-sm text-muted-foreground">
-          Upload a property-tax Excel tracker. Every row is looked up on its
-          county portal and a checked copy is produced — the original is never
-          modified.
+          Drop a property-tax .xlsx. Each row gets looked up; a checked
+          copy is produced.
         </p>
       </div>
 
@@ -91,11 +90,10 @@ export function UploadCard() {
       >
         <UploadCloud className="h-5 w-5 text-muted-foreground" />
         <p className="text-sm">
-          Drop an <span className="font-medium">.xlsx</span> tracker here, or
-          click to browse
+          Drop an <span className="font-medium">.xlsx</span>, or click to browse.
         </p>
         <p className="text-xs text-muted-foreground">
-          e.g. “Property Taxes- Florida.xlsx” — any state, any layout
+          Any state, any layout.
         </p>
         <input
           ref={inputRef}
@@ -121,12 +119,10 @@ export function UploadCard() {
             </button>
           </span>
         ) : (
-          <span className="text-xs text-muted-foreground">
-            No file selected
-          </span>
+          <span className="text-xs text-muted-foreground">No file</span>
         )}
         <Button onClick={start} disabled={!file || busy}>
-          {busy ? "Uploading…" : "Check property taxes"}
+          {busy ? "Uploading…" : "Check"}
         </Button>
       </div>
     </Card>

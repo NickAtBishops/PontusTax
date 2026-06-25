@@ -59,16 +59,9 @@ function LoginForm() {
           <div className="flex h-9 w-9 items-center justify-center rounded-md bg-primary text-primary-foreground">
             <Building2 className="h-4.5 w-4.5" />
           </div>
-          <p className="text-[11px] font-medium tracking-wide text-muted-foreground uppercase">
-            Pontus Capital &middot; Internal
-          </p>
+          <p className="text-sm font-semibold">Pontus</p>
         </div>
-        <div>
-          <h1 className="text-base font-semibold">Sign in</h1>
-          <p className="text-sm text-muted-foreground">
-            Enter the shared team password.
-          </p>
-        </div>
+        <h1 className="text-base font-semibold">Sign in</h1>
         <form onSubmit={handleSubmit} className="space-y-3">
           <Input
             type="password"

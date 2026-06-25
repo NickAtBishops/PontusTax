@@ -94,9 +94,8 @@ export function DeleteRunButton({
         <AlertDialogHeader>
           <AlertDialogTitle>Delete this run?</AlertDialogTitle>
           <AlertDialogDescription>
-            “{fileName}” and everything attached to it — the uploaded workbook,
-            the checked output, and all per-row results — will be permanently
-            removed. This can’t be undone.
+            &ldquo;{fileName}&rdquo; and everything attached to it will be
+            permanently deleted.
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>

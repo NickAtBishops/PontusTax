@@ -404,10 +404,10 @@ export default function TenantCreditPage() {
       return next;
     });
     setUnassigned((cur) => [...cur, ...newUnassigned]);
-    if (assigned > 0) toast.success(`Routed ${assigned} PDF${assigned === 1 ? "" : "s"} from the zip.`);
+    if (assigned > 0) toast.success(`Routed ${assigned} PDF${assigned === 1 ? "" : "s"}.`);
     if (newUnassigned.length > 0) {
       toast.warning(
-        `${newUnassigned.length} PDF${newUnassigned.length === 1 ? "" : "s"} couldn't be matched; drag them to the right tenant.`,
+        `${newUnassigned.length} unmatched. Assign below.`,
       );
     }
   }
@@ -426,7 +426,7 @@ export default function TenantCreditPage() {
       (s) => s.pdf !== null && s.status !== "computed",
     );
     if (ready.length === 0) {
-      toast.info("Every tenant with a PDF is already computed.");
+      toast.info("Already computed.");
       return;
     }
     setRunning(true);
@@ -501,7 +501,7 @@ export default function TenantCreditPage() {
           toast.error(`${entry.tenant.display_name}: ${msg}`);
         }
       });
-      toast.success("Batch complete. Review the results table below.");
+      toast.success("Done.");
     } finally {
       setRunning(false);
     }
@@ -515,7 +515,7 @@ export default function TenantCreditPage() {
       return;
     }
     if (tenantsWithData.length === 0) {
-      toast.error("No tenants have been computed yet.");
+      toast.error("Nothing computed yet.");
       return;
     }
     setWriting(true);
@@ -606,13 +606,6 @@ export default function TenantCreditPage() {
   return (
     <ConfigGate>
       <AppShell title="Tenant Credit Tracker">
-        <p className="text-sm text-muted-foreground">
-          Upload the corporate financials tracker, then a PDF per tenant.
-          Each PDF goes through Claude for line-item extraction and a
-          generic compute rule for Sales, EBITDA, Interest, Rent, Cash,
-          CFO, and Capex. Numbers land in the right cells when you click
-          Write at the bottom.
-        </p>
 
         <TrackerCard
           file={trackerFile}
@@ -677,13 +670,10 @@ function TrackerCard(props: {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Step 1 — Upload tracker</CardTitle>
+        <CardTitle>1. Tracker</CardTitle>
         <CardDescription>
-          Drop the latest{" "}
-          <span className="font-mono">Corporate_Financials_and_P_Ls.xlsx</span>{" "}
-          here. We read column A of the{" "}
-          <span className="font-mono">Corp Financials</span> sheet to
-          populate the tenant cards below.
+          Drop{" "}
+          <span className="font-mono">Corporate_Financials_and_P_Ls.xlsx</span>.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
@@ -718,10 +708,9 @@ function QuarterAndZipCard(props: {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Step 2 — Pick quarter, attach PDFs</CardTitle>
+        <CardTitle>2. Quarter &amp; PDFs</CardTitle>
         <CardDescription>
-          One quarter for the whole batch. Drag PDFs onto each tenant
-          card below, or drop a zip here to auto-route by filename.
+          One quarter per batch. Drag PDFs to cards, or drop a zip.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -759,15 +748,14 @@ function QuarterAndZipCard(props: {
               onChange={(e) => props.onZipUpload(e.target.files?.[0] ?? null)}
             />
             <p className="text-xs text-neutral-500">
-              Files like{" "}
+              Files named like{" "}
               <span className="font-mono">Pinnacle_Q1_2026.pdf</span>{" "}
-              route to the matching tenant card automatically. Unmatched
-              files surface in the Unassigned bucket below.
+              auto-route by filename.
             </p>
           </div>
         </div>
         <p className="text-xs text-neutral-500">
-          {props.loadedCount} of {props.totalCount} tenants have a PDF attached.
+          {props.loadedCount} / {props.totalCount} attached.
         </p>
       </CardContent>
     </Card>
@@ -783,11 +771,7 @@ function TenantGrid(props: {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Step 3 — Tenants</CardTitle>
-        <CardDescription>
-          One card per tenant from column A of the tracker. Drop the
-          tenant&rsquo;s quarterly PDF on its card.
-        </CardDescription>
+        <CardTitle>3. Tenants</CardTitle>
       </CardHeader>
       <CardContent>
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
@@ -919,11 +903,8 @@ function UnassignedCard(props: {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Unassigned PDFs</CardTitle>
-        <CardDescription>
-          These came out of the zip but didn&rsquo;t match a tenant
-          name. Pick the right tenant from the dropdown for each one.
-        </CardDescription>
+        <CardTitle>Unassigned</CardTitle>
+        <CardDescription>Pick a tenant for each.</CardDescription>
       </CardHeader>
       <CardContent>
         <ul className="space-y-2">
@@ -976,27 +957,21 @@ function ActionsCard(props: {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Step 4 — Run + write</CardTitle>
-        <CardDescription>
-          Extract + compute every loaded PDF in one click. Then review
-          the results table below and download the filled-in tracker.
-        </CardDescription>
+        <CardTitle>4. Run &amp; write</CardTitle>
       </CardHeader>
       <CardContent className="flex flex-wrap items-center gap-3">
         <Button
           onClick={props.onRunAll}
           disabled={props.running || props.writing || props.loadedCount === 0}
         >
-          {props.running ? "Running…" : `Extract & compute (${props.loadedCount} loaded)`}
+          {props.running ? "Running…" : `Extract & compute (${props.loadedCount})`}
         </Button>
         <Button
           onClick={props.onWriteAll}
           disabled={props.running || props.writing || props.readyCount === 0}
           variant={props.readyCount > 0 ? "default" : "outline"}
         >
-          {props.writing
-            ? "Writing…"
-            : `Write ${props.readyCount} tenant${props.readyCount === 1 ? "" : "s"} to ${props.quarterLabel}`}
+          {props.writing ? "Writing…" : `Write ${props.readyCount} to ${props.quarterLabel}`}
         </Button>
       </CardContent>
     </Card>
@@ -1007,12 +982,8 @@ function ResultsTable(props: { rows: TenantState[] }) {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Step 5 — Review</CardTitle>
-        <CardDescription>
-          All values in $000s. EBITDA Margin is computed inline as a
-          sanity check; the tracker recomputes it from Sales and EBITDA
-          once you write.
-        </CardDescription>
+        <CardTitle>5. Review</CardTitle>
+        <CardDescription>All values in $000s.</CardDescription>
       </CardHeader>
       <CardContent className="overflow-x-auto">
         <Table>

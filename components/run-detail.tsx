@@ -194,7 +194,7 @@ export function RunDetail({ runId }: { runId: string }) {
       {run?.trigger_error && run.status === "queued" && (
         <Alert>
           <TerminalSquare className="h-4 w-4" />
-          <AlertTitle>Queued — worker not auto-started</AlertTitle>
+          <AlertTitle>Queued. Worker not started.</AlertTitle>
           <AlertDescription className="font-mono text-xs">
             {run.trigger_error}
           </AlertDescription>
@@ -287,11 +287,10 @@ function OutstandingCard({
     <Card className="gap-0 overflow-hidden border-red-200 p-0 shadow-none">
       <div className="border-b border-red-200 bg-red-50/60 px-5 py-3.5">
         <h2 className="text-sm font-semibold text-red-900">
-          Outstanding balances — left to pay
+          Left to pay
         </h2>
         <p className="text-xs text-red-700/80">
-          Live amounts owed right now (incl. penalties/interest) as shown by
-          each county portal.
+          Live amounts owed (incl. penalties/interest).
         </p>
       </div>
       {owed.length === 0 ? (
@@ -614,7 +613,7 @@ function RowSheet({
                             {row.input.url}
                           </a>
                         ) : (
-                          "— (portal discovered by search)"
+                          "discovered by search"
                         )
                       }
                     />
@@ -768,7 +767,7 @@ function SummaryCard({ run }: { run: RunDoc }) {
                   <span className="font-mono text-xs tabular-nums">
                     {r.sheet} · row {r.row}
                   </span>{" "}
-                  — {r.reason}
+                  · {r.reason}
                 </li>
               ))}
             </ul>

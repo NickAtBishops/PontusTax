@@ -36,12 +36,7 @@ export function AppShell({
           <div className="flex h-8 w-8 items-center justify-center rounded-md bg-primary text-primary-foreground">
             <Building2 className="h-4 w-4" />
           </div>
-          <div className="leading-tight">
-            <p className="text-[11px] font-medium tracking-wide text-muted-foreground uppercase">
-              Pontus Capital
-            </p>
-            <p className="text-sm font-semibold">Internal Tools</p>
-          </div>
+          <p className="text-sm font-semibold">Pontus</p>
         </Link>
         <Separator />
         <nav className="flex-1 space-y-0.5 p-3">

@@ -4,8 +4,8 @@ import { Building2 } from "lucide-react";
 import { isFirebaseConfigured } from "@/lib/firebase";
 import { Card } from "@/components/ui/card";
 
-/** Blocks rendering until Firebase env vars exist — components behind this
- *  gate touch `db` directly, which is undefined without a web config. */
+// Blocks rendering until Firebase env vars exist. Components behind
+// this gate touch `db` directly; it's undefined without a web config.
 export function ConfigGate({ children }: { children: React.ReactNode }) {
   if (!isFirebaseConfigured) {
     return (
@@ -15,16 +15,13 @@ export function ConfigGate({ children }: { children: React.ReactNode }) {
             <div className="flex h-9 w-9 items-center justify-center rounded-md bg-primary text-primary-foreground">
               <Building2 className="h-4.5 w-4.5" />
             </div>
-            <p className="text-[11px] font-medium tracking-wide text-muted-foreground uppercase">
-              Pontus Capital · Internal
-            </p>
+            <p className="text-sm font-semibold">Pontus</p>
           </div>
-          <p className="text-sm font-medium">Firebase isn’t configured yet</p>
+          <p className="text-sm font-medium">Firebase not configured</p>
           <p className="text-sm text-muted-foreground">
             Copy <code className="font-mono text-xs">.env.example</code> to{" "}
-            <code className="font-mono text-xs">.env.local</code>, fill in the
-            Firebase web config + service account, then restart the dev
-            server. Full steps are in the README.
+            <code className="font-mono text-xs">.env.local</code>, fill in
+            the Firebase keys, restart dev.
           </p>
         </Card>
       </div>
