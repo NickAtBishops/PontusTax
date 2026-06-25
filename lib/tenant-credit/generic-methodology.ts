@@ -1,66 +1,53 @@
 // Generic methodology engine. Pure functions, no I/O.
 //
-// The per-tenant "recipe" model (lib/tenant-credit/methodology.ts) is
-// accurate but bottlenecked on having to hand-write a config per tenant.
-// This module gives up that accuracy in exchange for working out of the
-// box for every tenant: it classifies each line item from the PDF via
-// keyword rules and computes Sales + EBITDA from whatever it found.
+// Classifies each line item from the source PDF via keyword rules and
+// computes seven tracker metrics — Sales, EBITDA, Interest, Rent,
+// Cash, CFO, Capex — from whatever it found. The remaining tracker
+// columns (EBITDA Margin, EBITDAR, Total Debt, FCF, FCCR, leverage)
+// are tracker formulas that recompute themselves once these seven
+// land in their cells, so the engine never produces them directly.
 //
 // What this engine deliberately does NOT do:
 //   - Read PDFs. The extract route still does that via Claude.
 //   - Touch the xlsx. The writeback route still does that.
-//   - Pretend to be authoritative. The patterns below cover the common
-//     case; the analyst has to audit every run and tell us when a line
-//     was miscategorized so we can refine the rules.
-//
-// The output shape mirrors lib/tenant-credit/methodology.ts ComputeResult
-// one-for-one so callers (audit log, dashboard cards, writeback) don't
-// have to branch on which engine produced the result.
+//   - Pretend to be authoritative. The patterns cover the common case;
+//     the analyst has to audit every run and tell us when a line was
+//     mis-categorized so we can refine the rules.
 
-import type {
-  CalculationInput,
-  CalculationTrace,
-  ComputeResult,
-  IntercompanyObservation,
-  LineItem,
-} from "@/lib/tenant-credit/methodology";
+import type { LineItem } from "@/lib/tenant-credit/methodology";
 
-// The four buckets a line can fall into. "ignore" is intentionally
-// explicit so the audit trace shows the analyst we saw the line and
-// chose not to use it (rather than silently dropping it).
+// Buckets a single line can fall into. Each one drives at most one
+// tracker cell, except "ebitda_addback" which feeds the EBITDA
+// reconstruction alongside "net_income". "ignore" is intentional and
+// surfaces in the audit trace with a reason.
 export type LineCategory =
   | "sales"
   | "net_income"
   | "ebitda_addback"
+  | "interest_expense"
+  | "rent_expense"
+  | "cash"
+  | "cfo"
+  | "capex"
   | "intercompany"
   | "ignore";
 
-// What was matched, and why. Surfaced in the calculation trace so the
-// analyst can audit a single line: "this came in as a Sale because its
-// label contains 'sales'".
 export type CategoryDecision = {
   category: LineCategory;
   reason: string;
 };
 
-// Pattern → category, evaluated in order. Earlier rules win, which
-// matters because "rent income" must match the EXCLUDE rule for Sales
-// before the generic INCLUDE rule for "income". Each pattern matches
-// the lowercased, whitespace-normalized label.
-//
-// Adjusting these rules is the main maintenance lever. When the analyst
-// finds a mis-categorized line, add a rule above the looser ones.
 type Rule = {
-  // Word-boundary regex matched against the normalized label.
+  // Word-boundary regex matched against the lowercased, whitespace-
+  // normalized label.
   pattern: RegExp;
   category: LineCategory;
   reason: string;
 };
 
 const RULES: Rule[] = [
-  // -- HARD EXCLUDES (must come before any include rule that would catch them)
-  // Intercompany pairs net to zero; we log them but neither side
-  // contributes to Sales or EBITDA.
+  // -- HARD EXCLUDES first; the include rules below must not catch them.
+  // Intercompany pairs net to zero; logged, never math.
   {
     pattern: /\bintercompany\b|\binter-company\b/,
     category: "intercompany",
@@ -72,15 +59,12 @@ const RULES: Rule[] = [
     reason: "common intercompany pair (management income/fee)",
   },
 
-  // Rent is non-operating for tenants (they pay it, the landlord
-  // collects it). The credit tracker is tenant-side, so rent income
-  // doesn't belong in Sales.
+  // Rent INCOME (landlord side) is non-operating for tenants.
   {
     pattern: /\b(rent|rental|lease) income\b/,
     category: "ignore",
     reason: "rent income is non-operating for this credit tracker",
   },
-
   // Non-operating income lines.
   {
     pattern: /\binterest income\b|\binvestment income\b|\bdividend income\b/,
@@ -92,31 +76,72 @@ const RULES: Rule[] = [
     category: "ignore",
     reason: "'Other income' is typically non-operating; audit before including",
   },
-
-  // Subtotal lines we never want to double-count.
+  // Subtotals: would double-count.
   {
     pattern: /\btotal\b/,
     category: "ignore",
-    reason: "subtotal line; would double-count operating revenue",
+    reason: "subtotal line; would double-count",
   },
   {
     pattern: /\b(gross|operating) (profit|margin)\b/,
     category: "ignore",
     reason: "computed metric, not a raw line item",
   },
+
+  // -- Balance sheet: CASH ---------------------------------------------
   {
-    pattern: /\bnet (sales|revenue)\b/,
-    category: "sales",
-    reason: "explicit net-of-returns top line",
+    pattern: /\bcash and (cash )?equivalents?\b/,
+    category: "cash",
+    reason: "balance-sheet cash & equivalents",
+  },
+  {
+    pattern: /^cash$|\bcash on hand\b|\bcash balance\b/,
+    category: "cash",
+    reason: "balance-sheet cash",
   },
 
-  // -- EBITDA components (must come before the loose Sales include
-  // because "depreciation" could otherwise look like nothing useful and
-  // the catch-all wouldn't grab it).
+  // -- Cash flow statement: CFO + Capex --------------------------------
+  // Capex must come BEFORE the broader CFO pattern, since "purchases of
+  // property" appears inside cash-flow-from-investing lines that some
+  // statements label "cash used in investing" — we want the capex bucket.
+  {
+    pattern: /\bcapital expenditures?\b|\bcapex\b/,
+    category: "capex",
+    reason: "capital expenditure line",
+  },
+  {
+    pattern: /\bpurchases? of (property|equipment|plant)/,
+    category: "capex",
+    reason: "capex (purchase of fixed assets)",
+  },
+  {
+    pattern:
+      /\b(net )?cash (provided by|from|used in) operating activities\b|\boperating cash flow\b|\bcash from operations\b/,
+    category: "cfo",
+    reason: "cash flow from operations",
+  },
+
+  // -- Income statement bottom-line + EBITDA addbacks ------------------
   {
     pattern: /\bnet (income|earnings|loss)\b/,
     category: "net_income",
-    reason: "the EBITDA reconstruction starts here",
+    reason: "starting point of the EBITDA reconstruction",
+  },
+  // Interest expense double-duties: it goes into the EBITDA addback
+  // bucket AND into the Interest tracker column. We pick the more
+  // specific bucket here and let the compute function copy the sum
+  // into both metrics.
+  {
+    pattern: /\binterest (expense|paid|cost)\b|^interest$/,
+    category: "interest_expense",
+    reason: "interest expense (added back for EBITDA; written to Interest col)",
+  },
+  // Rent expense same shape: feeds EBITDA-neutral (rent is operating, so
+  // NOT added back for plain EBITDA), but populates the Rent tracker col.
+  {
+    pattern: /\brent (expense|paid|cost)\b|\blease (expense|cost)\b/,
+    category: "rent_expense",
+    reason: "rent expense (written to Rent col; not an EBITDA addback)",
   },
   {
     pattern: /\bdepreciation\b/,
@@ -129,14 +154,9 @@ const RULES: Rule[] = [
     reason: "non-cash; added back for EBITDA",
   },
   {
-    pattern: /\bd\s*&\s*a\b/,  // "D&A" or "D & A"
+    pattern: /\bd\s*&\s*a\b/,
     category: "ebitda_addback",
     reason: "combined depreciation & amortization; added back for EBITDA",
-  },
-  {
-    pattern: /\binterest (expense|paid|cost)\b|\binterest$/,
-    category: "ebitda_addback",
-    reason: "financing cost; added back for EBITDA",
   },
   {
     pattern: /\b(income tax|tax expense|provision for tax)/,
@@ -144,16 +164,19 @@ const RULES: Rule[] = [
     reason: "income taxes; added back for EBITDA",
   },
 
-  // -- SALES (operating revenue). Loose include comes last so the
-  // excludes above get first crack.
+  // -- Sales (loose include; runs last so excludes get first crack).
+  {
+    pattern: /\bnet (sales|revenue)\b/,
+    category: "sales",
+    reason: "explicit net-of-returns top line",
+  },
   {
     pattern: /\b(sales|revenue|income)\b/,
     category: "sales",
     reason: "label looks like operating revenue",
   },
 
-  // Anything else (expenses, fees, COGS, etc.) is intentionally
-  // unmatched; falls through to the default "ignore".
+  // Anything else (COGS, labor, SG&A) falls through to "ignore".
 ];
 
 function normalize(label: string): string {
@@ -170,170 +193,254 @@ export function classifyLineItem(label: string): CategoryDecision {
   return { category: "ignore", reason: "no rule matched; assumed non-revenue" };
 }
 
-// Pair intercompany lines (income leg + expense leg) when both sides
-// appear in the input and have matching magnitudes. We don't insist on
-// the labels being a known pair; the rule "two intercompany lines with
-// the same absolute amount" matches the common Management Income /
-// Management Fee shape and most lookalikes.
+// One contributing line in a metric trace. Both raw and tracker-units
+// amounts are recorded so the audit log can show both views.
+export type MetricContribution = {
+  label: string;
+  amount_source: number;
+  amount_tracker: number;
+  reason: string;
+};
+
+// One metric's full trace. result is the integer the writer will put
+// into the cell; contributions is the audit list. null result means
+// the PDF didn't carry anything we could classify into this bucket;
+// the writer leaves the cell empty for the analyst to fill in by hand.
+export type MetricTrace = {
+  metric:
+    | "sales" | "ebitda" | "interest" | "rent"
+    | "cash" | "cfo" | "capex";
+  formula: string;
+  contributions: MetricContribution[];
+  total_tracker_unrounded: number;
+  result_tracker: number | null;
+};
+
+export type IntercompanyObservation = {
+  income_label: string;
+  expense_label: string;
+  income_amount_source: number;
+  expense_amount_source: number;
+  amounts_match: boolean;
+};
+
+// What the engine returns. The seven metrics live in `metrics` keyed by
+// MetricKey so the writer can iterate them in WRITABLE_METRICS order
+// without branching per metric. Convenience scalars (`sales`, `ebitda`,
+// ...) duplicate the same numbers for code paths that just want one
+// value (e.g. the results table in the UI).
+export type ComputeResult = {
+  sales: number | null;
+  ebitda: number | null;
+  interest: number | null;
+  rent: number | null;
+  cash: number | null;
+  cfo: number | null;
+  capex: number | null;
+  metrics: Record<MetricTrace["metric"], MetricTrace>;
+  intercompany_observed: IntercompanyObservation[];
+  // Lines the classifier dropped, with the reason. The dashboard shows
+  // these so the analyst can spot a mis-categorization (e.g. a new
+  // revenue line we didn't match).
+  unused_labels: string[];
+};
+
 function findIntercompanyPairs(
   items: LineItem[],
   classifications: Map<string, CategoryDecision>,
 ): IntercompanyObservation[] {
-  const intercompany = items.filter(
+  const ic = items.filter(
     (i) => classifications.get(i.label)?.category === "intercompany",
   );
-  if (intercompany.length === 0) return [];
+  if (ic.length === 0) return [];
 
-  // Heuristic split: lines whose labels contain "income" are the income
-  // leg, the rest are expense legs. Some files reverse this convention
-  // but the pairing logic below tolerates either order.
-  const incomeLegs = intercompany.filter((i) =>
-    /\bincome\b/.test(normalize(i.label)),
-  );
-  const expenseLegs = intercompany.filter(
-    (i) => !/\bincome\b/.test(normalize(i.label)),
-  );
+  const incomeLegs = ic.filter((i) => /\bincome\b/.test(normalize(i.label)));
+  const expenseLegs = ic.filter((i) => !/\bincome\b/.test(normalize(i.label)));
 
-  const observations: IntercompanyObservation[] = [];
+  const observed: IntercompanyObservation[] = [];
   const matched = new Set<string>();
   for (const income of incomeLegs) {
-    // Pair with the unmatched expense leg whose absolute amount is
-    // closest to the income leg's. Cent-level tolerance.
     let best: { expense: LineItem; diff: number } | null = null;
     for (const expense of expenseLegs) {
       if (matched.has(expense.label)) continue;
       const diff = Math.abs(
         Math.abs(income.amount) - Math.abs(expense.amount),
       );
-      if (best === null || diff < best.diff) {
-        best = { expense, diff };
-      }
+      if (best === null || diff < best.diff) best = { expense, diff };
     }
     if (best === null) continue;
     matched.add(best.expense.label);
-    observations.push({
+    observed.push({
       income_label: income.label,
       expense_label: best.expense.label,
       income_amount_source: income.amount,
       expense_amount_source: best.expense.amount,
       amounts_match: best.diff < 0.01,
-      net_effect_on_ebitda_source: 0,
     });
   }
-  return observations;
+  return observed;
 }
 
-function toCalcInput(item: LineItem): CalculationInput {
+// Build one metric's trace from the line items classified into a given
+// bucket. `formulaLabel` controls how the audit string reads, e.g.
+// "Net Income + Depreciation Expense + Interest Paid" for EBITDA.
+function traceFor(
+  metric: MetricTrace["metric"],
+  items: LineItem[],
+  classifications: Map<string, CategoryDecision>,
+  contributions: { item: LineItem; sign: 1 | -1 }[],
+): MetricTrace {
+  const _ = [items, classifications]; // keep signature symmetrical
+  void _;
+
+  const trace: MetricContribution[] = contributions.map(({ item }) => {
+    const decision = classifications.get(item.label);
+    return {
+      label: item.label,
+      amount_source: item.amount,
+      amount_tracker: item.amount / 1000,
+      reason: decision?.reason ?? "matched",
+    };
+  });
+
+  const formula =
+    contributions.length === 0
+      ? "no matching lines found in the PDF"
+      : contributions
+          .map((c, i) =>
+            i === 0
+              ? c.item.label
+              : c.sign > 0
+                ? `+ ${c.item.label}`
+                : `- ${c.item.label}`,
+          )
+          .join(" ");
+
+  const totalSource = contributions.reduce(
+    (acc, c) => acc + c.sign * c.item.amount,
+    0,
+  );
+  const totalTracker = totalSource / 1000;
+  // A null result tells the writer "no source data — leave the cell
+  // alone". Zero is a real value (e.g. paid off all debt) and gets
+  // written.
+  const result = contributions.length === 0 ? null : Math.round(totalTracker);
+
   return {
-    label: item.label,
-    amount_source: item.amount,
-    // Tracker is in $000s. Round-to-tracker happens once, at the end;
-    // here we just record the raw value in tracker units for the trace.
-    amount_tracker: item.amount / 1000,
+    metric,
+    formula,
+    contributions: trace,
+    total_tracker_unrounded: totalTracker,
+    result_tracker: result,
   };
 }
 
-export type GenericComputeOptions = {
-  // When true, throw on any sign weirdness (e.g. negative Sales) instead
-  // of returning a result the analyst might miss. Defaults to false so
-  // loss-making tenants still get a result.
-  strictSigns?: boolean;
-};
-
-export function computeGeneric(
-  items: LineItem[],
-  options: GenericComputeOptions = {},
-): ComputeResult {
-  // Bucket every line item once so the trace is consistent.
+export function computeGeneric(items: LineItem[]): ComputeResult {
   const classifications = new Map<string, CategoryDecision>();
   for (const item of items) {
     classifications.set(item.label, classifyLineItem(item.label));
   }
 
-  const salesItems = items.filter(
-    (i) => classifications.get(i.label)?.category === "sales",
-  );
-  const netIncomeItems = items.filter(
-    (i) => classifications.get(i.label)?.category === "net_income",
-  );
-  const addbackItems = items.filter(
-    (i) => classifications.get(i.label)?.category === "ebitda_addback",
-  );
-
-  // SALES = sum of every line bucketed as "sales".
-  const salesInputs = salesItems.map(toCalcInput);
-  const salesSourceTotal = salesInputs.reduce(
-    (acc, i) => acc + i.amount_source,
-    0,
-  );
-  const salesTrackerUnrounded = salesSourceTotal / 1000;
-  const salesResult = Math.round(salesTrackerUnrounded);
-
-  if (options.strictSigns && salesResult < 0) {
-    throw new Error(
-      `Computed Sales (${salesResult}) is negative; check the source ` +
-        "PDF — Sales should be positive on a healthy operating quarter.",
-    );
+  // Bucket every input by category for easy access below.
+  const byCategory = new Map<LineCategory, LineItem[]>();
+  for (const item of items) {
+    const c = classifications.get(item.label)!.category;
+    const bucket = byCategory.get(c) ?? [];
+    bucket.push(item);
+    byCategory.set(c, bucket);
   }
+  const grab = (c: LineCategory) => byCategory.get(c) ?? [];
 
-  // EBITDA = Net Income + sum of addback lines. Net Income carries its
-  // own sign (negative for a loss); addbacks (Interest, D&A, Tax) are
-  // reported as positive magnitudes by the extractor.
-  const ebitdaInputs = [...netIncomeItems, ...addbackItems].map(toCalcInput);
-  const ebitdaSourceTotal = ebitdaInputs.reduce(
-    (acc, i) => acc + i.amount_source,
-    0,
+  // Sales: every operating-revenue line, summed.
+  const salesTrace = traceFor(
+    "sales",
+    items,
+    classifications,
+    grab("sales").map((item) => ({ item, sign: 1 })),
   );
-  const ebitdaTrackerUnrounded = ebitdaSourceTotal / 1000;
-  const ebitdaResult = Math.round(ebitdaTrackerUnrounded);
 
-  // Intercompany pairs are logged but never affect the math; Net Income
-  // already nets them (they go through both sides of the income
-  // statement). Surfacing them in the audit lets the analyst sanity-check
-  // that we noticed the common shape.
+  // EBITDA reconstruction: Net Income + addbacks + interest expense
+  // (interest is always added back for EBITDA, regardless of whether it
+  // also feeds the Interest tracker column).
+  const ebitdaContribs: { item: LineItem; sign: 1 | -1 }[] = [
+    ...grab("net_income").map((item) => ({ item, sign: 1 as const })),
+    ...grab("ebitda_addback").map((item) => ({ item, sign: 1 as const })),
+    ...grab("interest_expense").map((item) => ({ item, sign: 1 as const })),
+  ];
+  const ebitdaTrace = traceFor(
+    "ebitda",
+    items,
+    classifications,
+    ebitdaContribs,
+  );
+
+  // Interest tracker column: the interest-expense lines themselves.
+  const interestTrace = traceFor(
+    "interest",
+    items,
+    classifications,
+    grab("interest_expense").map((item) => ({ item, sign: 1 })),
+  );
+
+  // Rent tracker column: rent expense (tenant pays it). NOT an EBITDA
+  // addback because rent is operating; subtracting it would inflate
+  // EBITDA artificially.
+  const rentTrace = traceFor(
+    "rent",
+    items,
+    classifications,
+    grab("rent_expense").map((item) => ({ item, sign: 1 })),
+  );
+
+  // Balance-sheet and cash-flow metrics: each is just the sum of
+  // whatever lines the classifier matched into the bucket.
+  const cashTrace = traceFor(
+    "cash",
+    items,
+    classifications,
+    grab("cash").map((item) => ({ item, sign: 1 })),
+  );
+  const cfoTrace = traceFor(
+    "cfo",
+    items,
+    classifications,
+    grab("cfo").map((item) => ({ item, sign: 1 })),
+  );
+  // Capex amounts on cash-flow statements appear as outflows (negative
+  // values or labelled as such). The extractor reports magnitudes, and
+  // the tracker convention stores Capex as a positive magnitude too.
+  // No sign flip needed; we just sum.
+  const capexTrace = traceFor(
+    "capex",
+    items,
+    classifications,
+    grab("capex").map((item) => ({ item, sign: 1 })),
+  );
+
   const intercompany_observed = findIntercompanyPairs(items, classifications);
 
-  // Anything classified as "ignore" lands in unused_labels so the
-  // analyst can audit lines we chose to drop. The classifier's reason
-  // is included so the analyst can see WHY each was ignored.
   const unused_labels = items
     .filter((i) => classifications.get(i.label)?.category === "ignore")
     .map((i) => `${i.label} (${classifications.get(i.label)?.reason})`);
 
-  const salesFormula =
-    salesInputs.length === 0
-      ? "no Sales lines matched the generic rule"
-      : salesInputs.map((i) => i.label).join(" + ");
-
-  const ebitdaFormulaParts: string[] = [];
-  for (const ni of netIncomeItems) ebitdaFormulaParts.push(ni.label);
-  for (const ab of addbackItems) ebitdaFormulaParts.push(`+ ${ab.label}`);
-  const ebitdaFormula =
-    ebitdaFormulaParts.length === 0
-      ? "no Net Income or addbacks matched the generic rule"
-      : ebitdaFormulaParts.join(" ");
-
-  const salesTrace: CalculationTrace = {
-    formula: salesFormula,
-    inputs: salesInputs,
-    total_tracker_unrounded: salesTrackerUnrounded,
-    result_tracker: salesResult,
-  };
-  const ebitdaTrace: CalculationTrace = {
-    formula: ebitdaFormula,
-    inputs: ebitdaInputs,
-    total_tracker_unrounded: ebitdaTrackerUnrounded,
-    result_tracker: ebitdaResult,
-  };
-
   return {
-    sales: salesResult,
-    ebitda: ebitdaResult,
-    intercompany_observed,
-    unused_labels,
-    calculations: {
+    sales: salesTrace.result_tracker,
+    ebitda: ebitdaTrace.result_tracker,
+    interest: interestTrace.result_tracker,
+    rent: rentTrace.result_tracker,
+    cash: cashTrace.result_tracker,
+    cfo: cfoTrace.result_tracker,
+    capex: capexTrace.result_tracker,
+    metrics: {
       sales: salesTrace,
       ebitda: ebitdaTrace,
+      interest: interestTrace,
+      rent: rentTrace,
+      cash: cashTrace,
+      cfo: cfoTrace,
+      capex: capexTrace,
     },
+    intercompany_observed,
+    unused_labels,
   };
 }

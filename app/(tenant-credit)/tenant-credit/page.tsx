@@ -1,10 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useMemo, useState } from "react";
 import { toast } from "sonner";
+import { unzipSync } from "fflate";
 
 import { AppShell } from "@/components/app-shell";
 import { ConfigGate } from "@/components/config-gate";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -21,13 +23,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Badge } from "@/components/ui/badge";
-import {
-  Tabs,
-  TabsContent,
-  TabsList,
-  TabsTrigger,
-} from "@/components/ui/tabs";
 import {
   Table,
   TableBody,
@@ -37,17 +32,25 @@ import {
   TableRow,
 } from "@/components/ui/table";
 
-import type { ComputeResult } from "@/lib/tenant-credit/methodology";
 import {
   ALL_QUARTER_IDS,
+  METRIC_LABELS,
+  WRITABLE_METRICS,
   quarterLabel,
-  writableQuartersForTenant,
+  type MetricKey,
   type QuarterId,
 } from "@/lib/tenant-credit/tracker-layout";
 
-// Mirrors the /api/extract response. Defined here rather than imported
-// from the route so the client doesn't pull server modules into its
-// bundle.
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+type TenantPickerEntry = {
+  display_name: string;
+  row: number;
+  tenant_id: string;
+};
+
 type ExtractResponse = {
   tenant_id: string;
   source_entity: string;
@@ -61,35 +64,67 @@ type ExtractResponse = {
   passed_through: string[];
 };
 
-// Shape of the picker entry returned by /api/tenant-credit/tenants.
-// Mirrors the route's TenantPickerEntry; redeclared here so the client
-// bundle doesn't pull the server route module.
-type TenantPickerEntry = {
-  display_name: string;
-  row: number;
-  tenant_id: string;
+type ComputeMetricTrace = {
+  metric: MetricKey;
+  formula: string;
+  contributions: {
+    label: string;
+    amount_source: number;
+    amount_tracker: number;
+    reason: string;
+  }[];
+  total_tracker_unrounded: number;
+  result_tracker: number | null;
 };
 
-// Shape of the Past Runs entries returned by /api/runs.
-type RunSummary = {
-  id: string;
-  tenant_id: string;
-  quarter: string;
-  source_entity: string;
-  source_period: string;
-  source_pdf_filename: string;
-  computed_sales: number;
-  computed_ebitda: number;
-  status: "writeback_success" | "writeback_failed";
-  worker_warnings: string[];
+type ComputeResponse = {
+  sales: number | null;
+  ebitda: number | null;
+  interest: number | null;
+  rent: number | null;
+  cash: number | null;
+  cfo: number | null;
+  capex: number | null;
+  metrics: Record<MetricKey, ComputeMetricTrace>;
+  intercompany_observed: {
+    income_label: string;
+    expense_label: string;
+    income_amount_source: number;
+    expense_amount_source: number;
+    amounts_match: boolean;
+  }[];
+  unused_labels: string[];
+};
+
+type TenantStatus =
+  | "idle"           // no PDF yet
+  | "loaded"         // PDF attached, not yet extracted
+  | "extracting"     // /extract running
+  | "computing"      // /compute running
+  | "computed"       // extract + compute done
+  | "error";
+
+type TenantState = {
+  tenant: TenantPickerEntry;
+  pdf: File | null;
+  pdfName: string | null;
+  status: TenantStatus;
+  extract: ExtractResponse | null;
+  compute: ComputeResponse | null;
   error: string | null;
-  written_by: string;
-  written_filename: string;
-  created_at: number | null;
 };
 
-// Compute SHA-256 of file bytes and return a lowercase hex string. Uses
-// the browser's SubtleCrypto so no extra dependency is needed.
+// Files dropped via the zip that didn't match any tenant by name.
+type UnassignedPdf = {
+  id: string;
+  name: string;
+  file: File;
+};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 async function sha256Hex(file: File): Promise<string> {
   const buf = await file.arrayBuffer();
   const digest = await crypto.subtle.digest("SHA-256", buf);
@@ -98,104 +133,124 @@ async function sha256Hex(file: File): Promise<string> {
     .join("");
 }
 
-// Best-effort guess of the target quarter from the extracted period
-// string. Falls back to Q1_2026 (the current quarter when the project
-// was built) if no match — the analyst can still override via the
-// picker before writing.
-function guessQuarter(sourcePeriod: string): QuarterId {
-  const text = sourcePeriod.toLowerCase();
-  type Probe = { id: QuarterId; needles: string[] };
-  const probes: Probe[] = ALL_QUARTER_IDS.map((id) => {
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+// Reduce a string to lowercase alphanumeric tokens for loose comparison.
+function normalize(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+// Score how well a PDF filename matches a tenant display name. Higher
+// is better; 0 means no overlap. The score is the length of the
+// longest tenant token (4+ chars) that appears in the filename, so
+// "Pinnacle_Q1_2026.pdf" matches "Pinnacle Oil & Gas Holdings, Inc."
+// via the shared token "pinnacle".
+function matchScore(filename: string, tenantName: string): number {
+  const fname = normalize(filename);
+  const tenant = normalize(tenantName);
+  if (!fname || !tenant) return 0;
+  let best = 0;
+  for (const token of tenant.split(/\s+/)) {
+    if (token.length < 4) continue;
+    if (fname.includes(token)) best = Math.max(best, token.length);
+  }
+  return best;
+}
+
+// Best-effort guess of which tenant a PDF belongs to. Returns the
+// winning tenant + the runner-up so we can flag ambiguous matches.
+function matchPdfToTenant(
+  filename: string,
+  tenants: TenantPickerEntry[],
+): { winner: TenantPickerEntry | null; tied: boolean } {
+  let bestScore = 0;
+  let winner: TenantPickerEntry | null = null;
+  let tied = false;
+  for (const t of tenants) {
+    const score = matchScore(filename, t.display_name);
+    if (score === 0) continue;
+    if (score > bestScore) {
+      bestScore = score;
+      winner = t;
+      tied = false;
+    } else if (score === bestScore) {
+      tied = true;
+    }
+  }
+  return { winner: tied ? null : winner, tied };
+}
+
+// Run an async task per item with bounded parallelism. Keeps the
+// number of in-flight Claude calls under control when batching 24
+// tenants.
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  async function runOne() {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await worker(items[i], i);
+    }
+  }
+  const workers = Array.from(
+    { length: Math.min(limit, items.length) },
+    () => runOne(),
+  );
+  await Promise.all(workers);
+  return results;
+}
+
+function guessQuarter(periodHint: string): QuarterId {
+  const text = periodHint.toLowerCase();
+  for (const id of ALL_QUARTER_IDS) {
     const [q, y] = id.split("_");
     const yy = y.slice(2);
-    const months = {
-      Q1: ["jan", "feb", "mar"],
-      Q2: ["apr", "may", "jun"],
-      Q3: ["jul", "aug", "sep"],
-      Q4: ["oct", "nov", "dec"],
-    }[q as "Q1" | "Q2" | "Q3" | "Q4"];
-    return {
-      id,
-      needles: [
-        `${q.toLowerCase()} ${y}`,
-        `${q.toLowerCase()} ${yy}`,
-        `${q.toLowerCase()}/${y}`,
-        ...months.map((m) => `${m} ${y}`),
-      ],
-    };
-  });
-  for (const probe of probes) {
-    for (const needle of probe.needles) {
-      if (text.includes(needle)) return probe.id;
-    }
+    if (text.includes(`${q.toLowerCase()} ${y}`)) return id;
+    if (text.includes(`${q.toLowerCase()} ${yy}`)) return id;
   }
   return "Q1_2026";
 }
 
-export default function DashboardPage() {
-  // Tracker is uploaded once per session; the browser holds the original
-  // File and re-sends it on writeback. We never persist it server-side
-  // between requests.
+// ---------------------------------------------------------------------------
+// Page
+// ---------------------------------------------------------------------------
+
+export default function TenantCreditPage() {
   const [trackerFile, setTrackerFile] = useState<File | null>(null);
   const [tenants, setTenants] = useState<TenantPickerEntry[]>([]);
-  const [tenantsLoading, setTenantsLoading] = useState<boolean>(false);
-  const [tenantId, setTenantId] = useState<string>("");
-  const [file, setFile] = useState<File | null>(null);
-  const [running, setRunning] = useState<boolean>(false);
-  const [extract, setExtract] = useState<ExtractResponse | null>(null);
-  const [compute, setCompute] = useState<ComputeResult | null>(null);
+  const [tenantsLoading, setTenantsLoading] = useState(false);
   const [quarterId, setQuarterId] = useState<QuarterId>("Q1_2026");
-  const [writing, setWriting] = useState<boolean>(false);
-  const [runs, setRuns] = useState<RunSummary[]>([]);
+  // Keyed by tenant.row so writes never accidentally collide across
+  // tenants who share a display-name prefix.
+  const [states, setStates] = useState<Record<number, TenantState>>({});
+  const [unassigned, setUnassigned] = useState<UnassignedPdf[]>([]);
+  const [running, setRunning] = useState(false);
+  const [writing, setWriting] = useState(false);
 
-  // The picker uses tenant_id as its value (matches what the recipe
-  // registry keys by). Look up the full entry for downstream calls.
-  const selectedTenant = tenants.find((t) => t.tenant_id === tenantId) ?? null;
+  const tenantsWithData = useMemo(
+    () =>
+      Object.values(states).filter(
+        (s) => s.status === "computed" && s.compute !== null,
+      ),
+    [states],
+  );
 
-  // Pull Past Runs on mount and after each successful writeback. Errors
-  // are swallowed because the section is informational; a noisy toast
-  // every time Firestore isn't configured would be more annoying than
-  // useful in local dev.
-  const refreshRuns = useCallback(async () => {
-    try {
-      const res = await fetch("/api/tenant-credit/runs?limit=20");
-      if (!res.ok) return;
-      const data = (await res.json()) as { runs: RunSummary[] };
-      setRuns(data.runs);
-    } catch {
-      // ignore
-    }
-  }, []);
-  // The lint rule react-hooks/set-state-in-effect flags calling a setter
-  // synchronously inside an effect body. Wrapping in an IIFE with a
-  // cancellation flag schedules the state update for the next tick, which
-  // satisfies the rule and also prevents a setState-after-unmount warning
-  // if the user navigates away during the fetch.
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const res = await fetch("/api/tenant-credit/runs?limit=20");
-        if (cancelled || !res.ok) return;
-        const data = (await res.json()) as { runs: RunSummary[] };
-        if (!cancelled) setRuns(data.runs);
-      } catch {
-        // ignore
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  // ----- Tracker upload --------------------------------------------------
 
-  // Upload the corporate-financials tracker and ask the server for the
-  // roster in column A. We keep the File object in component state so
-  // the writeback step can re-send the same bytes; storing it on the
-  // server between requests would mean session state we don't have.
   async function handleTrackerUpload(next: File | null) {
     setTrackerFile(next);
     setTenants([]);
-    setTenantId("");
+    setStates({});
+    setUnassigned([]);
     if (!next) return;
     if (!next.name.toLowerCase().endsWith(".xlsx")) {
       toast.error("Tracker must be an .xlsx file.");
@@ -218,165 +273,298 @@ export default function DashboardPage() {
       }
       const data = (await res.json()) as { tenants: TenantPickerEntry[] };
       setTenants(data.tenants);
-      if (data.tenants.length === 0) {
-        toast.warning("No tenants found in column A of the tracker.");
-      } else {
-        // Pre-select the first tenant so the picker isn't blank.
-        setTenantId(data.tenants[0].tenant_id);
-        toast.success(`Loaded ${data.tenants.length} tenants.`);
+      const seeded: Record<number, TenantState> = {};
+      for (const t of data.tenants) {
+        seeded[t.row] = {
+          tenant: t,
+          pdf: null,
+          pdfName: null,
+          status: "idle",
+          extract: null,
+          compute: null,
+          error: null,
+        };
       }
+      setStates(seeded);
+      toast.success(`Loaded ${data.tenants.length} tenants.`);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Tracker parse failed.";
-      toast.error(msg);
+      toast.error(err instanceof Error ? err.message : "Tracker parse failed.");
       setTrackerFile(null);
     } finally {
       setTenantsLoading(false);
     }
   }
 
-  async function handleRun() {
-    if (!file) {
-      toast.error("Select a PDF first.");
+  // ----- Per-tenant PDF drop -------------------------------------------
+
+  function assignPdfToTenant(row: number, file: File) {
+    setStates((prev) => {
+      const cur = prev[row];
+      if (!cur) return prev;
+      return {
+        ...prev,
+        [row]: {
+          ...cur,
+          pdf: file,
+          pdfName: file.name,
+          status: "loaded",
+          extract: null,
+          compute: null,
+          error: null,
+        },
+      };
+    });
+  }
+
+  function clearTenantPdf(row: number) {
+    setStates((prev) => {
+      const cur = prev[row];
+      if (!cur) return prev;
+      return {
+        ...prev,
+        [row]: {
+          ...cur,
+          pdf: null,
+          pdfName: null,
+          status: "idle",
+          extract: null,
+          compute: null,
+          error: null,
+        },
+      };
+    });
+  }
+
+  // ----- Zip handling ---------------------------------------------------
+
+  async function handleZipUpload(zipFile: File | null) {
+    if (!zipFile) return;
+    if (!zipFile.name.toLowerCase().endsWith(".zip")) {
+      toast.error("Bulk upload must be a .zip file.");
       return;
     }
-    if (!tenantId) {
-      toast.error("Pick a tenant first.");
+    let entries: Record<string, Uint8Array>;
+    try {
+      const bytes = new Uint8Array(await zipFile.arrayBuffer());
+      entries = unzipSync(bytes);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not unzip.");
+      return;
+    }
+    let assigned = 0;
+    const newUnassigned: UnassignedPdf[] = [];
+    setStates((prev) => {
+      const next = { ...prev };
+      for (const [path, bytes] of Object.entries(entries)) {
+        // unzipSync includes directory entries as zero-byte "names ending
+        // in /". Skip them and non-PDFs.
+        if (path.endsWith("/") || bytes.byteLength === 0) continue;
+        if (!path.toLowerCase().endsWith(".pdf")) continue;
+        // Use only the basename for matching, not the full path.
+        const filename = path.split("/").pop() ?? path;
+        const blob = new Blob([new Uint8Array(bytes)], { type: "application/pdf" });
+        const file = new File([blob], filename, { type: "application/pdf" });
+        const { winner, tied } = matchPdfToTenant(filename, tenants);
+        if (winner && !tied && next[winner.row]) {
+          next[winner.row] = {
+            ...next[winner.row],
+            pdf: file,
+            pdfName: filename,
+            status: "loaded",
+            extract: null,
+            compute: null,
+            error: null,
+          };
+          assigned++;
+        } else {
+          newUnassigned.push({
+            id: `${filename}-${Math.random().toString(36).slice(2, 8)}`,
+            name: filename,
+            file,
+          });
+        }
+      }
+      return next;
+    });
+    setUnassigned((cur) => [...cur, ...newUnassigned]);
+    if (assigned > 0) toast.success(`Routed ${assigned} PDF${assigned === 1 ? "" : "s"} from the zip.`);
+    if (newUnassigned.length > 0) {
+      toast.warning(
+        `${newUnassigned.length} PDF${newUnassigned.length === 1 ? "" : "s"} couldn't be matched; drag them to the right tenant.`,
+      );
+    }
+  }
+
+  function assignUnassigned(unassignedId: string, row: number) {
+    const entry = unassigned.find((u) => u.id === unassignedId);
+    if (!entry) return;
+    assignPdfToTenant(row, entry.file);
+    setUnassigned((cur) => cur.filter((u) => u.id !== unassignedId));
+  }
+
+  // ----- Batch extract + compute ---------------------------------------
+
+  async function handleRunAll() {
+    const ready = Object.values(states).filter(
+      (s) => s.pdf !== null && s.status !== "computed",
+    );
+    if (ready.length === 0) {
+      toast.info("Every tenant with a PDF is already computed.");
       return;
     }
     setRunning(true);
-    setExtract(null);
-    setCompute(null);
-
     try {
-      // Step 1 - extract from PDF via Claude.
-      const form = new FormData();
-      form.append("file", file);
-      form.append("tenant_id", tenantId);
-      const extractRes = await fetch("/api/tenant-credit/extract", {
-        method: "POST",
-        body: form,
-      });
-      if (!extractRes.ok) {
-        const detail = await extractRes.json().catch(() => ({}));
-        throw new Error(detail.error ?? `Extract failed (${extractRes.status}).`);
-      }
-      const extractData = (await extractRes.json()) as ExtractResponse;
+      await mapWithConcurrency(ready, 4, async (entry) => {
+        const file = entry.pdf;
+        if (!file) return;
+        setStates((prev) => ({
+          ...prev,
+          [entry.tenant.row]: { ...prev[entry.tenant.row], status: "extracting", error: null },
+        }));
+        try {
+          const form = new FormData();
+          form.append("file", file);
+          form.append("tenant_id", entry.tenant.tenant_id);
+          const extractRes = await fetch("/api/tenant-credit/extract", {
+            method: "POST",
+            body: form,
+          });
+          if (!extractRes.ok) {
+            const detail = await extractRes.json().catch(() => ({}));
+            throw new Error(
+              detail.error ?? `Extract failed (${extractRes.status}).`,
+            );
+          }
+          const extractData = (await extractRes.json()) as ExtractResponse;
 
-      // Step 2 - compute Sales and EBITDA from the normalized line items.
-      const computeRes = await fetch("/api/tenant-credit/compute", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          tenant_id: tenantId,
-          line_items: extractData.line_items,
-        }),
-      });
-      if (!computeRes.ok) {
-        const detail = await computeRes.json().catch(() => ({}));
-        throw new Error(
-          detail.error ?? `Compute failed (${computeRes.status}).`,
-        );
-      }
-      const computeData = (await computeRes.json()) as ComputeResult;
+          setStates((prev) => ({
+            ...prev,
+            [entry.tenant.row]: { ...prev[entry.tenant.row], status: "computing" },
+          }));
+          const computeRes = await fetch("/api/tenant-credit/compute", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              tenant_id: entry.tenant.tenant_id,
+              line_items: extractData.line_items,
+            }),
+          });
+          if (!computeRes.ok) {
+            const detail = await computeRes.json().catch(() => ({}));
+            throw new Error(
+              detail.error ?? `Compute failed (${computeRes.status}).`,
+            );
+          }
+          const computeData = (await computeRes.json()) as ComputeResponse;
 
-      setExtract(extractData);
-      setCompute(computeData);
-      setQuarterId(guessQuarter(extractData.source_period));
-      toast.success("Extracted and computed.");
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : "Run failed.";
-      toast.error(msg);
+          // Update the global quarter picker once, based on the first
+          // tenant's source period if it parses cleanly. Subsequent
+          // tenants don't overwrite the analyst's manual choice.
+          setQuarterId((cur) => {
+            if (cur !== "Q1_2026") return cur;
+            return guessQuarter(extractData.source_period);
+          });
+
+          setStates((prev) => ({
+            ...prev,
+            [entry.tenant.row]: {
+              ...prev[entry.tenant.row],
+              status: "computed",
+              extract: extractData,
+              compute: computeData,
+              error: null,
+            },
+          }));
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : "Run failed.";
+          setStates((prev) => ({
+            ...prev,
+            [entry.tenant.row]: { ...prev[entry.tenant.row], status: "error", error: msg },
+          }));
+          toast.error(`${entry.tenant.display_name}: ${msg}`);
+        }
+      });
+      toast.success("Batch complete. Review the results table below.");
     } finally {
       setRunning(false);
     }
   }
 
-  async function handleWriteback() {
-    if (!compute || !extract || !file) return;
+  // ----- Batch writeback ------------------------------------------------
+
+  async function handleWriteAll() {
     if (!trackerFile) {
-      toast.error("Upload the corporate financials tracker first.");
+      toast.error("Upload the tracker first.");
       return;
     }
-    if (!selectedTenant) {
-      toast.error("Pick a tenant first.");
+    if (tenantsWithData.length === 0) {
+      toast.error("No tenants have been computed yet.");
       return;
     }
     setWriting(true);
     try {
-      // Hash the PDF in the browser so the audit record records what
-      // file produced these numbers. SubtleCrypto is fast: the Q1 26
-      // PDF (30 KB) digests in under a millisecond.
-      const sourcePdfHash = await sha256Hex(file);
+      const entries = await Promise.all(
+        tenantsWithData.map(async (s) => {
+          const c = s.compute!;
+          const e = s.extract;
+          const pdfHash = s.pdf ? await sha256Hex(s.pdf) : "";
+          return {
+            tenant_id: s.tenant.tenant_id,
+            tenant_display_name: s.tenant.display_name,
+            tracker_row: s.tenant.row,
+            sales: c.sales,
+            ebitda: c.ebitda,
+            interest: c.interest,
+            rent: c.rent,
+            cash: c.cash,
+            cfo: c.cfo,
+            capex: c.capex,
+            source_pdf_filename: s.pdfName ?? "",
+            source_pdf_hash: pdfHash,
+            source_entity: e?.source_entity ?? "",
+            source_period: e?.source_period ?? "",
+            line_items: e?.line_items ?? [],
+            normalization_applied: e?.normalization_applied ?? [],
+            passed_through: e?.passed_through ?? [],
+            unused_labels: c.unused_labels,
+            intercompany_observed: c.intercompany_observed,
+            calculations: {
+              sales: traceToAudit(c.metrics.sales),
+              ebitda: traceToAudit(c.metrics.ebitda),
+            },
+          };
+        }),
+      );
 
-      const payload = {
-        tenant_id: tenantId,
-        // tenant_display_name is column-A text from the analyst's own
-        // tracker; the writeback uses its first whitespace/comma-
-        // separated token as the substring the server checks against
-        // column A of the target row.
-        tenant_display_name: selectedTenant.display_name,
-        quarter_id: quarterId,
-        // tracker_row is authoritative: it comes from the user's own
-        // file (column A row index), not a per-recipe default.
-        tracker_row: selectedTenant.row,
-        sales: compute.sales,
-        ebitda: compute.ebitda,
-        // Audit payload (Phase 6).
-        source_pdf_filename: file.name,
-        source_pdf_hash: sourcePdfHash,
-        source_entity: extract.source_entity,
-        source_period: extract.source_period,
-        line_items: extract.line_items,
-        normalization_applied: extract.normalization_applied,
-        passed_through: extract.passed_through,
-        unused_labels: compute.unused_labels,
-        intercompany_observed: compute.intercompany_observed,
-        calculations: {
-          sales: {
-            formula: compute.calculations.sales.formula,
-            inputs: compute.calculations.sales.inputs,
-            total_tracker_unrounded:
-              compute.calculations.sales.total_tracker_unrounded,
-            result: compute.calculations.sales.result_tracker,
-          },
-          ebitda: {
-            formula: compute.calculations.ebitda.formula,
-            inputs: compute.calculations.ebitda.inputs,
-            total_tracker_unrounded:
-              compute.calculations.ebitda.total_tracker_unrounded,
-            result: compute.calculations.ebitda.result_tracker,
-          },
-        },
-      };
-
-      const writebackForm = new FormData();
-      writebackForm.append("tracker_xlsx", trackerFile);
-      writebackForm.append("payload", JSON.stringify(payload));
+      const form = new FormData();
+      form.append("tracker_xlsx", trackerFile);
+      form.append("payload", JSON.stringify({ quarter_id: quarterId, entries }));
       const res = await fetch("/api/tenant-credit/writeback", {
         method: "POST",
-        body: writebackForm,
+        body: form,
       });
       if (!res.ok) {
         const detail = await res.json().catch(() => ({}));
+        if (Array.isArray(detail.failures)) {
+          for (const f of detail.failures) {
+            toast.error(`${f.tenant_display_name}: ${f.reasons.join("; ")}`);
+          }
+        }
         throw new Error(detail.error ?? `Writeback failed (${res.status}).`);
       }
-      // Soft warnings (e.g. the AI3 header typo) come back on a header.
       const warningsRaw = res.headers.get("X-Worker-Warnings");
       if (warningsRaw) {
         try {
           const list = JSON.parse(warningsRaw) as string[];
           for (const w of list) toast.warning(w);
         } catch {
-          // Header was present but not parseable JSON; surface raw.
           toast.warning(warningsRaw);
         }
       }
-      // Trigger the download.
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      // Prefer the server's filename when present.
       const cd = res.headers.get("Content-Disposition") ?? "";
       const match = cd.match(/filename="([^"]+)"/);
       a.download = match?.[1] ?? "tracker.xlsx";
@@ -385,101 +573,116 @@ export default function DashboardPage() {
       a.remove();
       URL.revokeObjectURL(url);
       toast.success(`Downloaded ${a.download}.`);
-      refreshRuns();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Writeback failed.";
-      toast.error(msg);
+      toast.error(err instanceof Error ? err.message : "Writeback failed.");
     } finally {
       setWriting(false);
     }
   }
 
+  // ----- Render --------------------------------------------------------
+
+  const allTenants = Object.values(states).sort((a, b) => a.tenant.row - b.tenant.row);
+  const readyCount = allTenants.filter((s) => s.status === "computed").length;
+  const loadedCount = allTenants.filter((s) => s.pdf !== null).length;
+
   return (
     <ConfigGate>
       <AppShell title="Tenant Credit Tracker">
         <p className="text-sm text-muted-foreground">
-          Preview Sales and EBITDA from a quarterly income statement before
-          writing them to the corporate tracker.
+          Upload the corporate financials tracker, then a PDF per tenant.
+          Each PDF goes through Claude for line-item extraction and a
+          generic compute rule for Sales, EBITDA, Interest, Rent, Cash,
+          CFO, and Capex. Numbers land in the right cells when you click
+          Write at the bottom.
         </p>
 
         <TrackerCard
           file={trackerFile}
           loading={tenantsLoading}
-          tenants={tenants}
+          tenantCount={tenants.length}
           onFileChange={handleTrackerUpload}
         />
 
-        {trackerFile && tenants.length > 0 && (
-          <UploadCard
-            tenants={tenants}
-            tenantId={tenantId}
-            onTenantChange={setTenantId}
-            file={file}
-            onFileChange={setFile}
-            running={running}
-            onRun={handleRun}
-          />
-        )}
+        {tenants.length > 0 && (
+          <>
+            <QuarterAndZipCard
+              quarterId={quarterId}
+              onQuarterChange={setQuarterId}
+              onZipUpload={handleZipUpload}
+              loadedCount={loadedCount}
+              totalCount={allTenants.length}
+            />
 
-        {extract && compute && (
-          <ResultCard extract={extract} compute={compute} />
-        )}
+            <TenantGrid
+              tenants={allTenants}
+              running={running}
+              onAssign={assignPdfToTenant}
+              onClear={clearTenantPdf}
+            />
 
-        {extract && compute && (
-          <WritebackCard
-            extract={extract}
-            compute={compute}
-            quarterId={quarterId}
-            onQuarterChange={setQuarterId}
-            writing={writing}
-            onWrite={handleWriteback}
-          />
-        )}
+            {unassigned.length > 0 && (
+              <UnassignedCard
+                items={unassigned}
+                tenants={tenants}
+                onAssign={assignUnassigned}
+              />
+            )}
 
-        {extract && compute && (
-          <AuditCard extract={extract} compute={compute} />
-        )}
+            <ActionsCard
+              loadedCount={loadedCount}
+              readyCount={readyCount}
+              running={running}
+              writing={writing}
+              onRunAll={handleRunAll}
+              onWriteAll={handleWriteAll}
+              quarterLabel={quarterLabel(quarterId)}
+            />
 
-        <PastRunsCard runs={runs} />
+            {readyCount > 0 && <ResultsTable rows={tenantsWithData} />}
+          </>
+        )}
       </AppShell>
     </ConfigGate>
   );
 }
 
+// ---------------------------------------------------------------------------
+// Sub-components
+// ---------------------------------------------------------------------------
+
 function TrackerCard(props: {
   file: File | null;
   loading: boolean;
-  tenants: TenantPickerEntry[];
+  tenantCount: number;
   onFileChange: (next: File | null) => void;
 }) {
-  const total = props.tenants.length;
   return (
     <Card>
       <CardHeader>
         <CardTitle>Step 1 — Upload tracker</CardTitle>
         <CardDescription>
-          Drop the latest <span className="font-mono">Corporate_Financials_and_P_Ls.xlsx</span>{" "}
+          Drop the latest{" "}
+          <span className="font-mono">Corporate_Financials_and_P_Ls.xlsx</span>{" "}
           here. We read column A of the{" "}
           <span className="font-mono">Corp Financials</span> sheet to
-          populate the tenant picker below.
+          populate the tenant cards below.
         </CardDescription>
       </CardHeader>
-      <CardContent className="space-y-4">
+      <CardContent className="space-y-3">
         <Input
           type="file"
           accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-          onChange={(e) =>
-            props.onFileChange(e.target.files?.[0] ?? null)
-          }
+          onChange={(e) => props.onFileChange(e.target.files?.[0] ?? null)}
           disabled={props.loading}
         />
         {props.file && (
           <p className="text-xs text-neutral-500">
-            {props.file.name} - {formatBytes(props.file.size)}
+            {props.file.name} · {formatBytes(props.file.size)}
             {props.loading
-              ? " - parsing..."
-              : total > 0
-                ? ` - ${total} tenants found`
+              ? " · parsing..."
+              : props.tenantCount > 0
+                ? ` · ${props.tenantCount} tenants found`
                 : ""}
           </p>
         )}
@@ -488,116 +691,39 @@ function TrackerCard(props: {
   );
 }
 
-function PastRunsCard({ runs }: { runs: RunSummary[] }) {
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Past runs</CardTitle>
-        <CardDescription>
-          Every write-back attempt, newest first. Reads from the
-          <span className="font-mono"> tenant_tracker_runs </span>
-          Firestore collection. Empty when Firebase isn&rsquo;t configured
-          locally (see <span className="font-mono">docs/firebase-setup.md</span>).
-        </CardDescription>
-      </CardHeader>
-      <CardContent>
-        {runs.length === 0 ? (
-          <p className="rounded border border-dashed border-neutral-200 px-4 py-6 text-center text-sm text-neutral-500">
-            No runs recorded yet. Set up Firebase to start logging.
-          </p>
-        ) : (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>When</TableHead>
-                <TableHead>Tenant</TableHead>
-                <TableHead>Quarter</TableHead>
-                <TableHead className="text-right">Sales</TableHead>
-                <TableHead className="text-right">EBITDA</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead>By</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {runs.map((run) => (
-                <TableRow key={run.id}>
-                  <TableCell className="font-mono text-xs">
-                    {run.created_at != null
-                      ? new Date(run.created_at).toLocaleString()
-                      : "-"}
-                  </TableCell>
-                  <TableCell>{run.tenant_id}</TableCell>
-                  <TableCell>{run.quarter}</TableCell>
-                  <TableCell className="text-right font-mono tabular-nums">
-                    {run.computed_sales.toLocaleString()}
-                  </TableCell>
-                  <TableCell className="text-right font-mono tabular-nums">
-                    {run.computed_ebitda.toLocaleString()}
-                  </TableCell>
-                  <TableCell>
-                    {run.status === "writeback_success" ? (
-                      <Badge variant="secondary">OK</Badge>
-                    ) : (
-                      <Badge variant="destructive">Failed</Badge>
-                    )}
-                  </TableCell>
-                  <TableCell className="text-xs text-neutral-600">
-                    {run.written_by}
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
-function WritebackCard(props: {
-  extract: ExtractResponse;
-  compute: ComputeResult;
+function QuarterAndZipCard(props: {
   quarterId: QuarterId;
   onQuarterChange: (id: QuarterId) => void;
-  writing: boolean;
-  onWrite: () => void;
+  onZipUpload: (file: File | null) => void;
+  loadedCount: number;
+  totalCount: number;
 }) {
-  // Show only quarters whose target cells are currently empty for this
-  // tenant. The worker also refuses to overwrite populated cells; this
-  // filter prevents the analyst from triggering that refusal in the UI.
-  const writable = writableQuartersForTenant(props.extract.tenant_id);
-  const options =
-    writable.length > 0 ? writable : (ALL_QUARTER_IDS as QuarterId[]);
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Write to tracker</CardTitle>
+        <CardTitle>Step 2 — Pick quarter, attach PDFs</CardTitle>
         <CardDescription>
-          Confirm the target quarter, then download a timestamped copy of
-          the tracker with these two cells written. The master file in
-          <span className="font-mono"> samples/</span> is never modified.
+          One quarter for the whole batch. Drag PDFs onto each tenant
+          card below, or drop a zip here to auto-route by filename.
         </CardDescription>
       </CardHeader>
-      <CardContent className="space-y-5">
+      <CardContent className="space-y-4">
         <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
           <div className="space-y-1.5">
-            <label
-              htmlFor="quarter"
-              className="text-sm font-medium text-neutral-700"
-            >
-              Target quarter
+            <label htmlFor="quarter" className="text-sm font-medium text-neutral-700">
+              Quarter
             </label>
             <Select
               value={props.quarterId}
-              onValueChange={(value) => {
-                if (value !== null) props.onQuarterChange(value as QuarterId);
+              onValueChange={(v) => {
+                if (v) props.onQuarterChange(v as QuarterId);
               }}
             >
               <SelectTrigger id="quarter" className="w-full">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {options.map((q) => (
+                {ALL_QUARTER_IDS.map((q) => (
                   <SelectItem key={q} value={q}>
                     {quarterLabel(q)}
                   </SelectItem>
@@ -605,458 +731,330 @@ function WritebackCard(props: {
               </SelectContent>
             </Select>
           </div>
-          <div className="space-y-1 md:col-span-2">
-            <div className="text-sm font-medium text-neutral-700">
-              Source PDF says
-            </div>
-            <div className="rounded border border-neutral-200 bg-neutral-50 px-3 py-2 text-sm text-neutral-700">
-              {props.extract.source_period}
-            </div>
+          <div className="space-y-1.5 md:col-span-2">
+            <label htmlFor="zip" className="text-sm font-medium text-neutral-700">
+              Bulk PDF zip (optional)
+            </label>
+            <Input
+              id="zip"
+              type="file"
+              accept=".zip,application/zip"
+              onChange={(e) => props.onZipUpload(e.target.files?.[0] ?? null)}
+            />
             <p className="text-xs text-neutral-500">
-              The picker default is inferred from this. Override if it&rsquo;s
-              wrong.
+              Files like{" "}
+              <span className="font-mono">Pinnacle_Q1_2026.pdf</span>{" "}
+              route to the matching tenant card automatically. Unmatched
+              files surface in the Unassigned bucket below.
             </p>
           </div>
         </div>
-        <div className="flex items-center justify-between">
-          <p className="text-xs text-neutral-500">
-            Sales{" "}
-            <span className="font-mono tabular-nums">
-              {props.compute.sales.toLocaleString()}
-            </span>{" "}
-            and EBITDA{" "}
-            <span className="font-mono tabular-nums">
-              {props.compute.ebitda.toLocaleString()}
-            </span>{" "}
-            (both in $000s) will be written into the row for{" "}
-            <span className="font-medium">
-              {props.extract.source_entity}
-            </span>
-            .
-          </p>
-          <Button
-            onClick={props.onWrite}
-            disabled={props.writing}
-            size="lg"
-          >
-            {props.writing ? "Writing..." : "Write to tracker"}
-          </Button>
-        </div>
+        <p className="text-xs text-neutral-500">
+          {props.loadedCount} of {props.totalCount} tenants have a PDF attached.
+        </p>
       </CardContent>
     </Card>
   );
 }
 
-function UploadCard(props: {
-  tenants: TenantPickerEntry[];
-  tenantId: string;
-  onTenantChange: (id: string) => void;
-  file: File | null;
-  onFileChange: (file: File | null) => void;
+function TenantGrid(props: {
+  tenants: TenantState[];
   running: boolean;
-  onRun: () => void;
+  onAssign: (row: number, file: File) => void;
+  onClear: (row: number) => void;
 }) {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Step 2 — Upload statement</CardTitle>
+        <CardTitle>Step 3 — Tenants</CardTitle>
         <CardDescription>
-          Pick the tenant, attach the quarter&rsquo;s income statement PDF,
-          then run. The PDF is sent to Anthropic Claude for extraction.
-          The compute step uses a generic rule that classifies each line
-          by keyword (operating revenue, net income, addbacks); audit the
-          numbers before writing.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-5">
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
-          <div className="space-y-1.5">
-            <label
-              htmlFor="tenant"
-              className="text-sm font-medium text-neutral-700"
-            >
-              Tenant
-            </label>
-            <Select
-              value={props.tenantId}
-              onValueChange={(value) => {
-                if (value) props.onTenantChange(value);
-              }}
-            >
-              <SelectTrigger id="tenant" className="w-full">
-                <SelectValue placeholder="Pick a tenant" />
-              </SelectTrigger>
-              <SelectContent>
-                {props.tenants.map((opt) => (
-                  <SelectItem key={opt.display_name} value={opt.tenant_id}>
-                    <span className="flex items-center gap-2">
-                      <span className="font-mono text-xs text-neutral-500">
-                        row {opt.row}
-                      </span>
-                      {opt.display_name}
-                    </span>
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="space-y-1.5 md:col-span-2">
-            <label
-              htmlFor="pdf"
-              className="text-sm font-medium text-neutral-700"
-            >
-              Income statement PDF
-            </label>
-            <Input
-              id="pdf"
-              type="file"
-              accept="application/pdf"
-              onChange={(e) =>
-                props.onFileChange(e.target.files?.[0] ?? null)
-              }
-              disabled={props.running}
-            />
-            {props.file && (
-              <p className="text-xs text-neutral-500">
-                {props.file.name} - {formatBytes(props.file.size)}
-              </p>
-            )}
-          </div>
-        </div>
-        <div className="flex justify-end">
-          <Button
-            onClick={props.onRun}
-            disabled={props.running || !props.file}
-            size="lg"
-          >
-            {props.running ? "Processing..." : "Extract & Compute"}
-          </Button>
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
-function ResultCard({
-  extract,
-  compute,
-}: {
-  extract: ExtractResponse;
-  compute: ComputeResult;
-}) {
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Computed values (preview)</CardTitle>
-        <CardDescription>
-          <span className="font-medium text-neutral-700">
-            {extract.source_entity}
-          </span>{" "}
-          - {extract.source_period}
+          One card per tenant from column A of the tracker. Drop the
+          tenant&rsquo;s quarterly PDF on its card.
         </CardDescription>
       </CardHeader>
       <CardContent>
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-          <StatTile
-            label="Sales (000s)"
-            value={compute.sales}
-            formula={compute.calculations.sales.formula}
-          />
-          <StatTile
-            label="EBITDA (000s)"
-            value={compute.ebitda}
-            formula={compute.calculations.ebitda.formula}
-          />
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
-function StatTile({
-  label,
-  value,
-  formula,
-}: {
-  label: string;
-  value: number;
-  formula: string;
-}) {
-  return (
-    <div className="rounded-lg border border-neutral-200 bg-white p-5">
-      <div className="text-xs font-medium uppercase tracking-wider text-neutral-500">
-        {label}
-      </div>
-      <div className="mt-1 font-mono text-3xl font-semibold tabular-nums tracking-tight">
-        {value.toLocaleString()}
-      </div>
-      <div className="mt-2 text-xs text-neutral-500">{formula}</div>
-    </div>
-  );
-}
-
-function AuditCard({
-  extract,
-  compute,
-}: {
-  extract: ExtractResponse;
-  compute: ComputeResult;
-}) {
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Audit details</CardTitle>
-        <CardDescription>
-          What the engine actually did. Every tab here mirrors a field that
-          Phase 6 will persist to the Firestore audit log.
-        </CardDescription>
-      </CardHeader>
-      <CardContent>
-        <Tabs defaultValue="trace">
-          <TabsList className="grid w-full grid-cols-2 md:grid-cols-5">
-            <TabsTrigger value="trace">Trace</TabsTrigger>
-            <TabsTrigger value="intercompany">
-              Intercompany
-              <CountBadge n={compute.intercompany_observed.length} />
-            </TabsTrigger>
-            <TabsTrigger value="rewrites">
-              Label rewrites
-              <CountBadge n={extract.normalization_applied.length} />
-            </TabsTrigger>
-            <TabsTrigger value="unused">
-              Unused
-              <CountBadge n={compute.unused_labels.length} warn />
-            </TabsTrigger>
-            <TabsTrigger value="raw">All inputs</TabsTrigger>
-          </TabsList>
-
-          <TabsContent value="trace" className="space-y-6 pt-4">
-            <TraceSection
-              title="Sales"
-              formula={compute.calculations.sales.formula}
-              inputs={compute.calculations.sales.inputs}
-              unrounded={compute.calculations.sales.total_tracker_unrounded}
-              result={compute.sales}
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          {props.tenants.map((s) => (
+            <TenantCard
+              key={s.tenant.row}
+              state={s}
+              running={props.running}
+              onAssign={props.onAssign}
+              onClear={props.onClear}
             />
-            <TraceSection
-              title="EBITDA"
-              formula={compute.calculations.ebitda.formula}
-              inputs={compute.calculations.ebitda.inputs}
-              unrounded={compute.calculations.ebitda.total_tracker_unrounded}
-              result={compute.ebitda}
-            />
-          </TabsContent>
-
-          <TabsContent value="intercompany" className="pt-4">
-            {compute.intercompany_observed.length === 0 ? (
-              <Empty text="No intercompany pairs observed in this statement." />
-            ) : (
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Income leg</TableHead>
-                    <TableHead>Expense leg</TableHead>
-                    <TableHead className="text-right">Income $</TableHead>
-                    <TableHead className="text-right">Expense $</TableHead>
-                    <TableHead>Match?</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {compute.intercompany_observed.map((pair, i) => (
-                    <TableRow key={i}>
-                      <TableCell>{pair.income_label}</TableCell>
-                      <TableCell>{pair.expense_label}</TableCell>
-                      <TableCell className="text-right font-mono tabular-nums">
-                        {fmtDollars(pair.income_amount_source)}
-                      </TableCell>
-                      <TableCell className="text-right font-mono tabular-nums">
-                        {fmtDollars(pair.expense_amount_source)}
-                      </TableCell>
-                      <TableCell>
-                        {pair.amounts_match ? (
-                          <Badge variant="secondary">Match</Badge>
-                        ) : (
-                          <Badge variant="destructive">Mismatch</Badge>
-                        )}
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            )}
-          </TabsContent>
-
-          <TabsContent value="rewrites" className="pt-4">
-            {extract.normalization_applied.length === 0 ? (
-              <Empty text="The extractor returned canonical labels. Nothing was rewritten." />
-            ) : (
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>From the PDF</TableHead>
-                    <TableHead>Mapped to</TableHead>
-                    <TableHead>Via</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {extract.normalization_applied.map((r, i) => (
-                    <TableRow key={i}>
-                      <TableCell className="font-mono text-sm">
-                        {r.raw_label}
-                      </TableCell>
-                      <TableCell>{r.canonical_label}</TableCell>
-                      <TableCell>
-                        <Badge variant="outline">
-                          {r.match_type === "alias" ? "alias" : "case/space"}
-                        </Badge>
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            )}
-          </TabsContent>
-
-          <TabsContent value="unused" className="pt-4">
-            {compute.unused_labels.length === 0 ? (
-              <Empty text="Every line in the PDF was consumed by the recipe. Nothing left over." />
-            ) : (
-              <div className="space-y-3">
-                <p className="text-sm text-neutral-600">
-                  These labels appeared in the source PDF but the recipe
-                  didn&rsquo;t use them. Review before writing - a new revenue
-                  line (e.g. &ldquo;Diesel Sales&rdquo;) would otherwise
-                  silently shrink Sales.
-                </p>
-                <div className="flex flex-wrap gap-2">
-                  {compute.unused_labels.map((label) => (
-                    <Badge key={label} variant="outline">
-                      {label}
-                    </Badge>
-                  ))}
-                </div>
-              </div>
-            )}
-          </TabsContent>
-
-          <TabsContent value="raw" className="pt-4">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Label (canonical)</TableHead>
-                  <TableHead className="text-right">Amount ($)</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {extract.line_items.map((item, i) => (
-                  <TableRow key={i}>
-                    <TableCell>{item.label}</TableCell>
-                    <TableCell className="text-right font-mono tabular-nums">
-                      {fmtDollars(item.amount)}
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </TabsContent>
-        </Tabs>
-      </CardContent>
-    </Card>
-  );
-}
-
-function TraceSection({
-  title,
-  formula,
-  inputs,
-  unrounded,
-  result,
-}: {
-  title: string;
-  formula: string;
-  inputs: { label: string; amount_source: number; amount_tracker: number }[];
-  unrounded: number;
-  result: number;
-}) {
-  return (
-    <div>
-      <div className="mb-2 flex items-baseline gap-3">
-        <h3 className="text-sm font-semibold">{title}</h3>
-        <span className="text-xs text-neutral-500">{formula}</span>
-      </div>
-      <Table>
-        <TableHeader>
-          <TableRow>
-            <TableHead>Line item</TableHead>
-            <TableHead className="text-right">Amount ($)</TableHead>
-            <TableHead className="text-right">($000s)</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {inputs.map((inp, i) => (
-            <TableRow key={i}>
-              <TableCell>{inp.label}</TableCell>
-              <TableCell className="text-right font-mono tabular-nums">
-                {fmtDollars(inp.amount_source)}
-              </TableCell>
-              <TableCell className="text-right font-mono tabular-nums">
-                {inp.amount_tracker.toFixed(3)}
-              </TableCell>
-            </TableRow>
           ))}
-          <TableRow className="border-t-2 border-neutral-300">
-            <TableCell className="font-semibold">
-              Total (before rounding)
-            </TableCell>
-            <TableCell className="text-right" />
-            <TableCell className="text-right font-mono font-semibold tabular-nums">
-              {unrounded.toFixed(3)}
-            </TableCell>
-          </TableRow>
-          <TableRow>
-            <TableCell className="font-semibold">
-              Rounded ({title} in $000s)
-            </TableCell>
-            <TableCell className="text-right" />
-            <TableCell className="text-right font-mono font-semibold tabular-nums">
-              {result.toLocaleString()}
-            </TableCell>
-          </TableRow>
-        </TableBody>
-      </Table>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function TenantCard(props: {
+  state: TenantState;
+  running: boolean;
+  onAssign: (row: number, file: File) => void;
+  onClear: (row: number) => void;
+}) {
+  const { state } = props;
+  const [dragOver, setDragOver] = useState(false);
+
+  function handleFile(file: File | null) {
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith(".pdf")) {
+      toast.error(`${file.name} is not a PDF.`);
+      return;
+    }
+    props.onAssign(state.tenant.row, file);
+  }
+
+  const statusBadge = (() => {
+    switch (state.status) {
+      case "idle":
+        return <Badge variant="outline">no PDF</Badge>;
+      case "loaded":
+        return <Badge variant="secondary">ready</Badge>;
+      case "extracting":
+        return <Badge>extracting…</Badge>;
+      case "computing":
+        return <Badge>computing…</Badge>;
+      case "computed":
+        return <Badge variant="secondary">computed</Badge>;
+      case "error":
+        return <Badge variant="destructive">error</Badge>;
+    }
+  })();
+
+  return (
+    <div
+      onDragOver={(e) => {
+        e.preventDefault();
+        setDragOver(true);
+      }}
+      onDragLeave={() => setDragOver(false)}
+      onDrop={(e) => {
+        e.preventDefault();
+        setDragOver(false);
+        handleFile(e.dataTransfer.files?.[0] ?? null);
+      }}
+      className={`rounded-lg border p-3 transition-colors ${
+        dragOver ? "border-primary bg-blue-50" : "border-neutral-200"
+      }`}
+    >
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="min-w-0">
+          <p className="truncate text-sm font-medium">{state.tenant.display_name}</p>
+          <p className="font-mono text-xs text-neutral-500">row {state.tenant.row}</p>
+        </div>
+        {statusBadge}
+      </div>
+
+      {state.pdf ? (
+        <div className="flex items-center justify-between gap-2 rounded border bg-neutral-50 px-2.5 py-1.5">
+          <span className="truncate text-xs text-neutral-700">
+            {state.pdfName} · {formatBytes(state.pdf.size)}
+          </span>
+          <button
+            type="button"
+            className="text-xs text-neutral-500 hover:text-foreground"
+            onClick={() => props.onClear(state.tenant.row)}
+            disabled={props.running}
+          >
+            remove
+          </button>
+        </div>
+      ) : (
+        <label className="block cursor-pointer rounded border border-dashed border-neutral-300 px-3 py-2 text-center text-xs text-neutral-500 hover:bg-neutral-50">
+          Drop a PDF here, or click to browse
+          <input
+            type="file"
+            accept="application/pdf"
+            className="hidden"
+            onChange={(e) => handleFile(e.target.files?.[0] ?? null)}
+          />
+        </label>
+      )}
+
+      {state.status === "computed" && state.compute && (
+        <div className="mt-2 grid grid-cols-2 gap-1 text-xs">
+          <span className="text-neutral-500">Sales</span>
+          <span className="text-right font-mono tabular-nums">
+            {fmtMetric(state.compute.sales)}
+          </span>
+          <span className="text-neutral-500">EBITDA</span>
+          <span className="text-right font-mono tabular-nums">
+            {fmtMetric(state.compute.ebitda)}
+          </span>
+        </div>
+      )}
+
+      {state.status === "error" && state.error && (
+        <p className="mt-2 text-xs text-red-600">{state.error}</p>
+      )}
     </div>
   );
 }
 
-function CountBadge({ n, warn }: { n: number; warn?: boolean }) {
-  if (n === 0) return null;
+function UnassignedCard(props: {
+  items: UnassignedPdf[];
+  tenants: TenantPickerEntry[];
+  onAssign: (unassignedId: string, row: number) => void;
+}) {
   return (
-    <Badge
-      variant={warn ? "destructive" : "secondary"}
-      className="ml-1.5 px-1.5 py-0 text-[10px]"
-    >
-      {n}
-    </Badge>
+    <Card>
+      <CardHeader>
+        <CardTitle>Unassigned PDFs</CardTitle>
+        <CardDescription>
+          These came out of the zip but didn&rsquo;t match a tenant
+          name. Pick the right tenant from the dropdown for each one.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <ul className="space-y-2">
+          {props.items.map((u) => (
+            <li
+              key={u.id}
+              className="flex flex-wrap items-center justify-between gap-2 rounded border bg-neutral-50 px-3 py-2"
+            >
+              <span className="font-mono text-xs">
+                {u.name} · {formatBytes(u.file.size)}
+              </span>
+              <Select
+                onValueChange={(v) => {
+                  if (v) props.onAssign(u.id, Number(v));
+                }}
+              >
+                <SelectTrigger className="w-72">
+                  <SelectValue placeholder="Assign to tenant" />
+                </SelectTrigger>
+                <SelectContent>
+                  {props.tenants.map((t) => (
+                    <SelectItem key={t.row} value={String(t.row)}>
+                      <span className="flex items-center gap-2">
+                        <span className="font-mono text-xs text-neutral-500">
+                          row {t.row}
+                        </span>
+                        {t.display_name}
+                      </span>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </li>
+          ))}
+        </ul>
+      </CardContent>
+    </Card>
   );
 }
 
-function Empty({ text }: { text: string }) {
+function ActionsCard(props: {
+  loadedCount: number;
+  readyCount: number;
+  running: boolean;
+  writing: boolean;
+  onRunAll: () => void;
+  onWriteAll: () => void;
+  quarterLabel: string;
+}) {
   return (
-    <p className="rounded border border-dashed border-neutral-200 px-4 py-6 text-center text-sm text-neutral-500">
-      {text}
-    </p>
+    <Card>
+      <CardHeader>
+        <CardTitle>Step 4 — Run + write</CardTitle>
+        <CardDescription>
+          Extract + compute every loaded PDF in one click. Then review
+          the results table below and download the filled-in tracker.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-wrap items-center gap-3">
+        <Button
+          onClick={props.onRunAll}
+          disabled={props.running || props.writing || props.loadedCount === 0}
+        >
+          {props.running ? "Running…" : `Extract & compute (${props.loadedCount} loaded)`}
+        </Button>
+        <Button
+          onClick={props.onWriteAll}
+          disabled={props.running || props.writing || props.readyCount === 0}
+          variant={props.readyCount > 0 ? "default" : "outline"}
+        >
+          {props.writing
+            ? "Writing…"
+            : `Write ${props.readyCount} tenant${props.readyCount === 1 ? "" : "s"} to ${props.quarterLabel}`}
+        </Button>
+      </CardContent>
+    </Card>
   );
 }
 
-function fmtDollars(n: number): string {
-  return n.toLocaleString("en-US", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
+function ResultsTable(props: { rows: TenantState[] }) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Step 5 — Review</CardTitle>
+        <CardDescription>
+          All values in $000s. EBITDA Margin is computed inline as a
+          sanity check; the tracker recomputes it from Sales and EBITDA
+          once you write.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="overflow-x-auto">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Tenant</TableHead>
+              {WRITABLE_METRICS.map((m) => (
+                <TableHead key={m} className="text-right">
+                  {METRIC_LABELS[m]}
+                </TableHead>
+              ))}
+              <TableHead className="text-right">Margin</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {props.rows.map((s) => {
+              const c = s.compute!;
+              const margin =
+                c.sales !== null && c.sales !== 0 && c.ebitda !== null
+                  ? (c.ebitda / c.sales) * 100
+                  : null;
+              return (
+                <TableRow key={s.tenant.row}>
+                  <TableCell className="max-w-64 truncate">
+                    {s.tenant.display_name}
+                  </TableCell>
+                  {WRITABLE_METRICS.map((m) => (
+                    <TableCell key={m} className="text-right font-mono tabular-nums">
+                      {fmtMetric(c[m])}
+                    </TableCell>
+                  ))}
+                  <TableCell className="text-right font-mono tabular-nums">
+                    {margin === null ? "—" : `${margin.toFixed(1)}%`}
+                  </TableCell>
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      </CardContent>
+    </Card>
+  );
 }
 
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+function fmtMetric(n: number | null): string {
+  if (n === null || n === undefined || Number.isNaN(n)) return "—";
+  return n.toLocaleString();
 }
+
+function traceToAudit(trace: ComputeMetricTrace) {
+  return {
+    formula: trace.formula,
+    inputs: trace.contributions.map((c) => ({
+      label: c.label,
+      amount_source: c.amount_source,
+      amount_tracker: c.amount_tracker,
+    })),
+    total_tracker_unrounded: trace.total_tracker_unrounded,
+    result: trace.result_tracker ?? 0,
+  };
+}
+

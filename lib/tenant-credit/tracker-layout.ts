@@ -1,34 +1,44 @@
 // Shared knowledge of the Corp Financials sheet's column structure.
-// Used by the writeback route to translate a (tenant, quarter) pair into
-// the exact (row, column) cells the Python worker should write.
 //
-// Why this lives in TypeScript (not in the worker): the worker is meant
-// to be a dumb, stateless cell-writer. All knowledge of layout, tenants,
-// and quarters lives on the Next.js side so the worker can be re-used
-// across tools without dragging the credit-tracker schema with it.
+// The sheet repeats the same 18-column "section" layout (13 quarterly +
+// 4 annual + 1 LTM) for every metric: Sales, EBITDA, EBITDA Margin,
+// Interest, Rent, EBITDAR, Op Lease Debt, B/S Debt, Total Debt, Cash,
+// CFO, Capex, FCF, and several leverage ratios. The Margin / EBITDAR /
+// Total Debt / FCF / leverage sections are formula-driven; the engine
+// only writes into the seven raw-metric sections (Sales, EBITDA,
+// Interest, Rent, Cash, CFO, Capex).
 //
-// Verified against samples/Corporate_Financials_and_P_Ls.xlsx via the
-// Phase 1 openpyxl inspection (see the report at the end of Phase 1).
+// Why this lives in TypeScript: the worker is meant to be a dumb,
+// stateless cell-writer. All knowledge of layout, tenants, and
+// quarters lives on the Next.js side so the worker can stay generic.
 
 // Header note: cell AI3 in the actual spreadsheet reads "Q4 26" instead
-// of "Q1 26" — a typo in the source, not in this code. The cell
-// ordering is otherwise consistent (col 35 sits right after Q4 25 at
-// col 34). The worker logs a warning when it encounters this header
-// rather than refusing the write.
+// of "Q1 26" — a typo in the source, not in this code. The writer
+// accepts the typo on the EBITDA section for Q1 2026 only and emits
+// a warning rather than refusing the write.
 const Q1_2026_EBITDA_HEADER_TYPO = "Q4 26";
 
 export const TRACKER_LAYOUT = {
-  // Trailing space is part of the sheet name. openpyxl is whitespace-
-  // sensitive on sheet lookups so this constant must match exactly.
+  // Trailing space is part of the sheet name. ExcelJS / openpyxl are
+  // both whitespace-sensitive on sheet lookups, so this constant must
+  // match the source exactly.
   sheet_name: "Corp Financials ",
-  // First quarterly column for each section. Sales starts at E (5).
-  // EBITDA starts at W (23). Both have 13 quarterly columns (Q1 23 to
-  // Q1 26), then 4 annual columns, then an LTM column.
-  sales_quarterly_start_col: 5,
-  ebitda_quarterly_start_col: 23,
-  quarterly_columns: 13,
-  // Row index that carries the column labels ("Q1 23", "Q2 23", ...).
+  // Row that carries the quarter labels ("Q1 23", "Q2 23", ...).
   header_row: 3,
+  // How many quarterly columns each section has before the annual /
+  // LTM columns start. Q1 23 through Q1 26 = 13.
+  quarterly_columns: 13,
+  // 1-indexed column where each writable section starts. Pulled off
+  // row 1 of the sample workbook (the section title row).
+  section_starts: {
+    sales: 5,      // E
+    ebitda: 23,    // W
+    interest: 59,  // BG
+    rent: 77,      // BY
+    cash: 167,     // FK
+    cfo: 185,      // GC
+    capex: 203,    // GU
+  },
 } as const;
 
 export type QuarterId =
@@ -37,9 +47,10 @@ export type QuarterId =
   | "Q1_2025" | "Q2_2025" | "Q3_2025" | "Q4_2025"
   | "Q1_2026";
 
-// Order matters: index in this list is the column offset from the
-// section start column. Extending the tracker into Q2 2026 and beyond
-// would mean appending entries here AND adding columns to the xlsx.
+// Order matters: index in this list is the column offset from each
+// section's start column. Extending the tracker into Q2 2026 and beyond
+// means appending entries here AND adding columns to the xlsx (the
+// engine refuses to write past the last known offset).
 const QUARTER_ORDER: { id: QuarterId; label: string }[] = [
   { id: "Q1_2023", label: "Q1 23" },
   { id: "Q2_2023", label: "Q2 23" },
@@ -56,19 +67,47 @@ const QUARTER_ORDER: { id: QuarterId; label: string }[] = [
   { id: "Q1_2026", label: "Q1 26" },
 ];
 
+// The seven raw-metric sections the engine writes to. Margin, EBITDAR,
+// Total Debt, FCF, and the leverage / FCCR ratios live between these
+// sections and are tracker formulas; never written by code.
+export const WRITABLE_METRICS = [
+  "sales",
+  "ebitda",
+  "interest",
+  "rent",
+  "cash",
+  "cfo",
+  "capex",
+] as const;
+export type MetricKey = (typeof WRITABLE_METRICS)[number];
+
+// Human-readable label for the picker / results table.
+export const METRIC_LABELS: Record<MetricKey, string> = {
+  sales: "Sales",
+  ebitda: "EBITDA",
+  interest: "Interest",
+  rent: "Rent",
+  cash: "Cash",
+  cfo: "CFO",
+  capex: "Capex",
+};
+
+export type MetricCell = {
+  metric: MetricKey;
+  // 1-indexed column in the Corp Financials sheet.
+  col: number;
+  // The text the header row should carry for this column.
+  header_expected: string;
+  // Optional alternate header the writer should also accept (only set
+  // for EBITDA Q1 26 today, where AI3 = "Q4 26" in the source).
+  header_alternate: string | null;
+};
+
 export type TrackerTarget = {
   sheet_name: string;
   header_row: number;
-  sales_col: number;
-  ebitda_col: number;
-  // The row-3 label the worker should expect to find above the Sales
-  // column. Mismatch is a hard error (wrong column entirely).
-  sales_header_expected: string;
-  // Same for EBITDA, plus an alternate to tolerate the AI3 "Q4 26"
-  // typo for Q1 26 specifically. The worker warns on the alternate
-  // but doesn't refuse the write.
-  ebitda_header_expected: string;
-  ebitda_header_alternate: string | null;
+  // One entry per writable metric, in WRITABLE_METRICS order.
+  cells: MetricCell[];
 };
 
 export function trackerColumnsForQuarter(quarterId: QuarterId): TrackerTarget {
@@ -80,22 +119,26 @@ export function trackerColumnsForQuarter(quarterId: QuarterId): TrackerTarget {
     );
   }
   const entry = QUARTER_ORDER[idx];
+  const isQ1_2026 = quarterId === "Q1_2026";
 
-  // The Q1 26 EBITDA column header has a typo in the source xlsx
-  // (AI3 = "Q4 26" instead of "Q1 26"). For that specific quarter, the
-  // worker accepts either label and logs the typo. Every other quarter
-  // is strict.
-  const ebitdaAlternate =
-    quarterId === "Q1_2026" ? Q1_2026_EBITDA_HEADER_TYPO : null;
+  // Build the cells array in the order WRITABLE_METRICS declares so
+  // the writer can iterate metrics deterministically and the audit log
+  // keeps a stable column order.
+  const cells: MetricCell[] = WRITABLE_METRICS.map((metric) => ({
+    metric,
+    col: TRACKER_LAYOUT.section_starts[metric] + idx,
+    header_expected: entry.label,
+    // The Q1 26 EBITDA column header has a typo in the source xlsx
+    // (AI3 = "Q4 26" instead of "Q1 26"). The writer accepts either
+    // for that one cell and reports it as a soft warning.
+    header_alternate:
+      metric === "ebitda" && isQ1_2026 ? Q1_2026_EBITDA_HEADER_TYPO : null,
+  }));
 
   return {
     sheet_name: TRACKER_LAYOUT.sheet_name,
     header_row: TRACKER_LAYOUT.header_row,
-    sales_col: TRACKER_LAYOUT.sales_quarterly_start_col + idx,
-    ebitda_col: TRACKER_LAYOUT.ebitda_quarterly_start_col + idx,
-    sales_header_expected: entry.label,
-    ebitda_header_expected: entry.label,
-    ebitda_header_alternate: ebitdaAlternate,
+    cells,
   };
 }
 
@@ -106,22 +149,3 @@ export function quarterLabel(id: QuarterId): string {
   return entry.label;
 }
 
-// Which quarters are currently writable for a given tenant. The worker
-// also enforces this defensively (it refuses to overwrite a populated
-// cell), but filtering the dashboard picker prevents the analyst from
-// triggering that refusal in the first place - the foot-gun would
-// otherwise surface as a raw "target cell already holds X" toast.
-//
-// Hardcoded per-tenant for Phase 6. When more tenants are added in
-// Phase 8, this can be derived dynamically by inspecting which cells
-// in each tenant's row are empty. The hardcoded approach makes the
-// initial demo predictable.
-const WRITABLE_QUARTERS: Record<string, QuarterId[]> = {
-  // Pinnacle row 14: Q1 23 through Q4 25 already have values or
-  // formulas (verified during Phase 1 inspection). Only Q1 26 is open.
-  pinnacle: ["Q1_2026"],
-};
-
-export function writableQuartersForTenant(tenantId: string): QuarterId[] {
-  return WRITABLE_QUARTERS[tenantId] ?? [];
-}
