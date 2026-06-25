@@ -360,8 +360,25 @@ export default function TenantCreditPage() {
         // in /". Skip them and non-PDFs.
         if (path.endsWith("/") || bytes.byteLength === 0) continue;
         if (!path.toLowerCase().endsWith(".pdf")) continue;
-        // Use only the basename for matching, not the full path.
-        const filename = path.split("/").pop() ?? path;
+        // macOS adds hidden resource-fork entries to every zip it
+        // creates: __MACOSX/<name>/._<filename> and plain ._<filename>
+        // alongside the real PDF. They have a .pdf extension but their
+        // bytes are AppleDouble metadata, not a PDF, and Anthropic
+        // rejects them as "not a valid PDF". Skip them.
+        const basename = path.split("/").pop() ?? path;
+        if (path.startsWith("__MACOSX/") || basename.startsWith("._")) continue;
+        // Magic-byte check: a real PDF starts with "%PDF". Anything
+        // else is some other file with a .pdf extension. Drop it
+        // rather than wasting a Claude call on it.
+        if (
+          bytes[0] !== 0x25 ||
+          bytes[1] !== 0x50 ||
+          bytes[2] !== 0x44 ||
+          bytes[3] !== 0x46
+        ) {
+          continue;
+        }
+        const filename = basename;
         const blob = new Blob([new Uint8Array(bytes)], { type: "application/pdf" });
         const file = new File([blob], filename, { type: "application/pdf" });
         const { winner, tied } = matchPdfToTenant(filename, tenants);

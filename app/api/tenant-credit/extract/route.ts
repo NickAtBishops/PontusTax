@@ -111,6 +111,32 @@ export async function POST(req: Request) {
 
   // Read the bytes and base64-encode for the Anthropic document block.
   const arrayBuffer = await file.arrayBuffer();
+  // Magic-byte check: a real PDF starts with "%PDF" (0x25 0x50 0x44 0x46).
+  // Without this, encrypted PDFs, scanned-image-only PDFs, macOS resource
+  // forks, and plain non-PDFs with a .pdf extension all get forwarded to
+  // Anthropic, which 400s with "The PDF specified was not valid." The
+  // analyst then sees a cryptic 502 from our route. Fail fast here
+  // instead with the actual reason.
+  const head = new Uint8Array(arrayBuffer.slice(0, 4));
+  if (
+    head[0] !== 0x25 ||
+    head[1] !== 0x50 ||
+    head[2] !== 0x44 ||
+    head[3] !== 0x46
+  ) {
+    return NextResponse.json(
+      {
+        error:
+          `${file.name} does not start with the "%PDF" header, so it isn't ` +
+          "a PDF Anthropic can read. Common causes: the file was renamed to " +
+          ".pdf from another format; the PDF is password-protected; the zip " +
+          "you uploaded contained macOS resource-fork files (the hidden " +
+          "._filename.pdf or __MACOSX/* entries). Try re-exporting the PDF " +
+          "from the source application, or upload one PDF at a time.",
+      },
+      { status: 400 },
+    );
+  }
   const pdfBase64 = Buffer.from(arrayBuffer).toString("base64");
 
   let raw;
