@@ -1335,7 +1335,14 @@ function TenantCombobox(props: {
   recommendedId: string | null;
   placeholder?: string;
 }) {
-  const [query, setQuery] = useState("");
+  // Initial query mirrors the picked tenant's name so the input shows
+  // what's already assigned when the page hydrates from storage. Once
+  // the user types, this state owns the field; pickTop syncs it back
+  // to the picked name.
+  const [query, setQuery] = useState(() => {
+    const t = props.tenants.find((tt) => tt.tenant_id === props.value);
+    return t?.display_name ?? "";
+  });
   const [open, setOpen] = useState(false);
 
   const suggestions = useMemo(() => {
@@ -1376,9 +1383,15 @@ function TenantCombobox(props: {
 
   function pickTop() {
     const top = suggestions[0];
-    if (!top) return;
+    if (!top) {
+      // Helpful toast when the analyst hits the button or Tabs with
+      // no matches — instead of the silent no-op that read as
+      // "broken" during testing.
+      toast.error("No matching tenant. Type more or pick from the list.");
+      return;
+    }
     props.onChange(top.tenant_id);
-    setQuery("");
+    setQuery(top.display_name);
     setOpen(false);
   }
 
@@ -1387,7 +1400,8 @@ function TenantCombobox(props: {
       <div className="flex gap-1">
         <Input
           value={query}
-          placeholder={selected?.display_name ?? props.placeholder ?? "Type to search"}
+          placeholder={props.placeholder ?? "Type to search"}
+          className={selected ? "border-emerald-500 focus-visible:ring-emerald-500/30" : ""}
           onChange={(e) => {
             setQuery(e.target.value);
             setOpen(true);
@@ -1403,7 +1417,7 @@ function TenantCombobox(props: {
                 pickTop();
               }
             } else if (e.key === "Escape") {
-              setQuery("");
+              setQuery(selected?.display_name ?? "");
               setOpen(false);
             }
           }}
@@ -1411,8 +1425,7 @@ function TenantCombobox(props: {
         <Button
           type="button"
           size="sm"
-          variant="outline"
-          disabled={suggestions.length === 0}
+          variant={selected ? "secondary" : "outline"}
           onClick={pickTop}
           title="Accept top suggestion"
           className="shrink-0"
