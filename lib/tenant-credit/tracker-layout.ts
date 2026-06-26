@@ -45,12 +45,17 @@ export type QuarterId =
   | "Q1_2023" | "Q2_2023" | "Q3_2023" | "Q4_2023"
   | "Q1_2024" | "Q2_2024" | "Q3_2024" | "Q4_2024"
   | "Q1_2025" | "Q2_2025" | "Q3_2025" | "Q4_2025"
-  | "Q1_2026";
+  | "Q1_2026" | "Q2_2026" | "Q3_2026" | "Q4_2026"
+  | "Q1_2027" | "Q2_2027" | "Q3_2027" | "Q4_2027"
+  | "Q1_2028" | "Q2_2028" | "Q3_2028" | "Q4_2028";
 
 // Order matters: index in this list is the column offset from each
-// section's start column. Extending the tracker into Q2 2026 and beyond
-// means appending entries here AND adding columns to the xlsx (the
-// engine refuses to write past the last known offset).
+// section's start column. Quarters past the last one actually present
+// in the analyst's tracker (Q1 26 on the bundled sample) are valid
+// inputs but the writeback's header-match check will refuse them
+// until the analyst extends the xlsx with the matching column. That's
+// intentional, so picking a future quarter on a not-yet-extended
+// tracker fails loudly instead of silently writing to the wrong cell.
 const QUARTER_ORDER: { id: QuarterId; label: string }[] = [
   { id: "Q1_2023", label: "Q1 23" },
   { id: "Q2_2023", label: "Q2 23" },
@@ -65,6 +70,17 @@ const QUARTER_ORDER: { id: QuarterId; label: string }[] = [
   { id: "Q3_2025", label: "Q3 25" },
   { id: "Q4_2025", label: "Q4 25" },
   { id: "Q1_2026", label: "Q1 26" },
+  { id: "Q2_2026", label: "Q2 26" },
+  { id: "Q3_2026", label: "Q3 26" },
+  { id: "Q4_2026", label: "Q4 26" },
+  { id: "Q1_2027", label: "Q1 27" },
+  { id: "Q2_2027", label: "Q2 27" },
+  { id: "Q3_2027", label: "Q3 27" },
+  { id: "Q4_2027", label: "Q4 27" },
+  { id: "Q1_2028", label: "Q1 28" },
+  { id: "Q2_2028", label: "Q2 28" },
+  { id: "Q3_2028", label: "Q3 28" },
+  { id: "Q4_2028", label: "Q4 28" },
 ];
 
 // The seven raw-metric sections the engine writes to. Margin, EBITDAR,
