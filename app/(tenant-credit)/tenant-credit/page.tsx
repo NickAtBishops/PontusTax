@@ -1,8 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { unzipSync } from "fflate";
+import { X } from "lucide-react";
 
 import { AppShell } from "@/components/app-shell";
 import { ConfigGate } from "@/components/config-gate";
@@ -301,7 +302,11 @@ function mergeLineItems(
 // ---------------------------------------------------------------------------
 
 export default function TenantCreditPage() {
-  const [mode, setMode] = useState<Mode>("quick");
+  // Triage is the default since most analysts dump a zip and want
+  // to review each file before it lands on a tenant. Quick mode is
+  // there for the case where filenames are already clean and the
+  // analyst trusts the auto-router.
+  const [mode, setMode] = useState<Mode>("triage");
   const [trackerFile, setTrackerFile] = useState<File | null>(null);
   const [tenants, setTenants] = useState<TenantPickerEntry[]>([]);
   const [tenantsLoading, setTenantsLoading] = useState(false);
@@ -1067,6 +1072,125 @@ function QuarterAndZipCard(props: {
   );
 }
 
+// Typeahead-style tenant picker. The analyst types part of the
+// tenant's name and the list narrows to whatever matches. Tab or
+// Enter accepts the top suggestion so a keyboard-only workflow is
+// fast. Recommended tenants are sorted first and labelled.
+function TenantCombobox(props: {
+  value: string;
+  onChange: (tenantId: string) => void;
+  tenants: TenantPickerEntry[];
+  recommendedId: string | null;
+  placeholder?: string;
+}) {
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+
+  const suggestions = useMemo(() => {
+    if (!query.trim()) {
+      // No query: show the recommended tenant on top (if any), then
+      // the rest in their original column-A order.
+      const rec = props.tenants.find(
+        (t) => t.tenant_id === props.recommendedId,
+      );
+      const others = props.tenants.filter(
+        (t) => t.tenant_id !== props.recommendedId,
+      );
+      return rec ? [rec, ...others] : others;
+    }
+    const q = normalize(query);
+    return props.tenants
+      .map((t) => {
+        const name = normalize(t.display_name);
+        let score = 0;
+        // Stronger weight on prefix matches so typing "pinn" puts
+        // "Pinnacle..." at the top even though "Family Dollar
+        // Stores of Wisconsin" also contains "in".
+        if (name.startsWith(q)) score = 1000 + (props.recommendedId === t.tenant_id ? 1 : 0);
+        else if (name.includes(q)) score = 500 + (props.recommendedId === t.tenant_id ? 1 : 0);
+        else {
+          for (const token of q.split(/\s+/)) {
+            if (token.length >= 3 && name.includes(token)) score += 100;
+          }
+        }
+        return { tenant: t, score };
+      })
+      .filter((x) => x.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .map((x) => x.tenant);
+  }, [query, props.tenants, props.recommendedId]);
+
+  const selected = props.tenants.find((t) => t.tenant_id === props.value);
+
+  function pickTop() {
+    const top = suggestions[0];
+    if (!top) return;
+    props.onChange(top.tenant_id);
+    setQuery("");
+    setOpen(false);
+  }
+
+  return (
+    <div className="relative">
+      <Input
+        value={query}
+        placeholder={selected?.display_name ?? props.placeholder ?? "Type to search"}
+        onChange={(e) => {
+          setQuery(e.target.value);
+          setOpen(true);
+        }}
+        onFocus={() => setOpen(true)}
+        // The 150 ms blur delay lets a mouse click on a suggestion
+        // register before the panel collapses.
+        onBlur={() => window.setTimeout(() => setOpen(false), 150)}
+        onKeyDown={(e) => {
+          if (e.key === "Tab" || e.key === "Enter") {
+            if (suggestions.length > 0) {
+              e.preventDefault();
+              pickTop();
+            }
+          } else if (e.key === "Escape") {
+            setQuery("");
+            setOpen(false);
+          }
+        }}
+      />
+      {open && suggestions.length > 0 && (
+        <div className="absolute left-0 right-0 top-full z-50 mt-1 max-h-72 overflow-auto rounded-md border bg-popover shadow-md">
+          {suggestions.slice(0, 12).map((t, i) => (
+            <button
+              key={t.tenant_id}
+              type="button"
+              className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-accent ${
+                i === 0 ? "bg-accent/30" : ""
+              }`}
+              onMouseDown={(e) => {
+                // mousedown beats the input's blur handler so the
+                // selection registers before the panel closes.
+                e.preventDefault();
+                props.onChange(t.tenant_id);
+                setQuery("");
+                setOpen(false);
+              }}
+            >
+              <span className="font-mono text-xs text-neutral-500">row {t.row}</span>
+              <span className="flex-1 truncate">{t.display_name}</span>
+              {t.tenant_id === props.recommendedId && (
+                <Badge variant="secondary">suggested</Badge>
+              )}
+              {i === 0 && (
+                <span className="ml-1 rounded border px-1 text-[10px] uppercase text-neutral-500">
+                  tab
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function TriageCard(props: {
   entries: TriageEntry[];
   tenants: TenantPickerEntry[];
@@ -1074,6 +1198,9 @@ function TriageCard(props: {
   onRemove: (id: string) => void;
   onConfirm: () => void;
 }) {
+  // The row whose preview is currently expanded. Only one expands
+  // at a time so we don't load every PDF simultaneously; clicking
+  // another row replaces the preview underneath it.
   const [previewId, setPreviewId] = useState<string | null>(
     props.entries[0]?.id ?? null,
   );
@@ -1088,7 +1215,9 @@ function TriageCard(props: {
       <CardHeader>
         <CardTitle>Triage</CardTitle>
         <CardDescription>
-          Confirm each file&rsquo;s tenant and tag.
+          Confirm each file&rsquo;s tenant and tag. Click a row to preview
+          it underneath. Type in the tenant box and press Tab to take the
+          top suggestion.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -1099,112 +1228,111 @@ function TriageCard(props: {
                 <TableHead>File</TableHead>
                 <TableHead>Tenant</TableHead>
                 <TableHead>Level</TableHead>
-                <TableHead className="w-8" />
+                <TableHead className="w-12" />
               </TableRow>
             </TableHeader>
             <TableBody>
               {props.entries.map((e) => (
-                <TableRow
-                  key={e.id}
-                  onClick={() => setPreviewId(e.id)}
-                  className={`cursor-pointer ${
-                    previewId === e.id ? "bg-accent/40" : ""
-                  }`}
-                >
-                  <TableCell className="max-w-56">
-                    <span className="flex items-center gap-2">
-                      <Badge variant="outline" className="uppercase">
-                        {e.kind}
-                      </Badge>
-                      <span className="truncate font-mono text-xs">
-                        {e.name}
-                      </span>
-                    </span>
-                  </TableCell>
-                  <TableCell
-                    onClick={(ev) => ev.stopPropagation()}
-                    className="min-w-56"
+                <Fragment key={e.id}>
+                  <TableRow
+                    onClick={() => setPreviewId(e.id)}
+                    className={`cursor-pointer ${
+                      previewId === e.id ? "bg-accent/40" : ""
+                    }`}
                   >
-                    <Select
-                      value={e.assigned_tenant_id ?? ""}
-                      onValueChange={(v) =>
-                        props.onChange(e.id, { assigned_tenant_id: v })
-                      }
+                    <TableCell className="max-w-56">
+                      <span className="flex items-center gap-2">
+                        <Badge variant="outline" className="uppercase">
+                          {e.kind}
+                        </Badge>
+                        <span className="truncate font-mono text-xs">
+                          {e.name}
+                        </span>
+                      </span>
+                    </TableCell>
+                    <TableCell
+                      onClick={(ev) => ev.stopPropagation()}
+                      className="min-w-72"
                     >
-                      <SelectTrigger className="w-full">
-                        <SelectValue placeholder="Pick tenant" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {props.tenants.map((t) => (
-                          <SelectItem key={t.row} value={t.tenant_id}>
-                            <span className="flex items-center gap-2">
-                              <span className="font-mono text-xs text-neutral-500">
-                                row {t.row}
-                              </span>
-                              {t.display_name}
-                              {t.tenant_id === e.recommended_tenant_id && (
-                                <Badge variant="secondary" className="ml-1">
-                                  suggested
-                                </Badge>
-                              )}
-                            </span>
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </TableCell>
-                  <TableCell onClick={(ev) => ev.stopPropagation()}>
-                    <div className="flex gap-1">
+                      <TenantCombobox
+                        value={e.assigned_tenant_id ?? ""}
+                        onChange={(v) =>
+                          props.onChange(e.id, { assigned_tenant_id: v })
+                        }
+                        tenants={props.tenants}
+                        recommendedId={e.recommended_tenant_id}
+                        placeholder="Type to search"
+                      />
+                    </TableCell>
+                    <TableCell onClick={(ev) => ev.stopPropagation()}>
+                      <div className="flex gap-1">
+                        <Button
+                          size="sm"
+                          variant={e.level === "tenant" ? "default" : "outline"}
+                          onClick={() => props.onChange(e.id, { level: "tenant" })}
+                        >
+                          T
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant={e.level === "corporate" ? "default" : "outline"}
+                          onClick={() => props.onChange(e.id, { level: "corporate" })}
+                        >
+                          C
+                        </Button>
+                      </div>
+                    </TableCell>
+                    <TableCell onClick={(ev) => ev.stopPropagation()}>
                       <Button
                         size="sm"
-                        variant={e.level === "tenant" ? "default" : "outline"}
-                        onClick={() => props.onChange(e.id, { level: "tenant" })}
+                        variant="ghost"
+                        className="h-9 w-9 p-0 text-neutral-500 hover:text-red-600"
+                        onClick={() => props.onRemove(e.id)}
+                        title="Remove from triage"
                       >
-                        T
+                        <X className="h-4 w-4" />
                       </Button>
-                      <Button
-                        size="sm"
-                        variant={e.level === "corporate" ? "default" : "outline"}
-                        onClick={() => props.onChange(e.id, { level: "corporate" })}
-                      >
-                        C
-                      </Button>
-                    </div>
-                  </TableCell>
-                  <TableCell onClick={(ev) => ev.stopPropagation()}>
-                    <button
-                      type="button"
-                      className="text-xs text-neutral-500 hover:text-red-600"
-                      onClick={() => props.onRemove(e.id)}
-                    >
-                      ×
-                    </button>
-                  </TableCell>
-                </TableRow>
+                    </TableCell>
+                  </TableRow>
+                  {previewId === e.id && (
+                    <TableRow className="hover:bg-transparent">
+                      <TableCell colSpan={4} className="p-0">
+                        <div className="border-y bg-neutral-50 p-3">
+                          {e.kind === "pdf" ? (
+                            <iframe
+                              key={e.id}
+                              src={previewUrl}
+                              className="h-[800px] w-full rounded border bg-white"
+                              title={e.name}
+                            />
+                          ) : (
+                            <div className="flex h-32 items-center justify-center rounded border bg-white text-center">
+                              <div>
+                                <p className="text-sm text-neutral-600">
+                                  {e.name}
+                                </p>
+                                <p className="text-xs text-neutral-500">
+                                  {formatBytes(e.file.size)} · Excel preview
+                                  not rendered inline.
+                                </p>
+                                <a
+                                  href={previewUrl}
+                                  download={e.name}
+                                  className="text-xs text-primary hover:underline"
+                                >
+                                  Download to open in Excel
+                                </a>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  )}
+                </Fragment>
               ))}
             </TableBody>
           </Table>
-        </div>
-
-        <div className="rounded border bg-neutral-50 p-2">
-          <p className="mb-2 text-xs text-neutral-500">
-            Preview{preview ? ` · ${preview.name}` : ""}
-          </p>
-          {preview && preview.kind === "pdf" ? (
-            <iframe
-              key={previewId}
-              src={previewUrl}
-              className="h-[800px] w-full rounded border bg-white"
-              title={preview.name}
-            />
-          ) : preview ? (
-            <p className="text-xs text-neutral-500">
-              {preview.name} ({formatBytes(preview.file.size)}). Excel
-              preview not rendered inline.
-            </p>
-          ) : (
-            <p className="text-xs text-neutral-500">Pick a row above.</p>
-          )}
         </div>
 
         <div className="flex justify-end">
