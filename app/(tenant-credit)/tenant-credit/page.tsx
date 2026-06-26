@@ -3,7 +3,14 @@
 import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { unzipSync } from "fflate";
-import { X } from "lucide-react";
+import { Check, X } from "lucide-react";
+
+import {
+  clearAll as clearStoredBlobs,
+  deleteBlob,
+  getBlob,
+  putBlob,
+} from "@/lib/tenant-credit/persistence";
 
 import { AppShell } from "@/components/app-shell";
 import { ConfigGate } from "@/components/config-gate";
@@ -151,6 +158,45 @@ type TriageEntry = {
   assigned_tenant_id: string | null;
   level: FileLevel;
 };
+
+// Persistent snapshot shape. Stored in localStorage as JSON; the raw
+// file Blobs live in IndexedDB keyed by file.id. The version field
+// makes it safe to evolve the schema later (older snapshots get
+// ignored when v doesn't match what the code expects).
+type SnapshotV1 = {
+  v: 1;
+  mode: Mode;
+  quarterId: QuarterId;
+  tracker: { name: string; size: number; idbKey: string } | null;
+  tenants: TenantPickerEntry[];
+  states: Record<
+    string,
+    {
+      tenant: TenantPickerEntry;
+      filesMeta: {
+        id: string;
+        name: string;
+        kind: "pdf" | "xlsx";
+        level: FileLevel;
+      }[];
+      status: TenantStatus;
+      extracts: ExtractResponse[];
+      compute: ComputeResponse | null;
+      error: string | null;
+    }
+  >;
+  triage: {
+    id: string;
+    name: string;
+    kind: "pdf" | "xlsx";
+    recommended_tenant_id: string | null;
+    assigned_tenant_id: string | null;
+    level: FileLevel;
+  }[];
+};
+
+const SNAPSHOT_STORAGE_KEY = "pontus-tenant-credit-snapshot";
+const TRACKER_IDB_KEY = "tracker";
 
 // One row of write-back history. Mirrors the route's RunSummary; the
 // audit module on the server persists these to Firestore so reloads
@@ -319,6 +365,11 @@ export default function TenantCreditPage() {
   // Sheet at the page root so any file in any list can be viewed
   // without disturbing the rest of the layout.
   const [previewing, setPreviewing] = useState<TenantFile | null>(null);
+  // Hydration flag: while true, we've started reading the saved
+  // snapshot from storage. We don't write back to storage until
+  // hydration completes, otherwise the empty initial state would
+  // wipe the saved snapshot before we can read it.
+  const [hydrated, setHydrated] = useState(false);
   // Persistent write-back history pulled from Firestore. Survives
   // reloads because it isn't in-memory — every committed write-back
   // lands in the audit log via /api/tenant-credit/writeback and the
@@ -360,6 +411,179 @@ export default function TenantCreditPage() {
       cancelled = true;
     };
   }, []);
+
+  // ----- Tab-survival persistence ---------------------------------------
+  // On mount: load the snapshot from localStorage + reconstruct File
+  // objects from IndexedDB. On every state change after that: persist
+  // the snapshot back. The hydrated flag prevents the first synchronous
+  // empty state from being saved over the real saved snapshot before
+  // we've had a chance to read it.
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const raw = window.localStorage.getItem(SNAPSHOT_STORAGE_KEY);
+        if (!raw) return;
+        const snap = JSON.parse(raw) as SnapshotV1;
+        if (snap?.v !== 1) return;
+
+        const trackerMime =
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+        let restoredTracker: File | null = null;
+        if (snap.tracker) {
+          const blob = await getBlob(snap.tracker.idbKey);
+          if (blob) {
+            restoredTracker = new File([blob], snap.tracker.name, {
+              type: trackerMime,
+            });
+          }
+        }
+
+        const restoredStates: Record<number, TenantState> = {};
+        for (const [rowKey, s] of Object.entries(snap.states)) {
+          const row = Number(rowKey);
+          const files: TenantFile[] = [];
+          for (const fm of s.filesMeta) {
+            const blob = await getBlob(fm.id);
+            if (!blob) continue;
+            const mime =
+              fm.kind === "pdf" ? "application/pdf" : trackerMime;
+            files.push({
+              id: fm.id,
+              file: new File([blob], fm.name, { type: mime }),
+              name: fm.name,
+              kind: fm.kind,
+              level: fm.level,
+            });
+          }
+          restoredStates[row] = {
+            tenant: s.tenant,
+            files,
+            // If IDB had been cleared (or a file was deleted out from
+            // under us), reset the run status. The numeric compute
+            // results stay for reference.
+            status: files.length === 0 ? "idle" : s.status,
+            extracts: s.extracts,
+            compute: s.compute,
+            error: s.error,
+          };
+        }
+
+        const restoredTriage: TriageEntry[] = [];
+        for (const t of snap.triage) {
+          const blob = await getBlob(t.id);
+          if (!blob) continue;
+          const mime = t.kind === "pdf" ? "application/pdf" : trackerMime;
+          restoredTriage.push({
+            id: t.id,
+            file: new File([blob], t.name, { type: mime }),
+            name: t.name,
+            kind: t.kind,
+            recommended_tenant_id: t.recommended_tenant_id,
+            assigned_tenant_id: t.assigned_tenant_id,
+            level: t.level,
+          });
+        }
+
+        if (cancelled) return;
+        setMode(snap.mode);
+        setQuarterId(snap.quarterId);
+        setTrackerFile(restoredTracker);
+        setTenants(snap.tenants);
+        setStates(restoredStates);
+        setTriage(restoredTriage);
+      } catch {
+        // Corrupted snapshot: ignore and start fresh.
+      } finally {
+        if (!cancelled) setHydrated(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    const handle = window.setTimeout(async () => {
+      try {
+        const snap: SnapshotV1 = {
+          v: 1,
+          mode,
+          quarterId,
+          tracker: trackerFile
+            ? {
+                name: trackerFile.name,
+                size: trackerFile.size,
+                idbKey: TRACKER_IDB_KEY,
+              }
+            : null,
+          tenants,
+          states: Object.fromEntries(
+            Object.entries(states).map(([row, s]) => [
+              row,
+              {
+                tenant: s.tenant,
+                filesMeta: s.files.map((f) => ({
+                  id: f.id,
+                  name: f.name,
+                  kind: f.kind,
+                  level: f.level,
+                })),
+                status: s.status,
+                extracts: s.extracts,
+                compute: s.compute,
+                error: s.error,
+              },
+            ]),
+          ),
+          triage: triage.map((e) => ({
+            id: e.id,
+            name: e.name,
+            kind: e.kind,
+            recommended_tenant_id: e.recommended_tenant_id,
+            assigned_tenant_id: e.assigned_tenant_id,
+            level: e.level,
+          })),
+        };
+
+        const writes: Promise<void>[] = [];
+        if (trackerFile) writes.push(putBlob(TRACKER_IDB_KEY, trackerFile));
+        for (const s of Object.values(states)) {
+          for (const f of s.files) writes.push(putBlob(f.id, f.file));
+        }
+        for (const e of triage) writes.push(putBlob(e.id, e.file));
+        await Promise.all(writes);
+
+        window.localStorage.setItem(
+          SNAPSHOT_STORAGE_KEY,
+          JSON.stringify(snap),
+        );
+      } catch {
+        // ignore; next save will retry
+      }
+    }, 500);
+    return () => window.clearTimeout(handle);
+  }, [hydrated, mode, quarterId, trackerFile, tenants, states, triage]);
+
+  // Hard reset: clear localStorage + IDB and reset every piece of state.
+  // Useful when the persisted snapshot is interfering with a fresh
+  // upload (or just to start over). Exposed via the Reset button at the
+  // top of the page.
+  async function resetAll() {
+    window.localStorage.removeItem(SNAPSHOT_STORAGE_KEY);
+    await clearStoredBlobs();
+    setMode("triage");
+    setTrackerFile(null);
+    setTenants([]);
+    setStates({});
+    setTriage([]);
+    setQuarterId("Q1_2026");
+    setPreviewing(null);
+    toast.success("Cleared.");
+  }
 
   const tenantsWithData = useMemo(
     () =>
@@ -452,6 +676,10 @@ export default function TenantCreditPage() {
   }
 
   function removeFile(row: number, fileId: string) {
+    // Drop the blob from IDB too so it doesn't linger as an orphan.
+    // Fire-and-forget: a failed delete just wastes a bit of disk;
+    // it doesn't break the UI.
+    void deleteBlob(fileId);
     setStates((prev) => {
       const cur = prev[row];
       if (!cur) return prev;
@@ -620,6 +848,7 @@ export default function TenantCreditPage() {
   }
 
   function removeTriageEntry(id: string) {
+    void deleteBlob(id);
     setTriage((cur) => cur.filter((e) => e.id !== id));
   }
 
@@ -684,21 +913,39 @@ export default function TenantCreditPage() {
         }));
         try {
           const extracts: ExtractResponse[] = [];
+          const fileFailures: string[] = [];
           for (const tf of entry.files) {
-            const form = new FormData();
-            form.append("file", tf.file);
-            form.append("tenant_id", entry.tenant.tenant_id);
-            const res = await fetch("/api/tenant-credit/extract", {
-              method: "POST",
-              body: form,
-            });
-            if (!res.ok) {
-              const detail = await res.json().catch(() => ({}));
-              throw new Error(
-                detail.error ?? `Extract failed for ${tf.name} (${res.status}).`,
-              );
+            try {
+              const form = new FormData();
+              form.append("file", tf.file);
+              form.append("tenant_id", entry.tenant.tenant_id);
+              const res = await fetch("/api/tenant-credit/extract", {
+                method: "POST",
+                body: form,
+              });
+              if (!res.ok) {
+                const detail = await res.json().catch(() => ({}));
+                throw new Error(
+                  detail.error ?? `Extract failed (${res.status}).`,
+                );
+              }
+              extracts.push((await res.json()) as ExtractResponse);
+            } catch (err) {
+              // One bad file shouldn't kill the rest of the tenant's
+              // run. Surface the per-file error as a toast so the
+              // analyst can fix it, then keep going. The tenant
+              // succeeds as long as at least one file extracted.
+              const msg = err instanceof Error ? err.message : "Extract failed.";
+              fileFailures.push(`${tf.name}: ${msg}`);
+              toast.error(`${entry.tenant.display_name} · ${tf.name}: ${msg}`);
             }
-            extracts.push((await res.json()) as ExtractResponse);
+          }
+          if (extracts.length === 0) {
+            throw new Error(
+              fileFailures.length > 0
+                ? `All ${entry.files.length} file(s) failed.`
+                : "No extracts produced.",
+            );
           }
 
           setStates((prev) => ({
@@ -866,7 +1113,12 @@ export default function TenantCreditPage() {
   return (
     <ConfigGate>
       <AppShell title="Tenant Credit Tracker">
-        <ModeToggle mode={mode} onChange={setMode} />
+        <div className="flex items-center justify-between gap-2">
+          <ModeToggle mode={mode} onChange={setMode} />
+          <Button size="sm" variant="outline" onClick={resetAll}>
+            Reset
+          </Button>
+        </div>
 
         <TrackerCard
           file={trackerFile}
@@ -1132,29 +1384,42 @@ function TenantCombobox(props: {
 
   return (
     <div className="relative">
-      <Input
-        value={query}
-        placeholder={selected?.display_name ?? props.placeholder ?? "Type to search"}
-        onChange={(e) => {
-          setQuery(e.target.value);
-          setOpen(true);
-        }}
-        onFocus={() => setOpen(true)}
-        // The 150 ms blur delay lets a mouse click on a suggestion
-        // register before the panel collapses.
-        onBlur={() => window.setTimeout(() => setOpen(false), 150)}
-        onKeyDown={(e) => {
-          if (e.key === "Tab" || e.key === "Enter") {
-            if (suggestions.length > 0) {
-              e.preventDefault();
-              pickTop();
+      <div className="flex gap-1">
+        <Input
+          value={query}
+          placeholder={selected?.display_name ?? props.placeholder ?? "Type to search"}
+          onChange={(e) => {
+            setQuery(e.target.value);
+            setOpen(true);
+          }}
+          onFocus={() => setOpen(true)}
+          // The 150 ms blur delay lets a mouse click on a suggestion
+          // register before the panel collapses.
+          onBlur={() => window.setTimeout(() => setOpen(false), 150)}
+          onKeyDown={(e) => {
+            if (e.key === "Tab" || e.key === "Enter") {
+              if (suggestions.length > 0) {
+                e.preventDefault();
+                pickTop();
+              }
+            } else if (e.key === "Escape") {
+              setQuery("");
+              setOpen(false);
             }
-          } else if (e.key === "Escape") {
-            setQuery("");
-            setOpen(false);
-          }
-        }}
-      />
+          }}
+        />
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          disabled={suggestions.length === 0}
+          onClick={pickTop}
+          title="Accept top suggestion"
+          className="shrink-0"
+        >
+          <Check className="h-4 w-4" />
+        </Button>
+      </div>
       {open && suggestions.length > 0 && (
         <div className="absolute left-0 right-0 top-full z-50 mt-1 max-h-72 overflow-auto rounded-md border bg-popover shadow-md">
           {suggestions.slice(0, 12).map((t, i) => (
