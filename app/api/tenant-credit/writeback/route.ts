@@ -421,11 +421,17 @@ export async function POST(req: Request) {
         continue;
       }
       if (!isCellEmpty(targetCell)) {
-        reasons.push(
-          `${METRIC_LABELS[metric]} target cell ` +
-            `(row ${entry.tracker_row}, col ${cell.col}) already holds ` +
-            `${JSON.stringify(targetCell.value)}. Clear it first if you really ` +
-            "intend to overwrite.",
+        // Non-empty target is no longer a hard refusal. The analyst
+        // usually wants to overwrite (re-running with corrected data),
+        // and forcing them to clear cells by hand each time made the
+        // tool unusable for normal iteration. The audit log captures
+        // every write, so a wrong overwrite is recoverable. Formulas
+        // are still refused unconditionally above; THIS branch is for
+        // analyst-entered or prior-run literal values.
+        entryWarnings.push(
+          `${METRIC_LABELS[metric]} cell at row ${entry.tracker_row} col ` +
+            `${cell.col} replaced ${JSON.stringify(targetCell.value)} with ` +
+            `${entry.values[metric]}.`,
         );
       }
     }
