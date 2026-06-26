@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { unzipSync } from "fflate";
 
@@ -151,6 +151,25 @@ type TriageEntry = {
   level: FileLevel;
 };
 
+// One row of write-back history. Mirrors the route's RunSummary; the
+// audit module on the server persists these to Firestore so reloads
+// don't lose them.
+type RunSummary = {
+  id: string;
+  tenant_id: string;
+  quarter: string;
+  source_entity: string;
+  source_period: string;
+  source_pdf_filename: string;
+  computed_sales: number;
+  computed_ebitda: number;
+  status: "writeback_success" | "writeback_failed";
+  error: string | null;
+  written_by: string;
+  written_filename: string;
+  created_at: number | null;
+};
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -295,6 +314,47 @@ export default function TenantCreditPage() {
   // Sheet at the page root so any file in any list can be viewed
   // without disturbing the rest of the layout.
   const [previewing, setPreviewing] = useState<TenantFile | null>(null);
+  // Persistent write-back history pulled from Firestore. Survives
+  // reloads because it isn't in-memory — every committed write-back
+  // lands in the audit log via /api/tenant-credit/writeback and the
+  // /runs endpoint reads it back.
+  const [history, setHistory] = useState<RunSummary[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+
+  const refreshHistory = useCallback(async () => {
+    setHistoryLoading(true);
+    try {
+      const res = await fetch("/api/tenant-credit/runs?limit=50");
+      if (!res.ok) return;
+      const data = (await res.json()) as { runs: RunSummary[] };
+      setHistory(data.runs);
+    } catch {
+      // Silent: the section is informational. A network blip
+      // shouldn't surface a toast.
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setHistoryLoading(true);
+      try {
+        const res = await fetch("/api/tenant-credit/runs?limit=50");
+        if (cancelled || !res.ok) return;
+        const data = (await res.json()) as { runs: RunSummary[] };
+        if (!cancelled) setHistory(data.runs);
+      } catch {
+        // ignore
+      } finally {
+        if (!cancelled) setHistoryLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const tenantsWithData = useMemo(
     () =>
@@ -782,6 +842,9 @@ export default function TenantCreditPage() {
       a.remove();
       URL.revokeObjectURL(url);
       toast.success(`Downloaded ${a.download}.`);
+      // Pull the freshly-written runs into the history table so the
+      // analyst sees them appear without a manual reload.
+      refreshHistory();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Writeback failed.");
     } finally {
@@ -861,6 +924,12 @@ export default function TenantCreditPage() {
             {readyCount > 0 && <ResultsTable rows={tenantsWithData} />}
           </>
         )}
+
+        <HistoryCard
+          runs={history}
+          loading={historyLoading}
+          onRefresh={refreshHistory}
+        />
 
         <FilePreviewSheet
           file={previewing}
@@ -1023,122 +1092,121 @@ function TriageCard(props: {
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
-          <div className="lg:col-span-2 overflow-x-auto">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>File</TableHead>
-                  <TableHead>Tenant</TableHead>
-                  <TableHead>Level</TableHead>
-                  <TableHead className="w-8" />
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {props.entries.map((e) => (
-                  <TableRow
-                    key={e.id}
-                    onClick={() => setPreviewId(e.id)}
-                    className={`cursor-pointer ${
-                      previewId === e.id ? "bg-accent/40" : ""
-                    }`}
-                  >
-                    <TableCell className="max-w-56">
-                      <span className="flex items-center gap-2">
-                        <Badge variant="outline" className="uppercase">
-                          {e.kind}
-                        </Badge>
-                        <span className="truncate font-mono text-xs">
-                          {e.name}
-                        </span>
+        <div className="overflow-x-auto">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>File</TableHead>
+                <TableHead>Tenant</TableHead>
+                <TableHead>Level</TableHead>
+                <TableHead className="w-8" />
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {props.entries.map((e) => (
+                <TableRow
+                  key={e.id}
+                  onClick={() => setPreviewId(e.id)}
+                  className={`cursor-pointer ${
+                    previewId === e.id ? "bg-accent/40" : ""
+                  }`}
+                >
+                  <TableCell className="max-w-56">
+                    <span className="flex items-center gap-2">
+                      <Badge variant="outline" className="uppercase">
+                        {e.kind}
+                      </Badge>
+                      <span className="truncate font-mono text-xs">
+                        {e.name}
                       </span>
-                    </TableCell>
-                    <TableCell
-                      onClick={(ev) => ev.stopPropagation()}
-                      className="min-w-56"
+                    </span>
+                  </TableCell>
+                  <TableCell
+                    onClick={(ev) => ev.stopPropagation()}
+                    className="min-w-56"
+                  >
+                    <Select
+                      value={e.assigned_tenant_id ?? ""}
+                      onValueChange={(v) =>
+                        props.onChange(e.id, { assigned_tenant_id: v })
+                      }
                     >
-                      <Select
-                        value={e.assigned_tenant_id ?? ""}
-                        onValueChange={(v) =>
-                          props.onChange(e.id, { assigned_tenant_id: v })
-                        }
-                      >
-                        <SelectTrigger className="w-full">
-                          <SelectValue placeholder="Pick tenant" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {props.tenants.map((t) => (
-                            <SelectItem key={t.row} value={t.tenant_id}>
-                              <span className="flex items-center gap-2">
-                                <span className="font-mono text-xs text-neutral-500">
-                                  row {t.row}
-                                </span>
-                                {t.display_name}
-                                {t.tenant_id === e.recommended_tenant_id && (
-                                  <Badge variant="secondary" className="ml-1">
-                                    suggested
-                                  </Badge>
-                                )}
+                      <SelectTrigger className="w-full">
+                        <SelectValue placeholder="Pick tenant" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {props.tenants.map((t) => (
+                          <SelectItem key={t.row} value={t.tenant_id}>
+                            <span className="flex items-center gap-2">
+                              <span className="font-mono text-xs text-neutral-500">
+                                row {t.row}
                               </span>
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </TableCell>
-                    <TableCell onClick={(ev) => ev.stopPropagation()}>
-                      <div className="flex gap-1">
-                        <Button
-                          size="sm"
-                          variant={e.level === "tenant" ? "default" : "outline"}
-                          onClick={() => props.onChange(e.id, { level: "tenant" })}
-                        >
-                          T
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant={e.level === "corporate" ? "default" : "outline"}
-                          onClick={() => props.onChange(e.id, { level: "corporate" })}
-                        >
-                          C
-                        </Button>
-                      </div>
-                    </TableCell>
-                    <TableCell onClick={(ev) => ev.stopPropagation()}>
-                      <button
-                        type="button"
-                        className="text-xs text-neutral-500 hover:text-red-600"
-                        onClick={() => props.onRemove(e.id)}
+                              {t.display_name}
+                              {t.tenant_id === e.recommended_tenant_id && (
+                                <Badge variant="secondary" className="ml-1">
+                                  suggested
+                                </Badge>
+                              )}
+                            </span>
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </TableCell>
+                  <TableCell onClick={(ev) => ev.stopPropagation()}>
+                    <div className="flex gap-1">
+                      <Button
+                        size="sm"
+                        variant={e.level === "tenant" ? "default" : "outline"}
+                        onClick={() => props.onChange(e.id, { level: "tenant" })}
                       >
-                        ×
-                      </button>
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </div>
-          <div className="rounded border bg-neutral-50 p-2">
-            <p className="mb-2 text-xs text-neutral-500">
-              Preview
-              {preview ? ` · ${preview.name}` : ""}
-            </p>
-            {preview && preview.kind === "pdf" ? (
-              <iframe
-                key={previewId}
-                src={previewUrl}
-                className="h-96 w-full rounded border bg-white"
-                title={preview.name}
-              />
-            ) : preview ? (
-              <p className="text-xs text-neutral-500">
-                {preview.name} ({formatBytes(preview.file.size)}). Excel
-                preview not rendered inline.
-              </p>
-            ) : (
-              <p className="text-xs text-neutral-500">Pick a row.</p>
-            )}
-          </div>
+                        T
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant={e.level === "corporate" ? "default" : "outline"}
+                        onClick={() => props.onChange(e.id, { level: "corporate" })}
+                      >
+                        C
+                      </Button>
+                    </div>
+                  </TableCell>
+                  <TableCell onClick={(ev) => ev.stopPropagation()}>
+                    <button
+                      type="button"
+                      className="text-xs text-neutral-500 hover:text-red-600"
+                      onClick={() => props.onRemove(e.id)}
+                    >
+                      ×
+                    </button>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
         </div>
+
+        <div className="rounded border bg-neutral-50 p-2">
+          <p className="mb-2 text-xs text-neutral-500">
+            Preview{preview ? ` · ${preview.name}` : ""}
+          </p>
+          {preview && preview.kind === "pdf" ? (
+            <iframe
+              key={previewId}
+              src={previewUrl}
+              className="h-[800px] w-full rounded border bg-white"
+              title={preview.name}
+            />
+          ) : preview ? (
+            <p className="text-xs text-neutral-500">
+              {preview.name} ({formatBytes(preview.file.size)}). Excel
+              preview not rendered inline.
+            </p>
+          ) : (
+            <p className="text-xs text-neutral-500">Pick a row above.</p>
+          )}
+        </div>
+
         <div className="flex justify-end">
           <Button onClick={props.onConfirm}>Confirm assignments</Button>
         </div>
@@ -1454,6 +1522,102 @@ function ResultsTable(props: { rows: TenantState[] }) {
           </TableBody>
         </Table>
       </CardContent>
+    </Card>
+  );
+}
+
+function HistoryCard(props: {
+  runs: RunSummary[];
+  loading: boolean;
+  onRefresh: () => void;
+}) {
+  // Collapsed by default so it doesn't dominate the first-paint
+  // layout; the analyst clicks to expand and see the past runs.
+  // The state itself isn't persisted (it's just a disclosure
+  // affordance), but the underlying runs are pulled from Firestore
+  // on every mount so a page reload doesn't lose them.
+  const [open, setOpen] = useState(false);
+  return (
+    <Card>
+      <CardHeader>
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          className="flex w-full items-center justify-between gap-2 text-left"
+        >
+          <div>
+            <CardTitle>History</CardTitle>
+            <CardDescription>
+              Every committed write-back. Persists across reloads.
+            </CardDescription>
+          </div>
+          <span className="font-mono text-xs text-neutral-500">
+            {open ? "hide" : `show (${props.runs.length})`}
+          </span>
+        </button>
+      </CardHeader>
+      {open && (
+        <CardContent className="space-y-3 overflow-x-auto">
+          <div className="flex justify-end">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={props.onRefresh}
+              disabled={props.loading}
+            >
+              {props.loading ? "Refreshing…" : "Refresh"}
+            </Button>
+          </div>
+          {props.runs.length === 0 ? (
+            <p className="rounded border border-dashed border-neutral-200 px-4 py-6 text-center text-xs text-neutral-500">
+              No runs yet.
+            </p>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>When</TableHead>
+                  <TableHead>Tenant</TableHead>
+                  <TableHead>Quarter</TableHead>
+                  <TableHead className="text-right">Sales</TableHead>
+                  <TableHead className="text-right">EBITDA</TableHead>
+                  <TableHead>Status</TableHead>
+                  <TableHead>By</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {props.runs.map((r) => (
+                  <TableRow key={r.id}>
+                    <TableCell className="font-mono text-xs">
+                      {r.created_at != null
+                        ? new Date(r.created_at).toLocaleString()
+                        : "—"}
+                    </TableCell>
+                    <TableCell>{r.source_entity || r.tenant_id}</TableCell>
+                    <TableCell>{r.quarter}</TableCell>
+                    <TableCell className="text-right font-mono tabular-nums">
+                      {r.computed_sales.toLocaleString()}
+                    </TableCell>
+                    <TableCell className="text-right font-mono tabular-nums">
+                      {r.computed_ebitda.toLocaleString()}
+                    </TableCell>
+                    <TableCell>
+                      {r.status === "writeback_success" ? (
+                        <Badge variant="secondary">OK</Badge>
+                      ) : (
+                        <Badge variant="destructive">Failed</Badge>
+                      )}
+                    </TableCell>
+                    <TableCell className="text-xs text-neutral-600">
+                      {r.written_by}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        </CardContent>
+      )}
     </Card>
   );
 }
