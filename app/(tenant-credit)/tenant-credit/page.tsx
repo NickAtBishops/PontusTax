@@ -3,7 +3,7 @@
 import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { unzipSync } from "fflate";
-import { X } from "lucide-react";
+import { Check, X } from "lucide-react";
 
 import {
   clearAll as clearStoredBlobs,
@@ -852,6 +852,44 @@ export default function TenantCreditPage() {
     setTriage((cur) => cur.filter((e) => e.id !== id));
   }
 
+  // Accept a single triage row: move its file onto the chosen tenant,
+  // then pop the row off the triage queue. Called by TenantCombobox's
+  // green check (and by clicking a suggestion) so the analyst gets
+  // one-click commits instead of doing the bulk "Confirm assignments"
+  // step.
+  function acceptOneTriage(entryId: string, tenantId: string) {
+    const entry = triage.find((e) => e.id === entryId);
+    if (!entry) return;
+    const tenant = tenants.find((t) => t.tenant_id === tenantId);
+    if (!tenant) {
+      toast.error("Unknown tenant.");
+      return;
+    }
+    setStates((prev) => {
+      if (!prev[tenant.row]) return prev;
+      const tf: TenantFile = {
+        id: randomId(),
+        file: entry.file,
+        name: entry.name,
+        kind: entry.kind,
+        level: entry.level,
+      };
+      return {
+        ...prev,
+        [tenant.row]: {
+          ...prev[tenant.row],
+          files: [...prev[tenant.row].files, tf],
+          status: "loaded",
+          extracts: [],
+          compute: null,
+          error: null,
+        },
+      };
+    });
+    setTriage((cur) => cur.filter((e) => e.id !== entryId));
+    toast.success(`→ ${tenant.display_name}`);
+  }
+
   function confirmTriage() {
     // Commit every triage row that has an assigned tenant; leave the
     // un-assigned rows behind for the analyst to deal with.
@@ -1145,6 +1183,7 @@ export default function TenantCreditPage() {
                 onChange={updateTriageEntry}
                 onRemove={removeTriageEntry}
                 onConfirm={confirmTriage}
+                onAcceptOne={acceptOneTriage}
               />
             )}
 
@@ -1324,111 +1363,161 @@ function QuarterAndZipCard(props: {
   );
 }
 
-// Click-driven tenant picker. The button shows the current pick (or a
-// placeholder). Clicking opens the full numbered list of tenants;
-// click any row to pick it. Keyboard shortcut: with the trigger
-// focused, type digits to pick the Nth tenant. Enter commits the
-// number, Backspace edits it, Escape clears.
-function TenantPicker(props: {
+// Typeahead-style tenant picker. The analyst types part of the
+// tenant's name; matching tenants narrow down by score. Tab/Enter
+// PREVIEWS the top match by setting the input value. The green check
+// button (or an explicit click on a suggestion) ACCEPTS, calling
+// onAccept when provided so the parent can commit the assignment and
+// remove the row from the triage queue in one motion.
+function TenantCombobox(props: {
   value: string;
   onChange: (tenantId: string) => void;
+  // Optional commit-and-remove callback. When set, the green check
+  // button and suggestion clicks fire onAccept instead of onChange,
+  // and the parent is expected to (a) record the assignment and (b)
+  // remove the triage row. Tab/Enter still only previews so a typo
+  // doesn't permanently move a file.
+  onAccept?: (tenantId: string) => void;
   tenants: TenantPickerEntry[];
+  recommendedId: string | null;
+  placeholder?: string;
 }) {
+  const [query, setQuery] = useState(() => {
+    const t = props.tenants.find((tt) => tt.tenant_id === props.value);
+    return t?.display_name ?? "";
+  });
   const [open, setOpen] = useState(false);
-  const [digits, setDigits] = useState("");
+
+  const suggestions = useMemo(() => {
+    if (!query.trim()) {
+      const rec = props.tenants.find(
+        (t) => t.tenant_id === props.recommendedId,
+      );
+      const others = props.tenants.filter(
+        (t) => t.tenant_id !== props.recommendedId,
+      );
+      return rec ? [rec, ...others] : others;
+    }
+    const q = normalize(query);
+    return props.tenants
+      .map((t) => {
+        const name = normalize(t.display_name);
+        let score = 0;
+        if (name.startsWith(q)) score = 1000 + (props.recommendedId === t.tenant_id ? 1 : 0);
+        else if (name.includes(q)) score = 500 + (props.recommendedId === t.tenant_id ? 1 : 0);
+        else {
+          for (const token of q.split(/\s+/)) {
+            if (token.length >= 3 && name.includes(token)) score += 100;
+          }
+        }
+        return { tenant: t, score };
+      })
+      .filter((x) => x.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .map((x) => x.tenant);
+  }, [query, props.tenants, props.recommendedId]);
+
   const selected = props.tenants.find((t) => t.tenant_id === props.value);
 
-  const targetIndex =
-    digits.length > 0 && /^\d+$/.test(digits)
-      ? Number(digits) - 1
-      : null;
-  const targetValid =
-    targetIndex !== null &&
-    targetIndex >= 0 &&
-    targetIndex < props.tenants.length;
-  const target = targetValid ? props.tenants[targetIndex!] : null;
-
-  function commit(t: TenantPickerEntry | null) {
-    if (!t) return;
-    props.onChange(t.tenant_id);
+  // Tab/Enter behavior: set the value to the top suggestion but DON'T
+  // commit. Lets the analyst correct a typo before locking it in.
+  function previewTop() {
+    const top = suggestions[0];
+    if (!top) {
+      toast.error("No matching tenant. Type more or pick from the list.");
+      return;
+    }
+    props.onChange(top.tenant_id);
+    setQuery(top.display_name);
     setOpen(false);
-    setDigits("");
+  }
+
+  // Green check button / suggestion click behavior: commit. When the
+  // parent supplies onAccept, that handler moves the file to its
+  // tenant and pops the row off the triage queue.
+  function acceptTop() {
+    const top = suggestions[0];
+    if (!top) {
+      toast.error("No matching tenant. Type more or pick from the list.");
+      return;
+    }
+    if (props.onAccept) {
+      props.onAccept(top.tenant_id);
+    } else {
+      props.onChange(top.tenant_id);
+      setQuery(top.display_name);
+    }
+    setOpen(false);
   }
 
   return (
     <div className="relative">
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") {
-            if (target) {
-              e.preventDefault();
-              commit(target);
-            }
-          } else if (/^\d$/.test(e.key)) {
-            e.preventDefault();
-            setDigits((d) => d + e.key);
+      <div className="flex gap-1">
+        <Input
+          value={query}
+          placeholder={props.placeholder ?? "Type to search"}
+          className={selected ? "border-emerald-500 focus-visible:ring-emerald-500/30" : ""}
+          onChange={(e) => {
+            setQuery(e.target.value);
             setOpen(true);
-          } else if (e.key === "Backspace" && digits.length > 0) {
-            e.preventDefault();
-            setDigits((d) => d.slice(0, -1));
-          } else if (e.key === "Escape") {
-            e.preventDefault();
-            setOpen(false);
-            setDigits("");
-          }
-        }}
-        className={`flex w-full items-center justify-between gap-2 rounded-md border bg-background px-3 py-2 text-left text-sm focus:outline-none focus:ring-2 focus:ring-ring/30 ${
-          selected
-            ? "border-emerald-500"
-            : "border-input"
-        }`}
-      >
-        <span className="truncate">
-          {digits.length > 0
-            ? `#${digits}${target ? ` · ${target.display_name}` : " · (none)"}`
-            : selected
-              ? selected.display_name
-              : "Pick tenant"}
-        </span>
-        <span className="font-mono text-xs text-neutral-400">▾</span>
-      </button>
-
-      {open && (
-        <div className="absolute left-0 right-0 top-full z-50 mt-1 max-h-96 overflow-auto rounded-md border bg-popover shadow-md">
-          {digits.length > 0 && (
-            <div className="border-b bg-neutral-50 px-3 py-1.5 text-xs text-neutral-600">
-              Type more digits, Enter picks #{digits}. Backspace edits.
-            </div>
-          )}
-          {props.tenants.map((t, i) => {
-            const isSelected = t.tenant_id === props.value;
-            const isTarget = i === targetIndex;
-            return (
-              <button
-                key={t.tenant_id}
-                type="button"
-                onMouseDown={(ev) => {
-                  // mousedown so the pick fires before the trigger's
-                  // blur collapses the panel.
-                  ev.preventDefault();
-                  commit(t);
-                }}
-                className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-accent ${
-                  isTarget ? "bg-blue-50" : isSelected ? "bg-accent/40" : ""
-                }`}
-              >
-                <span className="w-8 shrink-0 font-mono text-xs text-neutral-500">
-                  {i + 1}.
+          }}
+          onFocus={() => setOpen(true)}
+          onBlur={() => window.setTimeout(() => setOpen(false), 150)}
+          onKeyDown={(e) => {
+            if (e.key === "Tab" || e.key === "Enter") {
+              if (suggestions.length > 0) {
+                e.preventDefault();
+                previewTop();
+              }
+            } else if (e.key === "Escape") {
+              setQuery(selected?.display_name ?? "");
+              setOpen(false);
+            }
+          }}
+        />
+        <Button
+          type="button"
+          size="sm"
+          variant={selected ? "secondary" : "outline"}
+          onClick={acceptTop}
+          title={props.onAccept ? "Accept and remove from list" : "Accept"}
+          className="shrink-0"
+        >
+          <Check className="h-4 w-4" />
+        </Button>
+      </div>
+      {open && suggestions.length > 0 && (
+        <div className="absolute left-0 right-0 top-full z-50 mt-1 max-h-72 overflow-auto rounded-md border bg-popover shadow-md">
+          {suggestions.slice(0, 12).map((t, i) => (
+            <button
+              key={t.tenant_id}
+              type="button"
+              className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-accent ${
+                i === 0 ? "bg-accent/30" : ""
+              }`}
+              onMouseDown={(e) => {
+                e.preventDefault();
+                if (props.onAccept) {
+                  props.onAccept(t.tenant_id);
+                } else {
+                  props.onChange(t.tenant_id);
+                  setQuery(t.display_name);
+                }
+                setOpen(false);
+              }}
+            >
+              <span className="font-mono text-xs text-neutral-500">row {t.row}</span>
+              <span className="flex-1 truncate">{t.display_name}</span>
+              {t.tenant_id === props.recommendedId && (
+                <Badge variant="secondary">suggested</Badge>
+              )}
+              {i === 0 && (
+                <span className="ml-1 rounded border px-1 text-[10px] uppercase text-neutral-500">
+                  tab
                 </span>
-                <span className="flex-1 truncate">{t.display_name}</span>
-                <span className="font-mono text-xs text-neutral-400">
-                  row {t.row}
-                </span>
-              </button>
-            );
-          })}
+              )}
+            </button>
+          ))}
         </div>
       )}
     </div>
@@ -1441,6 +1530,7 @@ function TriageCard(props: {
   onChange: (id: string, patch: Partial<TriageEntry>) => void;
   onRemove: (id: string) => void;
   onConfirm: () => void;
+  onAcceptOne: (entryId: string, tenantId: string) => void;
 }) {
   // The row whose preview is currently expanded. Only one expands
   // at a time so we don't load every PDF simultaneously; clicking
@@ -1459,9 +1549,9 @@ function TriageCard(props: {
       <CardHeader>
         <CardTitle>Triage</CardTitle>
         <CardDescription>
-          Confirm each file&rsquo;s tenant and tag. Click a row to preview
-          it underneath. Click the tenant button to pick from the list,
-          or type a number (e.g. 6) and press Enter.
+          Type the tenant name, press Tab to preview the top match,
+          then click the green check to accept. The row leaves the
+          list the moment you accept it.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -1498,12 +1588,17 @@ function TriageCard(props: {
                       onClick={(ev) => ev.stopPropagation()}
                       className="min-w-72"
                     >
-                      <TenantPicker
+                      <TenantCombobox
                         value={e.assigned_tenant_id ?? ""}
                         onChange={(v) =>
                           props.onChange(e.id, { assigned_tenant_id: v })
                         }
+                        onAccept={(tenantId) =>
+                          props.onAcceptOne(e.id, tenantId)
+                        }
                         tenants={props.tenants}
+                        recommendedId={e.recommended_tenant_id}
+                        placeholder="Type to search"
                       />
                     </TableCell>
                     <TableCell onClick={(ev) => ev.stopPropagation()}>
