@@ -24,8 +24,55 @@
 
 import { NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
+import ExcelJS from "exceljs";
 
-import { extractFromPdf } from "@/lib/tenant-credit/extraction";
+import {
+  extractFromPdf,
+  extractFromXlsxText,
+} from "@/lib/tenant-credit/extraction";
+
+const XLSX_MIME =
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+// Flatten a workbook to a tab-separated text dump grouped by sheet.
+// Anthropic's document content block accepts PDFs only; xlsx files go
+// through this path and reach Claude as plain text. ExcelJS is already
+// in the bundle (used by the writeback route) so no extra cost.
+async function xlsxToText(file: File): Promise<string> {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(await file.arrayBuffer());
+  const out: string[] = [];
+  for (const sheet of wb.worksheets) {
+    out.push(`=== Sheet: ${sheet.name} ===`);
+    sheet.eachRow((row) => {
+      const values = row.values as unknown[];
+      // ExcelJS prepends a null at index 0 so column 1 is at index 1.
+      const cells = values.slice(1).map(cellAsText).filter((s) => s !== "");
+      if (cells.length > 0) out.push(cells.join("\t"));
+    });
+    out.push("");
+  }
+  return out.join("\n");
+}
+
+function cellAsText(v: unknown): string {
+  if (v == null) return "";
+  if (typeof v === "string") return v.trim();
+  if (typeof v === "number") return String(v);
+  if (v instanceof Date) return v.toISOString().slice(0, 10);
+  if (typeof v === "object") {
+    const o = v as Record<string, unknown>;
+    if ("richText" in o && Array.isArray(o.richText)) {
+      return (o.richText as { text?: string }[])
+        .map((r) => r.text ?? "")
+        .join("")
+        .trim();
+    }
+    if ("result" in o) return cellAsText(o.result);
+    if ("text" in o && typeof o.text === "string") return o.text.trim();
+  }
+  return "";
+}
 
 // Anthropic's inline document content block accepts PDFs up to ~32 MB
 // before requiring the Files API. Reject larger uploads at the door
@@ -37,7 +84,7 @@ const MAX_PDF_BYTES = 32 * 1024 * 1024;
 // get killed at the default 10s on Hobby plan. Income-statement
 // extraction with high-effort thinking typically takes 15-30s.
 export const runtime = "nodejs";
-export const maxDuration = 60;
+export const maxDuration = 90;
 
 export async function POST(req: Request) {
   // Parse the multipart upload. If the Content-Type isn't multipart,
@@ -91,57 +138,79 @@ export async function POST(req: Request) {
     return NextResponse.json(
       {
         error:
-          `PDF is ${file.size} bytes; max accepted is ${MAX_PDF_BYTES}. ` +
-          "For larger files, switch to the Files API in Phase 5.",
+          `File is ${file.size} bytes; max accepted is ${MAX_PDF_BYTES}.`,
       },
       { status: 413 },
     );
   }
-  // file.type is best-effort (the browser sets it). Allow both the
-  // standard MIME and the empty string (some clients omit it), reject
-  // anything that clearly isn't a PDF.
-  if (file.type && file.type !== "application/pdf") {
-    return NextResponse.json(
-      {
-        error: `Expected application/pdf upload; got ${file.type}.`,
-      },
-      { status: 400 },
-    );
-  }
 
-  // Read the bytes and base64-encode for the Anthropic document block.
-  const arrayBuffer = await file.arrayBuffer();
-  // Magic-byte check: a real PDF starts with "%PDF" (0x25 0x50 0x44 0x46).
-  // Without this, encrypted PDFs, scanned-image-only PDFs, macOS resource
-  // forks, and plain non-PDFs with a .pdf extension all get forwarded to
-  // Anthropic, which 400s with "The PDF specified was not valid." The
-  // analyst then sees a cryptic 502 from our route. Fail fast here
-  // instead with the actual reason.
-  const head = new Uint8Array(arrayBuffer.slice(0, 4));
-  if (
-    head[0] !== 0x25 ||
-    head[1] !== 0x50 ||
-    head[2] !== 0x44 ||
-    head[3] !== 0x46
-  ) {
+  // Decide the extraction path. PDFs go to Claude as a document block;
+  // xlsx files get flattened to text first because Anthropic's document
+  // block doesn't accept spreadsheets. Anything else is rejected here.
+  const lowerName = file.name.toLowerCase();
+  const isPdf =
+    file.type === "application/pdf" || lowerName.endsWith(".pdf");
+  const isXlsx =
+    file.type === XLSX_MIME || lowerName.endsWith(".xlsx");
+  if (!isPdf && !isXlsx) {
     return NextResponse.json(
       {
         error:
-          `${file.name} does not start with the "%PDF" header, so it isn't ` +
-          "a PDF Anthropic can read. Common causes: the file was renamed to " +
-          ".pdf from another format; the PDF is password-protected; the zip " +
-          "you uploaded contained macOS resource-fork files (the hidden " +
-          "._filename.pdf or __MACOSX/* entries). Try re-exporting the PDF " +
-          "from the source application, or upload one PDF at a time.",
+          `Unsupported file type for ${file.name}. Upload .pdf or .xlsx; ` +
+          `got mime "${file.type || "(none)"}".`,
       },
       { status: 400 },
     );
   }
-  const pdfBase64 = Buffer.from(arrayBuffer).toString("base64");
 
   let raw;
   try {
-    raw = await extractFromPdf(pdfBase64);
+    if (isPdf) {
+      const arrayBuffer = await file.arrayBuffer();
+      // Magic-byte check: a real PDF starts with "%PDF". Without this,
+      // encrypted PDFs, scanned-image-only PDFs, macOS resource forks,
+      // and plain non-PDFs with a .pdf extension all get forwarded to
+      // Anthropic, which 400s with a cryptic "PDF specified was not
+      // valid." Fail fast here with the actual reason.
+      const head = new Uint8Array(arrayBuffer.slice(0, 4));
+      if (
+        head[0] !== 0x25 ||
+        head[1] !== 0x50 ||
+        head[2] !== 0x44 ||
+        head[3] !== 0x46
+      ) {
+        return NextResponse.json(
+          {
+            error:
+              `${file.name} does not start with the "%PDF" header. The ` +
+              "file may be password-protected, scanned-image-only, or " +
+              "renamed from another format.",
+          },
+          { status: 400 },
+        );
+      }
+      raw = await extractFromPdf(Buffer.from(arrayBuffer).toString("base64"));
+    } else {
+      // xlsx path: ExcelJS reads cell values, we hand the flattened
+      // text to Claude with the same schema and system prompt.
+      let xlsxText: string;
+      try {
+        xlsxText = await xlsxToText(file);
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        return NextResponse.json(
+          { error: `Could not parse ${file.name} as .xlsx: ${detail}` },
+          { status: 400 },
+        );
+      }
+      if (xlsxText.trim() === "") {
+        return NextResponse.json(
+          { error: `${file.name} has no readable cells.` },
+          { status: 400 },
+        );
+      }
+      raw = await extractFromXlsxText(xlsxText);
+    }
   } catch (err) {
     // Map Anthropic errors to specific status codes so the analyst sees
     // a useful message instead of a generic 500. Use typed exceptions

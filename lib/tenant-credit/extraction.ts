@@ -131,9 +131,9 @@ function isRawExtractionResult(x: unknown): x is RawExtractionResult {
   return true;
 }
 
-// The main entry point. `pdfBase64` is the raw PDF bytes encoded as
-// base64 (no data URL prefix). The route layer is responsible for
-// reading the upload and converting to base64.
+// Shared Claude call. Takes the user-content blocks (either a PDF
+// document block or a plain-text block built from an xlsx) and returns
+// the structured extraction result.
 //
 // Throws on:
 //   - Missing ANTHROPIC_API_KEY (caught at SDK init time)
@@ -141,13 +141,15 @@ function isRawExtractionResult(x: unknown): x is RawExtractionResult {
 //     as the SDK's typed exceptions; the route maps them to 5xx.
 //   - Malformed Anthropic response (validator failure). Should never
 //     happen with structured outputs, but we don't trust silently.
-export async function extractFromPdf(
-  pdfBase64: string,
+async function runExtraction(
+  userContent: Anthropic.Messages.ContentBlockParam[],
 ): Promise<RawExtractionResult> {
-  // 25s timeout per call, no internal retries. The route layer sets
-  // maxDuration=60 so we leave ~30s headroom for network + JSON parse.
-  // The SDK's default retry would burn that budget on a hung request.
-  const client = new Anthropic({ timeout: 25_000, maxRetries: 1 });
+  // 50s timeout per call. High-effort thinking on a dense quarterly
+  // statement regularly takes 20-40s; the previous 25s budget aborted
+  // those calls and surfaced as "Client disconnected" 499s in the
+  // Anthropic logs. The route layer maxDuration is 90s so we still
+  // leave headroom for parsing + audit + the response stream back.
+  const client = new Anthropic({ timeout: 50_000, maxRetries: 1 });
 
   const response = await client.messages.create({
     model: "claude-opus-4-8",
@@ -161,27 +163,9 @@ export async function extractFromPdf(
       },
     },
     system: SYSTEM_PROMPT,
-    messages: [
-      {
-        role: "user",
-        content: [
-          {
-            type: "document",
-            source: {
-              type: "base64",
-              media_type: "application/pdf",
-              data: pdfBase64,
-            },
-          },
-          { type: "text", text: USER_INSTRUCTION },
-        ],
-      },
-    ],
+    messages: [{ role: "user", content: userContent }],
   });
 
-  // The structured-outputs response is a single text block whose body
-  // is the JSON-encoded result. Find it explicitly because the API
-  // may also return thinking blocks (which we don't surface here).
   const textBlock = response.content.find(
     (b): b is Extract<typeof b, { type: "text" }> => b.type === "text",
   );
@@ -202,13 +186,51 @@ export async function extractFromPdf(
         `First 200 chars: ${textBlock.text.slice(0, 200)}`,
     );
   }
-
   if (!isRawExtractionResult(parsed)) {
     throw new Error(
       `Anthropic extraction response did not match expected schema. ` +
         `Got: ${textBlock.text.slice(0, 200)}`,
     );
   }
-
   return parsed;
+}
+
+export async function extractFromPdf(
+  pdfBase64: string,
+): Promise<RawExtractionResult> {
+  return runExtraction([
+    {
+      type: "document",
+      source: {
+        type: "base64",
+        media_type: "application/pdf",
+        data: pdfBase64,
+      },
+    },
+    { type: "text", text: USER_INSTRUCTION },
+  ]);
+}
+
+// Excel entry point. The route layer reads the xlsx with exceljs,
+// flattens every sheet into a tab-separated text dump, and hands it
+// here. Anthropic's document content block doesn't accept xlsx
+// directly (PDF + images only), so we feed it as plain text. Claude
+// reads spreadsheet dumps reliably for the line-item extraction task;
+// the SYSTEM_PROMPT and schema are identical to the PDF path.
+export async function extractFromXlsxText(
+  xlsxText: string,
+): Promise<RawExtractionResult> {
+  return runExtraction([
+    {
+      type: "text",
+      text:
+        "The following is a flattened text dump of the analyst's " +
+        "uploaded .xlsx workbook. Each sheet is delimited by a " +
+        "'=== Sheet: <name> ===' header. Rows within a sheet are " +
+        "tab-separated. Apply the same rules as for a PDF income " +
+        "statement.\n\n" +
+        xlsxText,
+    },
+    { type: "text", text: USER_INSTRUCTION },
+  ]);
 }
