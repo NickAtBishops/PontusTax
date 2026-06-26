@@ -24,6 +24,13 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
+import {
   Table,
   TableBody,
   TableCell,
@@ -284,6 +291,10 @@ export default function TenantCreditPage() {
   const [triage, setTriage] = useState<TriageEntry[]>([]);
   const [running, setRunning] = useState(false);
   const [writing, setWriting] = useState(false);
+  // A file the analyst clicked to preview. Renders in a slide-out
+  // Sheet at the page root so any file in any list can be viewed
+  // without disturbing the rest of the layout.
+  const [previewing, setPreviewing] = useState<TenantFile | null>(null);
 
   const tenantsWithData = useMemo(
     () =>
@@ -834,6 +845,7 @@ export default function TenantCreditPage() {
               onAddFile={addFileToTenant}
               onRemoveFile={removeFile}
               onToggleLevel={toggleFileLevel}
+              onPreviewFile={setPreviewing}
             />
 
             <ActionsCard
@@ -849,6 +861,11 @@ export default function TenantCreditPage() {
             {readyCount > 0 && <ResultsTable rows={tenantsWithData} />}
           </>
         )}
+
+        <FilePreviewSheet
+          file={previewing}
+          onClose={() => setPreviewing(null)}
+        />
       </AppShell>
     </ConfigGate>
   );
@@ -1194,6 +1211,7 @@ function TenantGrid(props: {
   onAddFile: (row: number, file: File, level?: FileLevel) => void;
   onRemoveFile: (row: number, fileId: string) => void;
   onToggleLevel: (row: number, fileId: string) => void;
+  onPreviewFile: (file: TenantFile) => void;
 }) {
   return (
     <Card>
@@ -1210,6 +1228,7 @@ function TenantGrid(props: {
               onAddFile={props.onAddFile}
               onRemoveFile={props.onRemoveFile}
               onToggleLevel={props.onToggleLevel}
+              onPreviewFile={props.onPreviewFile}
             />
           ))}
         </div>
@@ -1224,6 +1243,7 @@ function TenantCard(props: {
   onAddFile: (row: number, file: File, level?: FileLevel) => void;
   onRemoveFile: (row: number, fileId: string) => void;
   onToggleLevel: (row: number, fileId: string) => void;
+  onPreviewFile: (file: TenantFile) => void;
 }) {
   const { state } = props;
   const [dragOver, setDragOver] = useState(false);
@@ -1281,14 +1301,19 @@ function TenantCard(props: {
           {state.files.map((f) => (
             <li
               key={f.id}
-              className="flex items-center justify-between gap-2 rounded border bg-neutral-50 px-2.5 py-1.5"
+              className="flex items-center justify-between gap-2 rounded border bg-neutral-50 px-2.5 py-1.5 transition-colors hover:border-primary hover:bg-blue-50"
             >
-              <span className="flex min-w-0 items-center gap-2">
+              <button
+                type="button"
+                className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                onClick={() => props.onPreviewFile(f)}
+                title="Click to preview"
+              >
                 <Badge variant="outline" className="uppercase">
                   {f.kind}
                 </Badge>
                 <span className="truncate text-xs text-neutral-700">{f.name}</span>
-              </span>
+              </button>
               <span className="flex shrink-0 items-center gap-1.5">
                 <button
                   type="button"
@@ -1430,6 +1455,68 @@ function ResultsTable(props: { rows: TenantState[] }) {
         </Table>
       </CardContent>
     </Card>
+  );
+}
+
+function FilePreviewSheet(props: {
+  file: TenantFile | null;
+  onClose: () => void;
+}) {
+  // useMemo recomputes the blob URL only when the underlying File
+  // changes; without it, every parent re-render would create a new
+  // URL and the iframe would flicker. The previous URL is released
+  // by the browser's blob registry when the component unmounts or
+  // the URL value is replaced.
+  const url = useMemo(
+    () => (props.file ? URL.createObjectURL(props.file.file) : ""),
+    [props.file],
+  );
+  const open = props.file !== null;
+  return (
+    <Sheet open={open} onOpenChange={(v) => !v && props.onClose()}>
+      <SheetContent className="w-full sm:max-w-2xl">
+        {props.file && (
+          <>
+            <SheetHeader>
+              <SheetTitle className="flex items-center gap-2">
+                <Badge variant="outline" className="uppercase">
+                  {props.file.kind}
+                </Badge>
+                <span className="truncate">{props.file.name}</span>
+              </SheetTitle>
+              <SheetDescription>
+                {formatBytes(props.file.file.size)} ·{" "}
+                {props.file.level === "corporate"
+                  ? "Corporate level"
+                  : "Tenant level"}
+              </SheetDescription>
+            </SheetHeader>
+            <div className="h-[calc(100vh-7rem)] px-4 pb-4">
+              {props.file.kind === "pdf" ? (
+                <iframe
+                  src={url}
+                  className="h-full w-full rounded border bg-white"
+                  title={props.file.name}
+                />
+              ) : (
+                <div className="flex h-full flex-col items-center justify-center gap-3 rounded border bg-neutral-50 text-center">
+                  <p className="text-sm text-neutral-600">
+                    Excel preview not rendered in the browser.
+                  </p>
+                  <a
+                    href={url}
+                    download={props.file.name}
+                    className="text-sm text-primary hover:underline"
+                  >
+                    Download to open in Excel
+                  </a>
+                </div>
+              )}
+            </div>
+          </>
+        )}
+      </SheetContent>
+    </Sheet>
   );
 }
 
