@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from ..config import Config
@@ -104,6 +105,44 @@ You MUST respond with ONLY a JSON object, no prose before or after it, even when
 """
 
 
+def _extract_json_object(raw: str) -> Any | None:
+    """Best-effort JSON extraction for a model reply that the system
+    prompt demands be JSON-only, but that occasionally arrives with a
+    sentence of reasoning prose before the object — observed live both
+    bare ("The page shows... {"action": "wait", ...}") and fenced
+    mid-string ("...I'll click it.\n```json\n{...}\n```"). The old
+    logic only stripped a fence when the WHOLE reply started with
+    backticks, so prose-then-fence replies fell straight through to
+    give_up even though the model's actual decision was valid JSON.
+    Tries, in order: the whole string as-is, a fenced code block
+    anywhere in the string, then the last top-level {...} substring —
+    every observed non-JSON reply had its JSON object at the very end.
+    Returns None if nothing parses.
+    """
+    raw = raw.strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
+    if fence_match:
+        try:
+            return json.loads(fence_match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    start = raw.rfind("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(raw[start:end + 1])
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
 class GenericNavigator:
     """Vendor-agnostic fallback: an LLM decides what to click instead
     of a hand-written recipe. Used by the router (recipes/__init__.py
@@ -142,6 +181,18 @@ class GenericNavigator:
         async with browser.page(
             domain, url=url, goto_kwargs={"wait_until": "domcontentloaded"}
         ) as page:
+            # Some portals open the account/search-results page in a NEW
+            # tab (target="_blank" links — observed live on Pinellas's
+            # "View an Account" link). Without this, a click on such a
+            # link leaves `page` pointing at the same, unchanged DOM, so
+            # every subsequent snapshot looks identical and the model
+            # just re-clicks the same link step after step until the
+            # loop runs out. `page.context` is the same BrowserContext
+            # for the life of this fetch even after `page` itself is
+            # reassigned below, so one registration here catches every
+            # new tab opened from any page we switch to.
+            new_pages: list[Any] = []
+            page.context.on("page", new_pages.append)
             for step in range(_MAX_STEPS):
                 # Bot-challenge check BEFORE asking the model to look at
                 # the page — no point spending a call on a page we
@@ -218,6 +269,13 @@ class GenericNavigator:
                         raise RecipeError(
                             f"generic navigator: model returned unknown action {action!r}"
                         )
+                    if new_pages:
+                        page = new_pages.pop()
+                        new_pages.clear()
+                        log.info(
+                            "generic navigator: click opened a new tab — "
+                            "switching to it"
+                        )
                     await page.wait_for_load_state("domcontentloaded", timeout=15_000)
                     await page.wait_for_timeout(1500)  # let any async content start
                 except RecipeError:
@@ -264,14 +322,8 @@ class GenericNavigator:
             if getattr(b, "type", None) == "text"
         ]
         raw = "".join(text_parts).strip()
-        if raw.startswith("```"):
-            raw = raw.strip("`")
-            if raw.lower().startswith("json"):
-                raw = raw[4:].lstrip()
-            raw = raw.rsplit("```", 1)[0].strip()
-        try:
-            out = json.loads(raw)
-        except json.JSONDecodeError:
+        out = _extract_json_object(raw)
+        if out is None:
             log.warning("generic navigator: model returned non-JSON: %r", raw[:300])
             return {"action": "give_up", "reason": f"model returned non-JSON: {raw[:200]}"}
         if not isinstance(out, dict):

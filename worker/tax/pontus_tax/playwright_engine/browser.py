@@ -216,6 +216,37 @@ class Browser:
         message = str(exc).lower()
         return any(sig in message for sig in cls._PROXY_FAILURE_SIGNATURES)
 
+    async def _retry_direct(
+        self,
+        old_context: Any,
+        ua: str,
+        url: str,
+        goto_kwargs: dict[str, Any] | None,
+        domain: str,
+    ) -> tuple[Any, Any]:
+        """Close the failed proxied context and redo the same navigation
+        with no proxy at all. Shared by both retry triggers below (a
+        goto() exception, or a goto() that "succeeded" with a 4xx/5xx
+        status) since the recovery is identical either way.
+
+        If this SECOND attempt also fails, the new context must be
+        closed here before re-raising — the caller's `context` local
+        only gets reassigned on a successful `return`, so a failure
+        left uncaught here would leak this context past the caller's
+        own cleanup, which still only knows about the FIRST context.
+        """
+        await old_context.close()
+        context = await self._new_context(ua, use_proxy=False)
+        pg = await context.new_page()
+        pg.set_default_timeout(45_000)
+        try:
+            await pg.goto(url, **(goto_kwargs or {}))
+        except Exception:  # noqa: BLE001
+            await context.close()
+            raise
+        log.info("playwright: direct-egress retry for domain=%s succeeded", domain)
+        return context, pg
+
     # -- context construction ----------------------------------------------
 
     async def _new_context(self, ua: str, *, use_proxy: bool) -> Any:
@@ -271,14 +302,16 @@ class Browser:
         the FIRST navigation itself, instead of the caller doing
         `await page.goto(...)` right after opening the context. That is
         what makes the direct-egress fallback below possible: a Bright
-        Data proxy-tunnel failure (see `_is_proxy_connection_failure`)
-        on the very first request to a domain will fail the exact same
-        way on a second attempt through the SAME proxy, so instead we
-        retry once with the proxy removed entirely — Cloud Run's direct
-        egress never touches Bright Data's network, so there's no
-        compliance policy or proxy-peer state left to trip on the
-        retry. If the caller does its own goto() instead (the old
-        pattern), none of this applies.
+        Data proxy-tunnel failure (see `_is_proxy_connection_failure`),
+        or a proxied response that comes back with a 4xx/5xx status
+        (the tunnel succeeds but the response IS the block — observed
+        live as a 403), will fail the exact same way on a second
+        attempt through the SAME proxy, so instead we retry once with
+        the proxy removed entirely — Cloud Run's direct egress never
+        touches Bright Data's network, so there's no compliance policy
+        or proxy-peer state left to trip on the retry. If the caller
+        does its own goto() instead (the old pattern), none of this
+        applies.
         """
         await self._ensure_started()
         async with self.domain_lock(domain):
@@ -296,30 +329,40 @@ class Browser:
             pg.set_default_timeout(45_000)
             try:
                 if url is not None:
+                    retry_reason: str | None = None
                     try:
-                        await pg.goto(url, **(goto_kwargs or {}))
+                        resp = await pg.goto(url, **(goto_kwargs or {}))
                     except Exception as exc:  # noqa: BLE001
                         if not (
                             self.cfg.bright_data_enabled
                             and self._is_proxy_connection_failure(exc)
                         ):
                             raise
+                        retry_reason = f"failed at the tunnel level ({exc})"
+                    else:
+                        # A tunnel-level block is the shape a Government-
+                        # site compliance block usually takes, but not
+                        # always — one was observed live returning a
+                        # normal-looking HTTP 403 instead (the proxy let
+                        # the request through; the response was the
+                        # block). goto() doesn't raise for HTTP error
+                        # statuses, so this branch is the only place that
+                        # would ever catch that case.
+                        if (
+                            self.cfg.bright_data_enabled
+                            and resp is not None
+                            and resp.status >= 400
+                        ):
+                            retry_reason = f"returned HTTP {resp.status}"
+                    if retry_reason is not None:
                         log.warning(
                             "playwright: proxied navigation to domain=%s "
-                            "failed at the tunnel level (%s) — retrying "
-                            "once via direct Cloud Run egress (no Bright "
-                            "Data proxy)",
-                            domain, exc,
+                            "%s — retrying once via direct Cloud Run "
+                            "egress (no Bright Data proxy)",
+                            domain, retry_reason,
                         )
-                        await context.close()
-                        context = await self._new_context(ua, use_proxy=False)
-                        pg = await context.new_page()
-                        pg.set_default_timeout(45_000)
-                        await pg.goto(url, **(goto_kwargs or {}))
-                        log.info(
-                            "playwright: direct-egress retry for domain=%s "
-                            "succeeded",
-                            domain,
+                        context, pg = await self._retry_direct(
+                            context, ua, url, goto_kwargs, domain
                         )
                 yield pg
             finally:
