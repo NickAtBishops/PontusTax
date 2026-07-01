@@ -192,7 +192,17 @@ class GenericNavigator:
             # reassigned below, so one registration here catches every
             # new tab opened from any page we switch to.
             new_pages: list[Any] = []
-            page.context.on("page", new_pages.append)
+            # A bound built-in method (list.append) can't be an event
+            # handler here: Playwright's dispatcher caches its wrapper by
+            # setattr()-ing onto the handler object itself
+            # (_impl_to_api_mapping.py's IMPL_ATTR), and builtin_function_
+            # or_method objects have no __dict__ to set it on — every call
+            # raised "'builtin_function_or_method' object has no attribute
+            # '_pw_impl_instance_'" and killed the whole row. A plain
+            # lambda has a __dict__, so it works.
+            page.context.on("page", lambda p: new_pages.append(p))
+            last_action = "none"
+            last_reason = "no step ran"
             for step in range(_MAX_STEPS):
                 # Bot-challenge check BEFORE asking the model to look at
                 # the page — no point spending a call on a page we
@@ -219,10 +229,12 @@ class GenericNavigator:
 
                 decision = await self._decide(snapshot, row, step)
                 action = decision.get("action")
+                last_action = action or "none"
+                last_reason = decision.get("reason", "") or "(no reason given)"
                 log.info(
                     "generic navigator step %d/%d: action=%s ref=%s reason=%r",
                     step + 1, _MAX_STEPS, action, decision.get("ref"),
-                    decision.get("reason", "")[:150],
+                    last_reason[:150],
                 )
 
                 if action == "done":
@@ -288,7 +300,8 @@ class GenericNavigator:
 
             raise RecipeError(
                 f"generic navigator: exhausted {_MAX_STEPS} steps without "
-                "reaching a bill page"
+                f"reaching a bill page (last step: action={last_action!r}, "
+                f"reason={last_reason[:150]!r})"
             )
 
     # ---- internals --------------------------------------------------------

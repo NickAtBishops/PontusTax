@@ -261,6 +261,15 @@ class RowProcessor:
         (record, portal_dead)."""
         row = job.row
 
+        def _log_fail(reason: str) -> None:
+            # Durable trail for "why did this row fail" — the terminal
+            # evidence text only keeps the LAST reason, but every
+            # attempt's real reason (including a Playwright recipe's
+            # actual exception, once `notes` is populated) lands in
+            # the run's Firestore event log as it happens, so a failed
+            # row can be diagnosed after the fact without re-running it.
+            self.store.log_event("warning", reason, job.key)
+
         # §4B input ladder: account candidates → street address → owner.
         terms: list[tuple[str, str]] = [
             ("account/parcel number", c) for c in group.candidates[:3]
@@ -325,6 +334,7 @@ class RowProcessor:
             except Exception as exc:  # noqa: BLE001 — transport/SDK error
                 last_reason = f"runner error: {exc}"
                 log.warning("[%s] %s", job.key, last_reason)
+                _log_fail(last_reason)
                 continue
 
             if attempt.run_id:
@@ -338,27 +348,21 @@ class RowProcessor:
                 last_reason = (
                     f"skyvern run {attempt.status}: {attempt.failure_reason or ''}"
                 ).strip()
+                _log_fail(last_reason)
                 continue
 
             extraction = coerce_output(attempt.output)
             page_outcome = extraction.get("page_outcome", "error")
 
             if page_outcome == "login_required":
-                return (
-                    _needs_review_record(
-                        group.display,
-                        "portal requires an account login — humans only (§ Type E)",
-                    ),
-                    True,
-                )
+                reason = "portal requires an account login — humans only (§ Type E)"
+                _log_fail(reason)
+                return _needs_review_record(group.display, reason), True
             if page_outcome == "blocked":
-                return (
-                    _needs_review_record(
-                        group.display,
-                        "portal blocked automated access (CAPTCHA/WAF held)",
-                    ),
-                    True,
-                )
+                notes = (extraction.get("notes") or "").strip()
+                reason = "portal blocked automated access (CAPTCHA/WAF held)"
+                _log_fail(f"{reason}: {notes}" if notes else reason)
+                return _needs_review_record(group.display, reason), True
             if page_outcome == "pdf_only":
                 rec = await self._pdf_path(job, group, url, domain)
                 return rec, False
@@ -373,14 +377,29 @@ class RowProcessor:
                 continue
 
             if page_outcome in ("no_matching_property", "error"):
+                # `notes` carries the real failure (e.g. a Playwright
+                # RecipeError message) when the runner has one. Prefer
+                # it over the generic "(searched X = Y)" template,
+                # which is misleading whenever this attempt was a
+                # cache replay rather than a fresh search (the
+                # Playwright generic navigator resolves a whole
+                # account group in one browser session, so attempts
+                # 2+ for the same group are cache hits — see
+                # playwright_engine/runner.py's cache-key note — and
+                # the "searched {label}" text then names a term that
+                # was never actually searched).
+                notes = (extraction.get("notes") or "").strip()
                 last_reason = (
-                    f"{page_outcome} (searched {label} = {value!r})"
+                    f"{page_outcome}: {notes}" if notes
+                    else f"{page_outcome} (searched {label} = {value!r})"
                 )
+                _log_fail(last_reason)
                 idx += 1
                 continue
 
             if page_outcome == "ambiguous_multiple_matches":
                 last_reason = f"multiple results for {label}={value!r}"
+                _log_fail(last_reason)
                 idx += 1
                 continue
 
@@ -404,6 +423,7 @@ class RowProcessor:
                     verdict = claude
             if not verdict.matched:
                 last_reason = f"wrong record: {verdict.reason or verdict.basis}"
+                _log_fail(last_reason)
                 idx += 1
                 continue
 

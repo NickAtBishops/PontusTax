@@ -187,10 +187,22 @@ class PlaywrightRunner:
         try:
             fetched = await recipe.fetch(self.browser, url, ctx)
         except RecipeError as exc:
-            log.info("recipe %s soft-failed for %s: %s", recipe.name, url, exc)
+            # Most RecipeErrors genuinely mean "couldn't find this
+            # property" — but a bot-check/CAPTCHA (generic_navigator's
+            # two distinct raise sites: the top-level marker scan, and
+            # the model explicitly reporting "blocked") means the
+            # opposite: the portal never showed us anything to judge a
+            # match against. Route those to "blocked" so the
+            # orchestrator's dedicated needs-review message (§ Type E)
+            # fires instead of the misleading "no matching property"
+            # one, which reads as "wrong property" to an analyst when
+            # the real story is "never got past the challenge page".
+            exc_text = str(exc).lower()
+            is_bot_block = "bot-detection" in exc_text or "bot-check" in exc_text
+            log.warning("recipe %s soft-failed for %s: %s", recipe.name, url, exc)
             result = AttemptResult(
                 output={
-                    "page_outcome": "no_matching_property",
+                    "page_outcome": "blocked" if is_bot_block else "no_matching_property",
                     "amount_due_now": None,
                     "bills": [],
                     "notes": f"{recipe.name}: {exc}",
