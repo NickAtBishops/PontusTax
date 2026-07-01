@@ -51,18 +51,25 @@ SYNONYMS: list[tuple[str, list[str], bool]] = [
 # Fields that may legitimately map to several columns.
 MULTI_FIELDS = {"due_dates", "amounts", "status_notes"}
 
-# PTAX_Master template (and future fixed-cell workbooks) names four
+# PTAX_Master template (and future fixed-cell workbooks) names the
 # structured cells the checker writes to. These headers are matched
-# STRICTLY — case-insensitive and tolerant of extra whitespace, but
-# NOT tolerant of paraphrase ("Amount due now" ≠ "Ultimate payment due").
+# STRICTLY — case-insensitive and tolerant of extra whitespace, but NOT
+# tolerant of paraphrase ("Amount due now" ≠ "Ultimate payment due").
 # Strict matches always beat the fuzzy synonym table below, so e.g.
 # "Payment amount" never falls through to the loose "amounts" bucket.
+#
+# The CURRENT PTAX_Master template (2026-06-25 reshuffle) only carries
+# three of these: Payment amount, Payment date, Confidence — grouped under
+# the "Model System Output" band. "Ultimate payment due" and "Next due
+# date" were dropped from the layout; they stay in the table for backwards
+# compatibility so older uploaded copies that still carry those headers
+# continue to write into the right cell.
 STRICT_HEADERS: dict[str, str] = {
-    "ultimate payment due": "ultimate_payment_due",
-    "confidence":           "run_confidence",
-    "payment date":         "payment_date",
-    "payment amount":       "payment_amount",
-    "next due date":        "next_due_date",
+    "payment amount":       "payment_amount",      # PTAX_Master Y
+    "payment date":         "payment_date",        # PTAX_Master Z
+    "confidence":           "run_confidence",      # PTAX_Master AB
+    "ultimate payment due": "ultimate_payment_due",  # legacy template only
+    "next due date":        "next_due_date",         # legacy template only
 }
 _STRICT_SPECIFICITY = 1000  # any strict hit beats every fuzzy hit
 

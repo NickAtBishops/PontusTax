@@ -95,23 +95,29 @@ def test_status_column_defaults_to_last_run_notes_on_fresh_template(
 
 def test_ptax_master_header_detection(ptax_master_workbook):
     # README sheet has no detectable header row → skipped naturally.
-    # Property Tax sheet: group row 2, field-header row 3, data from row 4.
+    # Property Tax sheet (2026-06-25 reshuffle): row 2 is the System /
+    # Pontus System Report / Model System Output band, row 3 is section
+    # sub-labels (Location / Business Plan / Property Tax / Due Date),
+    # row 4 is the field-header row, data starts at row 5. detect_header
+    # picks row 4 (most field matches) and row 3 as the group row above it.
     intake = parse_workbook(ptax_master_workbook)
     assert [s.name for s in intake.sheets] == ["Property Tax"]
     sheet = intake.sheets[0]
-    assert sheet.header_row == 3
-    assert sheet.group_row == 2
+    assert sheet.header_row == 4
+    assert sheet.group_row == 3
 
 
 def test_ptax_master_structured_field_mapping(ptax_master_workbook):
-    # The five structured cells the checker writes to are detected by
-    # header text and end up at S–W exactly per the template.
+    # The three structured cells the checker writes to land at Y/Z/AB
+    # under the "Model System Output" band. The two legacy cells
+    # (ultimate_payment_due, next_due_date) were dropped from the
+    # 2026-06-25 layout and are absent — first_col returns None.
     sheet = parse_workbook(ptax_master_workbook).sheets[0]
-    assert sheet.first_col("ultimate_payment_due").letter == "S"
-    assert sheet.first_col("run_confidence").letter == "T"
-    assert sheet.first_col("payment_date").letter == "U"
-    assert sheet.first_col("payment_amount").letter == "V"
-    assert sheet.first_col("next_due_date").letter == "W"
+    assert sheet.first_col("payment_amount").letter == "Y"
+    assert sheet.first_col("payment_date").letter == "Z"
+    assert sheet.first_col("run_confidence").letter == "AB"
+    assert sheet.first_col("ultimate_payment_due") is None
+    assert sheet.first_col("next_due_date") is None
 
 
 def test_ptax_master_original_tracker_columns_still_map(ptax_master_workbook):
@@ -129,6 +135,10 @@ def test_ptax_master_original_tracker_columns_still_map(ptax_master_workbook):
     assert m["confirmation"] == "N"
     assert m["responsible_party"] == "O"
     assert m["website"] == "R"
+    # "Actual assessment" at AA fuzzy-matches the assessed_value bucket;
+    # the writeback then refuses to touch it (it isn't in
+    # _WRITABLE_FIELDS) — see test_writeback_guard_blocks_protected_columns.
+    assert m["assessed_value"] == "AA"
 
 
 def test_strict_match_beats_fuzzy_for_payment_amount():

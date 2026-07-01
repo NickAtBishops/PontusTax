@@ -152,11 +152,19 @@ def test_main_sheet_layout_unchanged(florida_workbook, tmp_path):
 # ---------------------------------------------------------------------------
 
 
+# PTAX_Master template (2026-06-25 reshuffle): data starts at row 5 (the
+# group row at 2 and section sub-labels at 3 pushed the field-header row
+# down to 4). The template's first data row is row 5 — Putnam.
+PTAX_FIRST_DATA_ROW = 5
+
+
 def _ptax_paid_putnam_outcome():
     # Synthesizes the canonical PAID-with-discount Putnam outcome targeting
-    # PTAX_Master row 4 (the template's first data row): ultimate=0, paid
-    # $4,974.48 on 2025-12-29, next deadline 2026-03-31. Confidence HIGH
-    # rides into the new T column.
+    # PTAX_Master row 5 (the template's first data row): paid $4,974.48 on
+    # 2025-12-29. Confidence HIGH rides into the AB column. Legacy
+    # ultimate_payment_due / next_due_date are still set on the outcome
+    # but the current template has no header for them, so those writes
+    # are clean no-ops.
     rec = AccountRecord(
         account_searched="09-05-24-005954-056-00",
         status=PAID,
@@ -168,9 +176,9 @@ def _ptax_paid_putnam_outcome():
         confidence=HIGH,
     )
     return RowOutcome(
-        row_key="s00_r0004",
+        row_key=f"s00_r{PTAX_FIRST_DATA_ROW:04d}",
         sheet_name="Property Tax",
-        row_number=4,
+        row_number=PTAX_FIRST_DATA_ROW,
         accounts=[rec],
         row_status=PAID,
         confidence=HIGH,
@@ -185,52 +193,54 @@ def _ptax_paid_putnam_outcome():
 def test_structured_cells_written(ptax_master_workbook, tmp_path):
     intake = parse_workbook(ptax_master_workbook)
     out_path = str(tmp_path / "out.xlsx")
-    write_output(intake, {"s00_r0004": _ptax_paid_putnam_outcome()}, RUN_DATE, out_path)
+    write_output(
+        intake,
+        {f"s00_r{PTAX_FIRST_DATA_ROW:04d}": _ptax_paid_putnam_outcome()},
+        RUN_DATE, out_path,
+    )
     ws = load_workbook(out_path)["Property Tax"]
 
-    # Five structured cells carry typed Excel values (number for $, real
-    # datetime for dates, plain string for confidence).
-    assert ws["S4"].value == 0.0
-    assert ws["T4"].value == "HIGH"
-    assert ws["U4"].value == dt.datetime(2025, 12, 29)
-    assert ws["V4"].value == 4974.48
-    assert ws["W4"].value == dt.datetime(2026, 3, 31)
+    # Three Model System Output cells carry typed Excel values (number for
+    # $, real datetime for dates, plain string for confidence).
+    r = PTAX_FIRST_DATA_ROW
+    assert ws[f"Y{r}"].value == 4974.48                          # Payment amount
+    assert ws[f"Z{r}"].value == dt.datetime(2025, 12, 29)        # Payment date
+    assert ws[f"AB{r}"].value == "HIGH"                          # Confidence
+    # Analyst columns inside the same band must be preserved byte-for-byte.
+    # Row 5 (Putnam) ships with Actual assessment = 3666000 in the template.
+    assert ws[f"AA{r}"].value == 3666000
 
 
 def test_template_fill_preserved(ptax_master_workbook, tmp_path):
     # Cream fill (FFFFF8DC) is the visual cue the analyst uses to spot the
     # auto-populated columns. Overwriting the value must not strip it.
+    r = PTAX_FIRST_DATA_ROW
     before = load_workbook(ptax_master_workbook)["Property Tax"]
-    for col in ("S", "T", "U", "V", "W"):
-        assert before[f"{col}4"].fill.fgColor.rgb == "FFFFF8DC", (
-            f"template missing cream fill at {col}4"
+    for col in ("Y", "Z", "AB"):
+        assert before[f"{col}{r}"].fill.fgColor.rgb == "FFFFF8DC", (
+            f"template missing cream fill at {col}{r}"
         )
 
     intake = parse_workbook(ptax_master_workbook)
     out_path = str(tmp_path / "out.xlsx")
-    write_output(intake, {"s00_r0004": _ptax_paid_putnam_outcome()}, RUN_DATE, out_path)
+    write_output(
+        intake,
+        {f"s00_r{r:04d}": _ptax_paid_putnam_outcome()},
+        RUN_DATE, out_path,
+    )
     after = load_workbook(out_path)["Property Tax"]
 
-    for col in ("S", "T", "U", "V", "W"):
-        assert after[f"{col}4"].fill.fgColor.rgb == "FFFFF8DC", (
-            f"{col}4 lost the cream fill after writeback"
+    for col in ("Y", "Z", "AB"):
+        assert after[f"{col}{r}"].fill.fgColor.rgb == "FFFFF8DC", (
+            f"{col}{r} lost the cream fill after writeback"
         )
-
-
-def _ptax_notes_col_letter():
-    # PTAX_Master has no month-update column, so 'Last run notes' is
-    # created at ws.max_column + 1. With the template's 47 cols of styling
-    # (the header band on row 2 spans into the AU column even though row
-    # 3 only fills A:AJ), the resolver lands at AU based on the row-2
-    # group header span. We resolve it dynamically in tests rather than
-    # hard-coding, but record the column once for legibility.
-    return None  # tests look it up via parse_workbook.write_output
 
 
 def _ptax_notes_col(out_path):
     ws = load_workbook(out_path)["Property Tax"]
+    # Header row on PTAX_Master is row 4 (post-2026-06-25 layout).
     for c in range(1, ws.max_column + 1):
-        v = ws.cell(3, c).value
+        v = ws.cell(4, c).value
         if v and str(v).strip().lower() == "last run notes":
             return c
         if v and "update" in str(v).lower():
@@ -242,9 +252,10 @@ def test_contradiction_routes_to_notes_only(ptax_master_workbook, tmp_path):
     # ultimate_payment_due > 0 with status PAID is the cross_check
     # contradiction case: cross_check_ultimate_due flips status to
     # NEEDS_REVIEW upstream, the orchestrator's gate leaves every
-    # write_* field unset, and the writeback skips all S–V writes. The
-    # contradiction sentence reaches the notes column with the
+    # write_* field unset, and the writeback skips every structured
+    # write. The contradiction sentence reaches the notes column with the
     # 'flagged for human review' marker so analysts see WHY.
+    r = PTAX_FIRST_DATA_ROW
     record = AccountRecord(
         account_searched="09-05-24-005954-056-00",
         status=NEEDS_REVIEW,
@@ -256,9 +267,9 @@ def test_contradiction_routes_to_notes_only(ptax_master_workbook, tmp_path):
         ),
     )
     outcome = RowOutcome(
-        row_key="s00_r0004",
+        row_key=f"s00_r{r:04d}",
         sheet_name="Property Tax",
-        row_number=4,
+        row_number=r,
         accounts=[record],
         row_status=NEEDS_REVIEW,
         confidence=LOW,
@@ -273,65 +284,65 @@ def test_contradiction_routes_to_notes_only(ptax_master_workbook, tmp_path):
 
     intake = parse_workbook(ptax_master_workbook)
     out_path = str(tmp_path / "out.xlsx")
-    write_output(intake, {"s00_r0004": outcome}, RUN_DATE, out_path)
+    write_output(intake, {f"s00_r{r:04d}": outcome}, RUN_DATE, out_path)
     ws = load_workbook(out_path)["Property Tax"]
 
-    # Pay date / amt / next due keep the template's pre-existing row-4
-    # values byte-for-byte. (Ultimate stays at 0 from the template too.)
-    assert ws["S4"].value == 0
-    # T is the new Confidence column — LOW gets written even for
-    # NEEDS_REVIEW rows (it's informational, runs outside the gate).
-    assert ws["T4"].value == "LOW"
-    assert ws["U4"].value == "2025-11-15"
-    assert ws["V4"].value == 19937
-    assert ws["W4"].value == "2026-11-23"
+    # Pay amt / date keep the template's pre-existing row-5 values byte
+    # for byte. Actual assessment (AA) is analyst-owned and untouched.
+    assert ws[f"Y{r}"].value == 19937
+    assert ws[f"Z{r}"].value == "2025-11-15"
+    assert ws[f"AA{r}"].value == 3666000
+    # Confidence ALWAYS writes — even for NEEDS_REVIEW rows, since it's
+    # informational and runs outside the `allowed` gate.
+    assert ws[f"AB{r}"].value == "LOW"
 
-    notes = ws.cell(4, _ptax_notes_col(out_path)).value
+    notes = ws.cell(r, _ptax_notes_col(out_path)).value
     assert "contradiction" in notes
     assert "flagged for human review" in notes
 
 
 def test_low_confidence_writes_only_to_notes(ptax_master_workbook, tmp_path):
     # LOW confidence outcome — even with write_* set — must not touch
-    # S–V (the existing `allowed` gate blocks every structured write).
+    # the structured cells (the `allowed` gate blocks every write).
     # The status note still reaches the notes column.
+    r = PTAX_FIRST_DATA_ROW
     outcome = RowOutcome(
-        row_key="s00_r0004",
+        row_key=f"s00_r{r:04d}",
         sheet_name="Property Tax",
-        row_number=4,
+        row_number=r,
         accounts=[AccountRecord(account_searched="x", status=PAID, confidence=LOW)],
         row_status=PAID,
         confidence=LOW,
         status_note="LOW confidence — could not verify",
-        write_ultimate_payment_due=9999.99,  # would be ignored
-        write_payment_date="2099-12-31",
-        write_payment_amount=9999.99,
-        write_next_due_date="2099-12-31",
+        write_ultimate_payment_due=9999.99,  # legacy field — would be ignored anyway (header absent)
+        write_payment_date="2099-12-31",     # gated by LOW confidence — must not write
+        write_payment_amount=9999.99,        # ditto
+        write_next_due_date="2099-12-31",    # legacy — header absent
     )
 
     intake = parse_workbook(ptax_master_workbook)
     out_path = str(tmp_path / "out.xlsx")
-    write_output(intake, {"s00_r0004": outcome}, RUN_DATE, out_path)
+    write_output(intake, {f"s00_r{r:04d}": outcome}, RUN_DATE, out_path)
     ws = load_workbook(out_path)["Property Tax"]
 
-    assert ws["S4"].value == 0           # template's pre-existing value
-    assert ws["T4"].value == "LOW"       # Confidence ALWAYS writes
-    assert ws["U4"].value == "2025-11-15"
-    assert ws["V4"].value == 19937
-    assert ws["W4"].value == "2026-11-23"
-    assert ws.cell(4, _ptax_notes_col(out_path)).value == (
+    assert ws[f"Y{r}"].value == 19937           # template's pre-existing value
+    assert ws[f"Z{r}"].value == "2025-11-15"
+    assert ws[f"AA{r}"].value == 3666000        # analyst column untouched
+    assert ws[f"AB{r}"].value == "LOW"          # Confidence ALWAYS writes
+    assert ws.cell(r, _ptax_notes_col(out_path)).value == (
         "LOW confidence — could not verify"
     )
 
 
 def test_no_overwrite_with_blank(ptax_master_workbook, tmp_path):
     # Outcome with every write_* = None — a parse glitch that yielded no
-    # values. The template's pre-existing row-4 values must survive
+    # values. The template's pre-existing row-5 values must survive
     # untouched (§7: no silent erasure).
+    r = PTAX_FIRST_DATA_ROW
     outcome = RowOutcome(
-        row_key="s00_r0004",
+        row_key=f"s00_r{r:04d}",
         sheet_name="Property Tax",
-        row_number=4,
+        row_number=r,
         accounts=[AccountRecord(account_searched="x", status=PAID, confidence=HIGH)],
         row_status=PAID,
         confidence=HIGH,
@@ -341,25 +352,25 @@ def test_no_overwrite_with_blank(ptax_master_workbook, tmp_path):
 
     intake = parse_workbook(ptax_master_workbook)
     out_path = str(tmp_path / "out.xlsx")
-    write_output(intake, {"s00_r0004": outcome}, RUN_DATE, out_path)
+    write_output(intake, {f"s00_r{r:04d}": outcome}, RUN_DATE, out_path)
     ws = load_workbook(out_path)["Property Tax"]
 
-    assert ws["S4"].value == 0
-    assert ws["T4"].value == "HIGH"          # Confidence writes regardless
-    assert ws["U4"].value == "2025-11-15"
-    assert ws["V4"].value == 19937
-    assert ws["W4"].value == "2026-11-23"
+    assert ws[f"Y{r}"].value == 19937
+    assert ws[f"Z{r}"].value == "2025-11-15"
+    assert ws[f"AA{r}"].value == 3666000        # analyst column untouched
+    assert ws[f"AB{r}"].value == "HIGH"         # Confidence writes regardless
 
 
 def test_date_correction_writes_and_notes(ptax_master_workbook, tmp_path):
-    # U4 (payment_date) is pre-populated as '2025-11-15' in the template.
-    # A portal receipt of 2025-12-29 should (a) overwrite U4 with a real
+    # Z5 (payment_date) is pre-populated as '2025-11-15' in the template.
+    # A portal receipt of 2025-12-29 should (a) overwrite Z5 with a real
     # datetime, and (b) ride a "corrected payment date from ... to ...
     # per portal receipt" sentence into the notes column.
+    r = PTAX_FIRST_DATA_ROW
     outcome = RowOutcome(
-        row_key="s00_r0004",
+        row_key=f"s00_r{r:04d}",
         sheet_name="Property Tax",
-        row_number=4,
+        row_number=r,
         accounts=[AccountRecord(account_searched="x", status=PAID, confidence=HIGH)],
         row_status=PAID,
         confidence=HIGH,
@@ -370,60 +381,103 @@ def test_date_correction_writes_and_notes(ptax_master_workbook, tmp_path):
 
     intake = parse_workbook(ptax_master_workbook)
     out_path = str(tmp_path / "out.xlsx")
-    write_output(intake, {"s00_r0004": outcome}, RUN_DATE, out_path)
+    write_output(intake, {f"s00_r{r:04d}": outcome}, RUN_DATE, out_path)
     ws = load_workbook(out_path)["Property Tax"]
 
-    assert ws["U4"].value == dt.datetime(2025, 12, 29)
-    assert ws["V4"].value == 4974.48
+    assert ws[f"Z{r}"].value == dt.datetime(2025, 12, 29)
+    assert ws[f"Y{r}"].value == 4974.48
 
-    notes = ws.cell(4, _ptax_notes_col(out_path)).value
+    notes = ws.cell(r, _ptax_notes_col(out_path)).value
     assert "corrected payment date from 2025-11-15 to 2025-12-29 per portal receipt" in notes
     assert "corrected payment amount from 19937 to 4974.48 per portal receipt" in notes
 
 
 def test_writeback_guard_blocks_protected_columns(ptax_master_workbook):
-    # _assert_writable_column raises on any column past W except the
-    # resolved notes column. The error message names the offending header
-    # so a misconfigured caller is obvious.
+    # _assert_writable_column raises on any column whose detected
+    # canonical field isn't in _WRITABLE_FIELDS (unless it's the notes
+    # column). The error message names the offending header so a
+    # misconfigured caller is obvious.
     intake = parse_workbook(ptax_master_workbook)
     sheet = intake.sheets[0]
     wb = load_workbook(ptax_master_workbook)
     ws = wb[sheet.name]
 
-    # Use a notes_col past the protected range so the guard's "target is
-    # the notes column" carve-out doesn't accidentally pass these targets.
+    # notes_col past every real column so its carve-out doesn't fire.
     notes_col = 999
 
-    # Probe each protected family — analyst-filled (X, AE), formula (AI).
-    for col in (24, 31, 35):  # X (Jurisdiction primary), AE (BOV med high), AI (Variance $)
+    # Probe each analyst-owned column on the new 2026-06-25 layout:
+    # BOV high (S=19), Jurisdiction link primary (V=22), Actual
+    # assessment (AA=27 — fuzzy-matches assessed_value, which is NOT
+    # in _WRITABLE_FIELDS so the guard still fires).
+    from pontus_tax.intake import ColumnInfo
+    for col in (19, 22, 27):
+        # Build a ColumnInfo the way the writeback does — lift fieldname
+        # off the parsed sheet so the test exercises the real path.
+        info = None
+        for cols in sheet.columns.values():
+            for ci in cols:
+                if ci.index == col:
+                    info = ci
+                    break
+            if info:
+                break
+        # BOV high (S) and Jurisdiction primary (V) aren't mapped to any
+        # canonical field at all — synthesize a bare ColumnInfo for them.
+        if info is None:
+            info = ColumnInfo(
+                index=col, letter=get_column_letter(col),
+                header=str(ws.cell(sheet.header_row, col).value),
+                effective="", fieldname=None,
+            )
         with pytest.raises(WritebackGuardError) as exc:
-            _assert_writable_column(ws, sheet, col, notes_col)
+            _assert_writable_column(ws, sheet, info, notes_col)
         header = str(ws.cell(sheet.header_row, col).value)
         assert header in str(exc.value), (
             f"col {get_column_letter(col)}: error must name header "
             f"{header!r}, got: {exc.value!s}"
         )
 
-    # Sanity: W (23, Next due date) and the notes_col itself are writable.
-    _assert_writable_column(ws, sheet, 23, notes_col)
+    # Bare-int path: writing into the notes_col is always OK; writing
+    # into any other column without a fieldname is not.
     _assert_writable_column(ws, sheet, notes_col, notes_col)
+    with pytest.raises(WritebackGuardError):
+        _assert_writable_column(ws, sheet, 27, notes_col)  # AA, not notes
+
+    # Sanity: every writeback-owned canonical field on the current
+    # template — Payment amount (Y), Payment date (Z), Confidence (AB) —
+    # passes the guard.
+    for fieldname, letter in (
+        ("payment_amount", "Y"),
+        ("payment_date",   "Z"),
+        ("run_confidence", "AB"),
+    ):
+        info = sheet.first_col(fieldname)
+        assert info is not None and info.letter == letter
+        _assert_writable_column(ws, sheet, info, notes_col)
 
 
-def test_template_columns_untouched(ptax_master_workbook, tmp_path):
-    # The full X..AK range must round-trip byte-for-byte through a real
-    # write_output run: every (value, data_type) pair preserved. Catches
-    # accidental writes AND, critically, formula-to-value replacements in
-    # AI/AJ/AK that would silently break the variance chain forever.
+def test_template_analyst_columns_untouched(ptax_master_workbook, tmp_path):
+    # Every analyst-owned column on the current PTAX_Master layout must
+    # round-trip byte-for-byte through a real write_output run: every
+    # (value, data_type) pair preserved. Catches accidental writes into
+    # the BOV / Jurisdiction / Actual assessment columns.
     ws_before = load_workbook(ptax_master_workbook)["Property Tax"]
+    # S–X = BOV high/mid/low + Jurisdiction primary/secondary/tertiary
+    # AA = Actual assessment
+    analyst_cols = list(range(19, 25)) + [27]
     before: dict[tuple[int, int], tuple] = {}
-    for r in range(4, ws_before.max_row + 1):
-        for col in range(24, 38):  # X..AK
+    for r in range(PTAX_FIRST_DATA_ROW, ws_before.max_row + 1):
+        for col in analyst_cols:
             c = ws_before.cell(r, col)
             before[(r, col)] = (c.value, c.data_type)
 
     intake = parse_workbook(ptax_master_workbook)
     out_path = str(tmp_path / "out.xlsx")
-    write_output(intake, {"s00_r0004": _ptax_paid_putnam_outcome()}, RUN_DATE, out_path)
+    write_output(
+        intake,
+        {f"s00_r{PTAX_FIRST_DATA_ROW:04d}": _ptax_paid_putnam_outcome()},
+        RUN_DATE, out_path,
+    )
 
     ws_after = load_workbook(out_path)["Property Tax"]
     drifted: list[str] = []
@@ -434,7 +488,7 @@ def test_template_columns_untouched(ptax_master_workbook, tmp_path):
                 f"{get_column_letter(col)}{r}: {expected} → "
                 f"{(c.value, c.data_type)}"
             )
-    assert not drifted, "protected columns drifted:\n  " + "\n  ".join(drifted)
+    assert not drifted, "analyst columns drifted:\n  " + "\n  ".join(drifted)
 
 
 def test_unprocessed_rows_are_marked_not_skipped(florida_workbook, tmp_path):
