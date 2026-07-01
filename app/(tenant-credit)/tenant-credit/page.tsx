@@ -46,6 +46,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { ExcelPreviewTable } from "@/components/excel-preview-table";
 
 import {
   ALL_QUARTER_IDS,
@@ -1643,23 +1644,8 @@ function TriageCard(props: {
                               title={e.name}
                             />
                           ) : (
-                            <div className="flex h-32 items-center justify-center rounded border bg-white text-center">
-                              <div>
-                                <p className="text-sm text-neutral-600">
-                                  {e.name}
-                                </p>
-                                <p className="text-xs text-neutral-500">
-                                  {formatBytes(e.file.size)} · Excel preview
-                                  not rendered inline.
-                                </p>
-                                <a
-                                  href={previewUrl}
-                                  download={e.name}
-                                  className="text-xs text-primary hover:underline"
-                                >
-                                  Download to open in Excel
-                                </a>
-                              </div>
+                            <div className="h-[800px] w-full">
+                              <ExcelPreviewTable key={e.id} file={e.file} />
                             </div>
                           )}
                         </div>
@@ -2128,18 +2114,10 @@ function FilePreviewSheet(props: {
                   title={props.file.name}
                 />
               ) : (
-                <div className="flex h-full flex-col items-center justify-center gap-3 rounded border bg-neutral-50 text-center">
-                  <p className="text-sm text-neutral-600">
-                    Excel preview not rendered in the browser.
-                  </p>
-                  <a
-                    href={url}
-                    download={props.file.name}
-                    className="text-sm text-primary hover:underline"
-                  >
-                    Download to open in Excel
-                  </a>
-                </div>
+                <ExcelPreviewTable
+                  key={props.file.name}
+                  file={props.file.file}
+                />
               )}
             </div>
           </>
