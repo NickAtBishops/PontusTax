@@ -49,6 +49,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--resume", action="store_true",
                    default=os.environ.get("RESUME") == "1",
                    help="also re-run rows whose scrape_state is 'failed'")
+    # --engine only applies to local mode (LocalStore). In Firestore
+    # mode the engine rides on the run document, written by the upload
+    # API at run-creation time.
+    p.add_argument(
+        "--engine",
+        choices=["skyvern", "playwright"],
+        default=os.environ.get("LOCAL_ENGINE", "skyvern"),
+        help="engine for --local-xlsx runs (default: skyvern)",
+    )
     return p.parse_args(argv)
 
 
@@ -74,13 +83,58 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
     cfg = Config()
 
-    if not args.dry_run and not cfg.skyvern_api_key:
-        log.error("SKYVERN_API_KEY is not set (use --dry-run to test without it)")
+    # Each engine needs its own key, and a Firestore-mode worker
+    # (Cloud Run job) doesn't know which engine the queue will ask for
+    # until a run is actually claimed — `engine` lives on the run doc,
+    # read inside execute_run(), strictly after this function would
+    # already have to decide whether to start at all. So we do NOT
+    # hard-require SKYVERN_API_KEY here the way earlier code did: a
+    # deployment that intentionally runs Playwright-only (no Skyvern
+    # plan, ANTHROPIC_API_KEY set) would otherwise refuse to start at
+    # all, every single invocation, queue never even inspected. Each
+    # runner already lazily raises a clear error on its OWN missing key
+    # when it's actually constructed (SkyvernRunner._sdk(),
+    # Extractor.__init__) — that's what surfaces a real misconfiguration
+    # for whichever engine a run actually picked. We only refuse to
+    # start here when NEITHER key is present, since then no run of
+    # either engine could possibly succeed.
+    if (
+        not args.dry_run
+        and not args.local_xlsx
+        and not cfg.skyvern_api_key
+        and not cfg.anthropic_api_key
+    ):
+        log.error(
+            "Neither SKYVERN_API_KEY nor ANTHROPIC_API_KEY is set — no "
+            "queued run, on either engine, could succeed (use --dry-run "
+            "to test without either)"
+        )
+        return 2
+    if (
+        not args.dry_run
+        and args.local_xlsx
+        and args.engine == "skyvern"
+        and not cfg.skyvern_api_key
+    ):
+        log.error("SKYVERN_API_KEY is not set (use --engine playwright or --dry-run)")
+        return 2
+    if (
+        not args.dry_run
+        and args.local_xlsx
+        and args.engine == "playwright"
+        and not cfg.anthropic_api_key
+    ):
+        log.error(
+            "ANTHROPIC_API_KEY is not set — required by the Playwright "
+            "engine's extraction step"
+        )
         return 2
 
     # Explicit single-run modes: process exactly the requested run.
     if args.local_xlsx:
-        store = LocalStore(args.local_xlsx, max_rows=args.max_rows)
+        store = LocalStore(
+            args.local_xlsx, max_rows=args.max_rows, engine=args.engine,
+        )
         return 0 if _run_once(store, cfg, args) else 1
     if args.run_id:
         return 0 if _run_once(FirestoreStore(cfg, args.run_id), cfg, args) else 1

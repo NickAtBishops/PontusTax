@@ -17,9 +17,10 @@ from openpyxl import Workbook
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-# templates/ lives at the repo root, one level above worker/.
+# templates/ lives at the Next Tax Project repo root, three levels above
+# this conftest (worker/tax/tests/ → worker/tax/ → worker/ → repo root).
 _TEMPLATES_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "templates")
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "templates")
 )
 
 

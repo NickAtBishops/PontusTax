@@ -14,6 +14,7 @@ import { COLLECTIONS, type RunDoc } from "@/lib/types";
 import { fmtMoney, fmtRelative } from "@/lib/format";
 import { StatusBadge } from "@/components/status-badge";
 import { DeleteRunButton } from "@/components/delete-run-button";
+import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import {
@@ -101,9 +102,22 @@ export function RunsTable({
                   onClick={() => router.push(`/tax/runs/${run.id}`)}
                 >
                   <TableCell className="max-w-64">
-                    <span className="block truncate font-medium">
-                      {run.file_name}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className="block truncate font-medium">
+                        {run.file_name}
+                      </span>
+                      {/* Engine badge: only show for the new engine,
+                          since Skyvern is the default and showing it
+                          on every old row would be visual noise. */}
+                      {run.engine === "playwright" ? (
+                        <Badge
+                          variant="outline"
+                          className="shrink-0 border-blue-200 bg-blue-50 px-1.5 py-0 text-[10px] font-medium text-blue-700"
+                        >
+                          Playwright
+                        </Badge>
+                      ) : null}
+                    </div>
                   </TableCell>
                   <TableCell>
                     <StatusBadge status={run.status} />

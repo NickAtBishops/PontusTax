@@ -2,7 +2,12 @@ import { NextResponse } from "next/server";
 import { FieldValue } from "firebase-admin/firestore";
 import { adminDb, adminBucket } from "@/lib/firebase-admin";
 import { triggerWorker } from "@/lib/cloud-run";
-import { COLLECTIONS } from "@/lib/types";
+import {
+  COLLECTIONS,
+  DEFAULT_TAX_ENGINE,
+  TAX_ENGINES,
+  type TaxEngine,
+} from "@/lib/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -51,6 +56,27 @@ export async function POST(req: Request) {
       );
     }
 
+    // Optional `engine` form field selects the back-end engine.
+    // Missing / unknown values fall back to the default. Validated
+    // here (not just trusted from the client) so a typo never reaches
+    // the worker and silently picks the wrong path.
+    const engineRaw = form.get("engine");
+    let engine: TaxEngine = DEFAULT_TAX_ENGINE;
+    if (typeof engineRaw === "string" && engineRaw) {
+      if ((TAX_ENGINES as readonly string[]).includes(engineRaw)) {
+        engine = engineRaw as TaxEngine;
+      } else {
+        return NextResponse.json(
+          {
+            error:
+              `Unknown engine ${JSON.stringify(engineRaw)}. ` +
+              `Valid: ${TAX_ENGINES.join(", ")}.`,
+          },
+          { status: 400 },
+        );
+      }
+    }
+
     const buffer = Buffer.from(await file.arrayBuffer());
     const runRef = adminDb().collection(COLLECTIONS.runs).doc();
     const safeName = file.name.replace(/[^\w.\- ()]/g, "_");
@@ -69,6 +95,7 @@ export async function POST(req: Request) {
       output_path: null,
       output_file_name: null,
       status: "queued",
+      engine,
       error: null,
       trigger_error: null,
       cancel_requested: false,

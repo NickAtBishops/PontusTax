@@ -71,6 +71,50 @@ class Config:
         default_factory=lambda: os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
     )
 
+    # Bright Data residential proxy — Playwright engine only. Cloud Run's
+    # own egress IP is in a recognized datacenter range; portals fronted
+    # by Cloudflare (the whole county-taxes.net/Grant Street family,
+    # confirmed live 2026-06-30) serve a bot-challenge or a page that
+    # never finishes rendering from that range. Skyvern already routes
+    # through a residential proxy (see proxy_location above) for the
+    # same reason; the Playwright engine had none until this was added.
+    # All four must be set together for the proxy to activate — see
+    # playwright_engine/browser.py `_proxy_settings()`. Get these from
+    # the Bright Data dashboard: Proxies & Scraping Infra → add a
+    # Residential zone → zone Overview tab has customer id + zone name;
+    # zone Access parameters tab has the zone password.
+    bright_data_customer_id: str | None = field(
+        default_factory=lambda: os.environ.get("BRIGHT_DATA_CUSTOMER_ID") or None
+    )
+    bright_data_zone: str | None = field(
+        default_factory=lambda: os.environ.get("BRIGHT_DATA_ZONE") or None
+    )
+    bright_data_zone_password: str | None = field(
+        default_factory=lambda: os.environ.get("BRIGHT_DATA_ZONE_PASSWORD") or None
+    )
+    # Every property in the portfolio is a US county portal — pin
+    # residential exit IPs to the US so we're not flagged for a
+    # geo-mismatch on top of everything else. Two-letter lowercase
+    # country code per Bright Data's username syntax.
+    bright_data_country: str = field(
+        default_factory=lambda: os.environ.get("BRIGHT_DATA_COUNTRY", "us")
+    )
+    # Bright Data's documented default residential endpoint. Override
+    # only if the zone's dashboard shows a different host/port.
+    bright_data_proxy_server: str = field(
+        default_factory=lambda: os.environ.get(
+            "BRIGHT_DATA_PROXY_SERVER", "http://brd.superproxy.io:33335"
+        )
+    )
+
+    @property
+    def bright_data_enabled(self) -> bool:
+        return bool(
+            self.bright_data_customer_id
+            and self.bright_data_zone
+            and self.bright_data_zone_password
+        )
+
     # Politeness / concurrency — several rows share a portal; don't hammer.
     polite_delay: float = field(default_factory=lambda: _float("POLITE_DELAY_SECONDS", 8.0))
     max_concurrency: int = field(default_factory=lambda: _int("MAX_CONCURRENCY", 2))

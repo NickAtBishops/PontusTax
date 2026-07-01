@@ -527,10 +527,16 @@ class FirestoreStore:
 # ===========================================================================
 
 class LocalStore:
-    def __init__(self, xlsx_path: str, max_rows: int | None = None):
+    def __init__(
+        self,
+        xlsx_path: str,
+        max_rows: int | None = None,
+        engine: str = "skyvern",
+    ):
         self.run_id = "local"
         self.xlsx_path = os.path.abspath(xlsx_path)
         self.max_rows = max_rows
+        self.engine = engine
         self.outcomes: dict[str, RowOutcome] = {}
         self.playbooks: dict[str, Playbook] = {pb.key: pb for pb in SEED_PLAYBOOKS}
         self.new_playbooks: list[str] = []
@@ -542,6 +548,9 @@ class LocalStore:
         return {
             "file_name": os.path.basename(self.xlsx_path),
             "input_path": self.xlsx_path,
+            # Mirrors the Firestore run-doc shape so the orchestrator
+            # reads the engine selection the same way in both modes.
+            "engine": self.engine,
         }
 
     def fetch_input(self) -> str:

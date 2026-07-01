@@ -32,6 +32,13 @@ from .intake import RowIntake, SheetIntake, parse_workbook
 from .playbooks import Playbook, draft_playbook, match_playbook
 from .prompts import PromptContext, build_prompt
 from .skyvern_runner import SkyvernRunner, coerce_output
+from .playwright_engine.runner import PlaywrightRunner
+
+# Default engine when the run doc has no `engine` field (back-compat
+# for runs created before the field existed). Skyvern is the safe
+# default because every recipe-shaped path has a Skyvern fallback in
+# the sense that the analyst can re-upload with engine="skyvern".
+DEFAULT_ENGINE = "skyvern"
 from .store import RunStore, row_key
 from .taxonomy import TYPE_A, TYPE_B, TYPE_D, classify_url, domain_of
 from .validate import build_account_record, build_row_note
@@ -101,7 +108,7 @@ class RowProcessor:
     def __init__(
         self,
         cfg: Config,
-        runner: SkyvernRunner,
+        runner: SkyvernRunner | PlaywrightRunner,
         playbooks: list[Playbook],
         store: RunStore,
         dry_run: bool,
@@ -301,10 +308,22 @@ class RowProcessor:
             calls += 1
             try:
                 attempt = await self.runner.run_attempt(
-                    domain, url, prompt, EXTRACTION_SCHEMA, title
+                    domain, url, prompt, EXTRACTION_SCHEMA, title,
+                    # Skyvern ignores `row`/`group_candidates`/`row_key`;
+                    # Playwright recipes drive their search ladder from
+                    # `group_candidates` (THIS account's candidates only
+                    # — never the whole row's, see CLAUDE.md §9 Pinellas
+                    # multi-account-cell case) and scope their result
+                    # cache by `row_key` + the candidate set so two
+                    # different account groups on one row, or two
+                    # different rows sharing one bare search URL
+                    # (CLAUDE.md §9 Broward case), never collide.
+                    row=row,
+                    group_candidates=group.candidates,
+                    row_key=job.key,
                 )
             except Exception as exc:  # noqa: BLE001 — transport/SDK error
-                last_reason = f"skyvern error: {exc}"
+                last_reason = f"runner error: {exc}"
                 log.warning("[%s] %s", job.key, last_reason)
                 continue
 
@@ -391,10 +410,14 @@ class RowProcessor:
             rec = build_account_record(group.display, extraction, verdict)
             return rec, False
 
-        # Technical failures (Skyvern transport/browser errors) are
-        # UNREACHABLE — the Retry button re-queues them. NEEDS_REVIEW is
-        # reserved for business outcomes a human must look at.
-        if last_reason.startswith("skyvern"):
+        # Technical failures (transport / browser errors on either
+        # engine) are UNREACHABLE — the Retry button re-queues them.
+        # NEEDS_REVIEW is reserved for business outcomes a human must
+        # look at. The two error prefixes here are the historical
+        # "skyvern error:" wording (kept for back-compat with the
+        # status-note matcher) and the new engine-agnostic
+        # "runner error:" wording the orchestrator now emits.
+        if last_reason.startswith("skyvern") or last_reason.startswith("runner"):
             return _unreachable_record(group.display, last_reason), False
         return _needs_review_record(group.display, last_reason), False
 
@@ -573,7 +596,24 @@ async def execute_run(
     todo = [j for j in jobs if j.key in pending]
     log.info("%d/%d rows pending", len(todo), len(jobs))
 
-    runner = SkyvernRunner(cfg)
+    # ---- Engine selection ------------------------------------------------
+    # `engine` rides on the run document (`tax_checker_runs/{id}.engine`)
+    # set at upload time from the UI's engine tab. The two engines
+    # implement the same SkyvernRunner-shaped surface, so the rest of
+    # this function does not branch.
+    engine = (meta.get("engine") or DEFAULT_ENGINE).lower()
+    if engine not in ("skyvern", "playwright"):
+        log.warning("unknown engine %r in run doc; falling back to %s",
+                    engine, DEFAULT_ENGINE)
+        engine = DEFAULT_ENGINE
+    runner: SkyvernRunner | PlaywrightRunner
+    if engine == "playwright":
+        runner = PlaywrightRunner(cfg)
+        log.info("engine: playwright (recipes + Claude Haiku extraction)")
+    else:
+        runner = SkyvernRunner(cfg)
+        log.info("engine: skyvern (vision agent)")
+    store.log_event("info", f"engine: {engine}")
     playbooks = store.load_playbooks()
     processor = RowProcessor(cfg, runner, playbooks, store, dry_run, today)
 

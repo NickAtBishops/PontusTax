@@ -121,6 +121,15 @@ class SkyvernRunner:
         prompt: str,
         schema: dict[str, Any],
         title: str,
+        *,
+        # Accepted-and-ignored for protocol parity with PlaywrightRunner,
+        # which needs row/group context to drive its recipes and scope
+        # its result cache. Skyvern gets everything it needs from
+        # `prompt` (already built per-term by the orchestrator), so
+        # none of these are used here.
+        row: Any = None,
+        group_candidates: list[str] | None = None,
+        row_key: str | None = None,
     ) -> AttemptResult:
         client = self._sdk()
         await self._polite_wait(domain)

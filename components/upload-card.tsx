@@ -7,7 +7,9 @@ import { toast } from "sonner";
 import { readError } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
+import { DEFAULT_TAX_ENGINE, type TaxEngine } from "@/lib/types";
 
 export function UploadCard() {
   const router = useRouter();
@@ -15,6 +17,12 @@ export function UploadCard() {
   const [file, setFile] = useState<File | null>(null);
   const [dragging, setDragging] = useState(false);
   const [busy, setBusy] = useState(false);
+  // Engine selection lives on the upload card (rides with the file).
+  // Defaults to the safe option (Skyvern). The Playwright tab is
+  // labeled "beta" because today it only covers Grant Street's
+  // county-taxes.net family; rows on other portals will land in
+  // Needs Review until the recipe library grows.
+  const [engine, setEngine] = useState<TaxEngine>(DEFAULT_TAX_ENGINE);
 
   function pick(f: File | undefined | null) {
     if (!f) return;
@@ -31,6 +39,7 @@ export function UploadCard() {
     try {
       const form = new FormData();
       form.append("file", file);
+      form.append("engine", engine);
       const res = await fetch("/api/tax/runs", {
         method: "POST",
         body: form,
@@ -65,6 +74,30 @@ export function UploadCard() {
           copy is produced.
         </p>
       </div>
+
+      {/* Engine selector. The two tabs are coexisting back-ends:
+          Skyvern is the AI agent (works on anything, costs more);
+          Playwright is the recipe + Claude Haiku path (cheap and
+          fast, only covers vendor families with recipes today). */}
+      <Tabs
+        value={engine}
+        onValueChange={(v) => setEngine(v as TaxEngine)}
+        className="gap-2"
+      >
+        <div className="flex items-center justify-between gap-3">
+          <TabsList>
+            <TabsTrigger value="skyvern">Skyvern</TabsTrigger>
+            <TabsTrigger value="playwright">
+              Playwright <span className="ml-1 text-[10px] opacity-70">beta</span>
+            </TabsTrigger>
+          </TabsList>
+          <p className="text-xs text-muted-foreground">
+            {engine === "playwright"
+              ? "Recipes + Claude extraction. ~10x cheaper. Currently covers county-taxes.net portals; other URLs land in Needs Review."
+              : "Vision agent. Handles any portal. Costs ~$0.30/property."}
+          </p>
+        </div>
+      </Tabs>
 
       <div
         role="button"

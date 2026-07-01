@@ -25,6 +25,14 @@ export type RunStatus =
   | "failed"
   | "canceled";
 
+/** Which back-end engine the worker uses for a run.
+ *  - "skyvern":    AI vision agent (handles any portal but per-step cost).
+ *  - "playwright": deterministic per-vendor recipes + Claude Haiku
+ *                  extraction (cheaper/faster, only known vendor families). */
+export const TAX_ENGINES = ["skyvern", "playwright"] as const;
+export type TaxEngine = (typeof TAX_ENGINES)[number];
+export const DEFAULT_TAX_ENGINE: TaxEngine = "skyvern";
+
 export interface RunTotals {
   rows: number;
   processed: number;
@@ -66,6 +74,9 @@ export interface RunDoc {
   output_path: string | null;
   output_file_name: string | null;
   status: RunStatus;
+  /** Which engine processed this run. Older runs created before the
+   *  engine selector existed read as undefined; treat as "skyvern". */
+  engine?: TaxEngine;
   error: string | null;
   trigger_error: string | null;
   cancel_requested: boolean;
