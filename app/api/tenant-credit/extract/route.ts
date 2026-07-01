@@ -81,10 +81,14 @@ const MAX_PDF_BYTES = 32 * 1024 * 1024;
 
 // Force Node.js runtime (Anthropic SDK needs Node APIs). maxDuration
 // raises the Vercel function timeout so a slow Claude response doesn't
-// get killed at the default 10s on Hobby plan. Income-statement
-// extraction with high-effort thinking typically takes 15-30s.
+// get killed early. PDF income-statement extraction with high-effort
+// thinking typically takes 15-30s, but dense xlsx-sourced statements
+// (balance sheets, granular multi-account P&Ls) showed real call-to-
+// call variance up to ~53s+ in testing (2026-07-01) — the extraction
+// client now budgets 100s per attempt with 1 retry (~200s worst
+// case), so this must stay comfortably above that.
 export const runtime = "nodejs";
-export const maxDuration = 90;
+export const maxDuration = 240;
 
 export async function POST(req: Request) {
   // Parse the multipart upload. If the Content-Type isn't multipart,

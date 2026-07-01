@@ -144,12 +144,20 @@ function isRawExtractionResult(x: unknown): x is RawExtractionResult {
 async function runExtraction(
   userContent: Anthropic.Messages.ContentBlockParam[],
 ): Promise<RawExtractionResult> {
-  // 50s timeout per call. High-effort thinking on a dense quarterly
-  // statement regularly takes 20-40s; the previous 25s budget aborted
-  // those calls and surfaced as "Client disconnected" 499s in the
-  // Anthropic logs. The route layer maxDuration is 90s so we still
-  // leave headroom for parsing + audit + the response stream back.
-  const client = new Anthropic({ timeout: 50_000, maxRetries: 1 });
+  // 100s timeout per call, 1 retry. Measured directly against real
+  // tenant xlsx uploads (2026-07-01): dense, non-standard-shaped
+  // statements (balance sheets, granular multi-account P&Ls flattened
+  // from .xlsx, which lack a PDF's native layout structure) completed
+  // in anywhere from 27s to 53s across repeated runs of the SAME
+  // file — adaptive high-effort thinking duration is genuinely
+  // variable call-to-call, not a fixed cost. A flat 80s budget still
+  // timed out 3 of 5 files on a second run of the identical content
+  // that had finished in under 53s moments earlier. Rather than chase
+  // a single "safe" number, this gives a generous 100s window AND one
+  // retry (a fresh attempt has independent variance, so it's a real
+  // second chance, not a repeat of the same slow path) — worst case
+  // ~200s. The route layer maxDuration is raised to 240s to match.
+  const client = new Anthropic({ timeout: 100_000, maxRetries: 1 });
 
   const response = await client.messages.create({
     model: "claude-opus-4-8",
