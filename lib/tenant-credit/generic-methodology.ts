@@ -76,6 +76,31 @@ const RULES: Rule[] = [
     category: "ignore",
     reason: "'Other income' is typically non-operating; audit before including",
   },
+  // QuickBooks-style EBIT-level subtotal ("Net Ordinary Income" /
+  // "Ordinary Income"), sitting ABOVE Other Income/Expense and thus
+  // above the statement's true bottom line. Must be excluded before
+  // the generic sales catch-all below, which would otherwise match it
+  // on the word "Income" and misreport it as revenue — the exact bug
+  // that put Ethema's -$551K EBIT in the Sales column instead of its
+  // real $1,365K revenue (2026-07-02). Deliberately NOT routed to
+  // net_income either: the true bottom-line "Net Income" line already
+  // feeds EBITDA correctly, and adding this one too would double it.
+  {
+    pattern: /\b(net )?ordinary income\b/,
+    category: "ignore",
+    reason: "EBIT-level subtotal (operating income before non-operating items), not top-line revenue",
+  },
+  // Standard QuickBooks top-line revenue total — the sum of every
+  // revenue account before COGS/expenses. Must run BEFORE the blanket
+  // "total" ignore rule below, since this exact label always starts
+  // with "Total" and would otherwise be discarded as a subtotal,
+  // leaving Sales with nothing to match at all on chart-of-accounts
+  // statements where every revenue line is "Total <account> · ...".
+  {
+    pattern: /^total income$/,
+    category: "sales",
+    reason: "QuickBooks top-line revenue total (sum of all revenue accounts)",
+  },
   // Subtotals: would double-count.
   {
     pattern: /\btotal\b/,
