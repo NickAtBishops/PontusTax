@@ -31,7 +31,10 @@ export type RunStatus =
  *                  extraction (cheaper/faster, only known vendor families). */
 export const TAX_ENGINES = ["skyvern", "playwright"] as const;
 export type TaxEngine = (typeof TAX_ENGINES)[number];
-export const DEFAULT_TAX_ENGINE: TaxEngine = "skyvern";
+// Playwright is the only engine selectable from the upload UI now
+// (see upload-card.tsx). "skyvern" stays in TAX_ENGINES so historical
+// runs that used it still type-check and display correctly.
+export const DEFAULT_TAX_ENGINE: TaxEngine = "playwright";
 
 export interface RunTotals {
   rows: number;
