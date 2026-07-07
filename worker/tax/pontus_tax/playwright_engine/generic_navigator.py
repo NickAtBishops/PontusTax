@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any
 
 from ..config import Config
@@ -62,6 +63,20 @@ log = logging.getLogger("pontus_tax.playwright.generic_navigator")
 # need many steps — if it does, something is wrong and burning more
 # calls won't fix it.
 _MAX_STEPS = 8
+
+# How long to give a page to render its FIRST real content before
+# spending any of the _MAX_STEPS decision budget on it. Observed live
+# (2026-07-07): some county sites take 10-15s just to paint anything
+# beyond a bare shell, which used to burn 3-5 of the 8 available steps
+# on nothing but "wait" — either exhausting the budget mid-render, or
+# worse, getting judged an empty dead end before it ever had a chance
+# to finish (the model has no way to tell "genuinely broken" apart
+# from "slow" from a single snapshot). This polls BEFORE the decision
+# loop starts, so by the time the model sees the page, slow-but-normal
+# rendering has already had a fair window — the loop's own "wait"
+# action is still the backstop for anything slower than this.
+_INITIAL_SETTLE_TIMEOUT_S = 20.0
+_INITIAL_SETTLE_POLL_S = 1.5
 
 # Reused from grant_street.py's bot-challenge detection — duplicated
 # rather than imported to keep this module fully independent of any
@@ -201,6 +216,7 @@ class GenericNavigator:
             # '_pw_impl_instance_'" and killed the whole row. A plain
             # lambda has a __dict__, so it works.
             page.context.on("page", lambda p: new_pages.append(p))
+            await self._wait_for_initial_settle(page)
             last_action = "none"
             last_reason = "no step ran"
             for step in range(_MAX_STEPS):
@@ -305,6 +321,26 @@ class GenericNavigator:
             )
 
     # ---- internals --------------------------------------------------------
+
+    async def _wait_for_initial_settle(self, page: Any) -> None:
+        """Poll for a STABLE non-empty snapshot (identical content on two
+        consecutive polls, mirroring grant_street.py's own settle check)
+        for up to _INITIAL_SETTLE_TIMEOUT_S before ever asking the model
+        to look at the page. Gives up silently once the timeout elapses
+        — the decision loop's "wait" action is still there as a backstop
+        for anything that needs even longer."""
+        deadline = time.monotonic() + _INITIAL_SETTLE_TIMEOUT_S
+        last_snapshot: str | None = None
+        while time.monotonic() < deadline:
+            try:
+                snapshot = await page.aria_snapshot(mode="ai")
+            except Exception:  # noqa: BLE001
+                snapshot = ""
+            stripped = snapshot.strip()
+            if stripped and stripped == last_snapshot:
+                return
+            last_snapshot = stripped
+            await page.wait_for_timeout(int(_INITIAL_SETTLE_POLL_S * 1000))
 
     async def _decide(
         self, snapshot: str, row: RowContext, step: int
