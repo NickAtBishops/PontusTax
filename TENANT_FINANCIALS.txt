@@ -1,0 +1,52 @@
+THE TENANT FINANCIALS PROJECT (Tenant Credit Tracker)
+
+Why it exists
+Pontus Capital is a commercial real-estate landlord, and its core portfolio
+risk is whether tenants can keep paying rent. Analysts track each tenant's
+financial health in a master Excel workbook, "Corporate Financials and P&Ls":
+roughly 24 tenants, one row each, and for every quarter seven raw numbers
+must be keyed in per tenant — Sales, EBITDA, Interest, Rent, Cash, CFO, and
+Capex, in thousands of dollars. The workbook's actual credit signals (EBITDA
+margin, EBITDAR, rent coverage, leverage, free cash flow) are Excel formulas
+that recompute once those seven inputs land. Each quarter, analysts receive
+heterogeneous statements — PDF income statements, Excel P&Ls, balance sheets —
+and hand-key the numbers. The Tenant Credit Tracker automates that data
+entry. It replaces the typing, not the analyst's judgment.
+
+How it works
+The tool lives at /tenant-credit in the same Next.js app as the property-tax
+checker (merged June 2026). The analyst uploads the tracker workbook — the
+tenant roster is read live from column A — picks a quarter (Q1 2023 through
+Q4 2028), then attaches statements per tenant or drops a zip that is routed
+by filename, with a "Triage" review table as the default so every file is
+confirmed before it lands on a tenant. Each file is sent once to Claude
+(claude-opus-4-8 with structured outputs): PDFs as native document blocks,
+Excel files flattened to text first. Claude returns verbatim {label, amount}
+line items: raw dollars, expense magnitudes positive, Net Income the only
+signed value. A pure keyword-rule engine (computeGeneric) then classifies
+every line through ordered regex rules and computes the seven metrics for
+any tenant, no per-tenant configuration needed. The rule ordering encodes
+hard-won lessons: QuickBooks subtotals like "Net Ordinary Income" are
+excluded (one once polluted Sales with an EBIT figure), "Total Income" wins
+over its constituent lines to prevent double-counting, intercompany
+management fees are logged but never summed, and every unmatched label
+surfaces in an audit list rather than vanishing.
+
+Writeback and safety
+Writeback happens in-process with ExcelJS and verifies everything before
+writing anything: the "Corp Financials " sheet (trailing space is real), the
+tenant's name in column A, and an exact quarter header match. Any failure
+returns 422 and nothing is written. Formula cells are never touched;
+overwriting a hand-entered value is a warning, not an error. The uploaded
+workbook is never modified — the response is a fresh, timestamped download.
+Every writeback is audit-logged to Firestore (tenant_tracker_runs, with full
+line items and calculation traces), and production refuses to write without
+that audit trail.
+
+Current state
+The only external dependencies are the Anthropic API and Firestore; there is
+no queue, worker, or cron. The site is intentionally unauthenticated, so
+audit attribution defaults to "pending-auth". The engine is best-effort by
+design — analysts review Sales and EBITDA before accepting a write. Recent
+work added inline Excel previews, timeout fixes for dense spreadsheets, the
+Sales-subtotal misclassification fix, and the engine's first automated tests.
