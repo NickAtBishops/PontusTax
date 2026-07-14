@@ -65,8 +65,12 @@ export function ExcelPreviewTable({ file }: { file: File }) {
           const colCount = Math.min(maxCol, MAX_COLS);
           const rows: string[][] = [];
           let rowCount = 0;
+          let hitRowCap = false;
           ws.eachRow({ includeEmpty: false }, (row) => {
-            if (rowCount >= MAX_ROWS) return;
+            if (rowCount >= MAX_ROWS) {
+              hitRowCap = true;
+              return;
+            }
             rowCount += 1;
             const cells: string[] = [];
             for (let c = 1; c <= colCount; c++) {
@@ -77,7 +81,7 @@ export function ExcelPreviewTable({ file }: { file: File }) {
           return {
             name: ws.name,
             rows,
-            truncated: rowCount >= MAX_ROWS || maxCol > MAX_COLS,
+            truncated: hitRowCap || maxCol > MAX_COLS,
           };
         });
         if (!cancelled) setSheets(parsed.filter((s) => s.rows.length > 0));
