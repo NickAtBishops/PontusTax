@@ -35,6 +35,10 @@ export type LineCategory =
 export type CategoryDecision = {
   category: LineCategory;
   reason: string;
+  // The line is the statement's own sum of other lines in the same
+  // bucket (e.g. QuickBooks "Total Income"). computeGeneric keeps the
+  // subtotal and drops its constituents when both appear.
+  subtotal?: boolean;
 };
 
 type Rule = {
@@ -43,15 +47,16 @@ type Rule = {
   pattern: RegExp;
   category: LineCategory;
   reason: string;
+  subtotal?: true;
 };
 
 const RULES: Rule[] = [
   // -- HARD EXCLUDES first; the include rules below must not catch them.
   // Intercompany pairs net to zero; logged, never math.
   {
-    pattern: /\bintercompany\b|\binter-company\b/,
+    pattern: /\bintercompany\b|\binter-company\b|\binterco\b/,
     category: "intercompany",
-    reason: "label contains 'intercompany'",
+    reason: "label contains 'intercompany' (or its common 'interco' shorthand)",
   },
   {
     pattern: /\bmanagement (income|fee|fees)\b/,
@@ -90,16 +95,27 @@ const RULES: Rule[] = [
     category: "ignore",
     reason: "EBIT-level subtotal (operating income before non-operating items), not top-line revenue",
   },
-  // Standard QuickBooks top-line revenue total — the sum of every
-  // revenue account before COGS/expenses. Must run BEFORE the blanket
-  // "total" ignore rule below, since this exact label always starts
-  // with "Total" and would otherwise be discarded as a subtotal,
-  // leaving Sales with nothing to match at all on chart-of-accounts
-  // statements where every revenue line is "Total <account> · ...".
+  // Standard top-line revenue total — the sum of every revenue account
+  // before COGS/expenses. Must run BEFORE the blanket "total" ignore
+  // rule below, since these labels always start with "Total" and would
+  // otherwise be discarded as a subtotal, leaving Sales with nothing to
+  // match at all on chart-of-accounts statements where every revenue
+  // line is "Total <account> · ...". Covers QuickBooks' "Total Income"
+  // as well as the "Total Revenue" / "Total Sales" phrasing common
+  // outside QuickBooks (e.g. a healthcare P&L that builds up to a
+  // "Total Revenue" line from Net Revenue + Grant Revenue + Other
+  // Income — without matching that label too, the constituents survive
+  // individually via the "net revenue" / loose-income rules below and
+  // double-count against the real total; verified against a real
+  // Oceans Healthcare statement, 2026-07-14).
+  // Marked `subtotal` so that on expanded statements — where the
+  // individual revenue lines ALSO classify as sales — computeGeneric
+  // keeps only this line instead of doubling the metric.
   {
-    pattern: /^total income$/,
+    pattern: /^total (income|revenue|sales|net sales)$/,
     category: "sales",
-    reason: "QuickBooks top-line revenue total (sum of all revenue accounts)",
+    reason: "top-line revenue total (sum of all revenue accounts)",
+    subtotal: true,
   },
   // Subtotals: would double-count.
   {
@@ -107,10 +123,17 @@ const RULES: Rule[] = [
     category: "ignore",
     reason: "subtotal line; would double-count",
   },
+  // "Gross Income" (not just "Gross Profit"/"Gross Margin") is a real
+  // label on cost-plus P&Ls (e.g. a fuel distributor's gross profit on
+  // fuel after cost of fuel) and matched the loose sales catch-all below
+  // via the word "income" alone before this covered it — verified
+  // against a real GPM Investments statement, 2026-07-14, where it was
+  // the ONLY line reaching the sales bucket and understated Sales by
+  // roughly three orders of magnitude.
   {
-    pattern: /\b(gross|operating) (profit|margin)\b/,
+    pattern: /\b(gross|operating) (profit|margin|income)\b/,
     category: "ignore",
-    reason: "computed metric, not a raw line item",
+    reason: "computed metric (gross profit/margin), not a raw revenue line item",
   },
 
   // -- Balance sheet: CASH ---------------------------------------------
@@ -161,10 +184,25 @@ const RULES: Rule[] = [
     category: "interest_expense",
     reason: "interest expense (added back for EBITDA; written to Interest col)",
   },
+  // Balance-sheet rent items (deposits/receivables/prepaid) are not a
+  // current-period expense; exclude them before the broad rent match
+  // below catches them on the word "rent" alone.
+  {
+    pattern: /\brent (receivable|deposit)\b|\bprepaid rent\b/,
+    category: "ignore",
+    reason: "balance-sheet rent asset (receivable/deposit/prepaid), not a current-period expense",
+  },
   // Rent expense same shape: feeds EBITDA-neutral (rent is operating, so
   // NOT added back for plain EBITDA), but populates the Rent tracker col.
+  // Matches bare "Rent" too, not just "Rent Expense" — real statements
+  // very commonly just label the line "Rent" or "Rent - <location>"
+  // (verified against a real tenant PDF, 2026-07-14, where the old
+  // "rent (expense|paid|cost)" pattern left the Rent column blank
+  // despite a real dollar figure on the page). The "rent income"
+  // exclusion earlier in this list already runs first, so landlord-side
+  // rent income is still safe.
   {
-    pattern: /\brent (expense|paid|cost)\b|\blease (expense|cost)\b/,
+    pattern: /\brent\b|\blease (expense|cost)\b/,
     category: "rent_expense",
     reason: "rent expense (written to Rent col; not an EBITDA addback)",
   },
@@ -212,7 +250,11 @@ export function classifyLineItem(label: string): CategoryDecision {
   const norm = normalize(label);
   for (const rule of RULES) {
     if (rule.pattern.test(norm)) {
-      return { category: rule.category, reason: rule.reason };
+      return {
+        category: rule.category,
+        reason: rule.reason,
+        subtotal: rule.subtotal ?? false,
+      };
     }
   }
   return { category: "ignore", reason: "no rule matched; assumed non-revenue" };
@@ -374,6 +416,32 @@ export function computeGeneric(items: LineItem[]): ComputeResult {
     bucket.push(item);
     byCategory.set(c, bucket);
   }
+
+  // Subtotal-vs-constituent dedup. A line matched by a `subtotal` rule
+  // (QuickBooks "Total Income") is the statement's own sum of the other
+  // lines in its bucket. On chart-of-accounts statements the
+  // constituents all carry "Total <account>" labels and get ignored, so
+  // the subtotal is the bucket's only line — but on standard expanded
+  // statements the constituents survive classification too, and summing
+  // both would exactly double the metric. Keep the subtotal (it also
+  // survives an extractor that missed a constituent) and drop the rest,
+  // logging them so the audit view shows why they didn't contribute.
+  const droppedConstituents: string[] = [];
+  for (const [category, bucket] of byCategory) {
+    const subtotals = bucket.filter(
+      (i) => classifications.get(i.label)?.subtotal,
+    );
+    if (subtotals.length === 0 || subtotals.length === bucket.length) continue;
+    for (const item of bucket) {
+      if (!classifications.get(item.label)?.subtotal) {
+        droppedConstituents.push(
+          `${item.label} (already summed into the statement's own subtotal; dropped to avoid double-count)`,
+        );
+      }
+    }
+    byCategory.set(category, subtotals);
+  }
+
   const grab = (c: LineCategory) => byCategory.get(c) ?? [];
 
   // Sales: every operating-revenue line, summed.
@@ -444,9 +512,36 @@ export function computeGeneric(items: LineItem[]): ComputeResult {
 
   const intercompany_observed = findIntercompanyPairs(items, classifications);
 
-  const unused_labels = items
-    .filter((i) => classifications.get(i.label)?.category === "ignore")
-    .map((i) => `${i.label} (${classifications.get(i.label)?.reason})`);
+  // Every intercompany line that DIDN'T land in a pair above is excluded
+  // from every metric (correctly — intercompany items never feed Sales/
+  // EBITDA/etc) but was, until now, invisible: its category isn't
+  // "ignore" so it never showed up below, and with no counterpart it
+  // never showed up in intercompany_observed either. Surface it
+  // explicitly so the analyst can see the line existed and was
+  // deliberately excluded, rather than silently disappearing.
+  const pairedLabels = new Set<string>();
+  for (const obs of intercompany_observed) {
+    pairedLabels.add(obs.income_label);
+    pairedLabels.add(obs.expense_label);
+  }
+  const orphanedIntercompany = items
+    .filter(
+      (i) =>
+        classifications.get(i.label)?.category === "intercompany" &&
+        !pairedLabels.has(i.label),
+    )
+    .map(
+      (i) =>
+        `${i.label} (intercompany line; excluded from every metric — no matching counterpart found to log as a pair)`,
+    );
+
+  const unused_labels = [
+    ...items
+      .filter((i) => classifications.get(i.label)?.category === "ignore")
+      .map((i) => `${i.label} (${classifications.get(i.label)?.reason})`),
+    ...droppedConstituents,
+    ...orphanedIntercompany,
+  ];
 
   return {
     sales: salesTrace.result_tracker,

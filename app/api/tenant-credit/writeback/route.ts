@@ -113,6 +113,28 @@ function tenantNameSubstring(tenantName: string): string {
   return tenantName.split(/[\s,]+/, 1)[0] ?? tenantName;
 }
 
+// Does the entity name Claude read off the actual statement resemble the
+// tenant we're about to write into? This is NOT the same check as
+// tenantNameSubstring above — that one re-derives its expected value from
+// the SAME tracker upload the picker came from, so it can only catch a
+// stale/out-of-sync tracker, never the wrong PDF attached to the right
+// tenant row. Most real tenant filenames don't contain the tenant's name
+// at all, so that assignment is manual (Triage picker) and this is the
+// one check that looks at what was actually extracted. Soft only —
+// legal-entity names drift too much (subsidiaries, DBAs, recently
+// acquired properties still showing the seller's name) to hard-refuse on.
+function entityLooksLikeTenant(sourceEntity: string, tenantName: string): boolean {
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const tokens = (s: string) => norm(s).split(" ").filter((t) => t.length >= 4);
+  const entityTokens = tokens(sourceEntity);
+  const tenantTokens = tokens(tenantName);
+  if (entityTokens.length === 0 || tenantTokens.length === 0) return true;
+  return (
+    entityTokens.some((t) => tenantTokens.includes(t)) ||
+    tenantTokens.some((t) => entityTokens.includes(t))
+  );
+}
+
 function timestamp(): string {
   const now = new Date();
   const p = (n: number) => String(n).padStart(2, "0");
@@ -388,7 +410,10 @@ export async function POST(req: Request) {
     const reasons: string[] = [];
     const entryWarnings: string[] = [];
 
-    // Tenant identity check on column A.
+    // Tenant identity check on column A. This only proves the picker and
+    // the CURRENT tracker upload agree with each other; it cannot catch
+    // the wrong PDF being attached to the right tenant row (see
+    // entityLooksLikeTenant below for that).
     const nameText = cellPlainText(sheet.getCell(entry.tracker_row, 1).value);
     const needle = tenantNameSubstring(entry.tenant_display_name);
     if (!nameText.toLowerCase().includes(needle.toLowerCase())) {
@@ -398,6 +423,18 @@ export async function POST(req: Request) {
           "out of sync with the uploaded tracker.",
       );
     }
+
+    // Source-entity check: the one defense against a mis-assigned file
+    // in Triage. Soft (warning, not refusal) — see entityLooksLikeTenant.
+    const sourceEntity = entry.audit.source_entity;
+    if (sourceEntity && !entityLooksLikeTenant(sourceEntity, entry.tenant_display_name)) {
+      entryWarnings.push(
+        `The extracted statement's entity ("${sourceEntity}") doesn't obviously ` +
+          `match tenant "${entry.tenant_display_name}". Double-check the right ` +
+          "file was attached to this row before trusting these numbers.",
+      );
+    }
+
     // Header + cell checks per metric we intend to write.
     for (const metric of WRITABLE_METRICS) {
       if (entry.values[metric] == null) continue;
@@ -478,40 +515,75 @@ export async function POST(req: Request) {
   const filename = `Corporate_Financials_and_P_Ls_${quarterId}_${timestamp()}.xlsx`;
 
   // Audit each tenant's run BEFORE returning. Each entry gets its own
-  // tenant_tracker_runs document; warnings collected for the entry
-  // ride along on worker_warnings. The whole batch refuses if Firestore
-  // is configured AND any audit write fails — same correctness rule as
-  // the per-tenant route used.
-  for (const entry of entries) {
-    const entryWarnings =
-      warnings
-        .find((w) => w.entry.tenant_id === entry.tenant_id)
-        ?.messages ?? [];
-    try {
-      await writeAuditRun({
+  // tenant_tracker_runs document; warnings collected for the entry ride
+  // along on worker_warnings. These are NOT one atomic transaction across
+  // tenants (each is its own top-level Firestore document), so if one
+  // fails we cannot un-write the ones that already succeeded.
+  // Promise.allSettled runs them all concurrently (rather than stopping
+  // at the first failure) so a single bad write doesn't hide the rest,
+  // and if any fail, the error response names every tenant whose audit
+  // doc is now stale — written with status "writeback_success" even
+  // though the workbook was never delivered — so that's visible to
+  // whoever reads the failure, not silently true.
+  const auditSettled = await Promise.allSettled(
+    entries.map(async (entry) => {
+      const entryWarnings =
+        warnings.find((w) => w.entry.tenant_id === entry.tenant_id)?.messages ?? [];
+      const id = await writeAuditRun({
         ...entry.audit,
         worker_warnings: entryWarnings,
         written_filename: filename,
       });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return NextResponse.json(
-        {
-          error:
-            `Wrote ${filename} but the audit-log write to Firestore failed ` +
-            `for "${entry.tenant_display_name}": ${msg}. Re-run after ` +
-            "fixing Firestore; the master tracker was not modified.",
-        },
-        { status: 500 },
-      );
-    }
+      return { id };
+    }),
+  );
+  const zipped = entries.map((entry, i) => ({ entry, result: auditSettled[i] }));
+  const auditFailures = zipped.filter(({ result }) => result.status === "rejected");
+
+  if (auditFailures.length > 0) {
+    const failedNames = auditFailures.map(({ entry }) => entry.tenant_display_name);
+    const staleSuccessNames = zipped
+      .filter(({ result }) => result.status === "fulfilled")
+      .map(({ entry }) => entry.tenant_display_name);
+    const reasons = auditFailures.map(({ result }) => {
+      const reason = (result as PromiseRejectedResult).reason;
+      return reason instanceof Error ? reason.message : String(reason);
+    });
+    return NextResponse.json(
+      {
+        error:
+          `Wrote ${filename} in memory, but the audit-log write to Firestore ` +
+          `failed for ${auditFailures.length} of ${entries.length} tenant(s) ` +
+          `(${failedNames.join(", ")}): ${reasons.join("; ")}. ` +
+          "The workbook was never sent to you, so your copy of the tracker is " +
+          "unchanged. Re-run after fixing Firestore." +
+          (staleSuccessNames.length > 0
+            ? ` NOTE: Firestore now has a "writeback_success" audit record from ` +
+              `this same failed attempt for ${staleSuccessNames.join(", ")} — those ` +
+              "records are stale (no file was ever delivered) and should be " +
+              "disregarded if reviewed later."
+            : ""),
+      },
+      { status: 500 },
+    );
   }
+
+  const noAuditTrail = zipped.some(
+    ({ result }) => result.status === "fulfilled" && result.value.id === null,
+  );
 
   // Aggregate warnings into the X-Worker-Warnings header so the
   // existing client-side toast logic still surfaces them.
   const headerWarnings = warnings.flatMap((w) =>
     w.messages.map((m) => `[${w.entry.tenant_display_name}] ${m}`),
   );
+  if (noAuditTrail) {
+    headerWarnings.push(
+      "This write has NO Firestore audit trail (Firestore isn't configured " +
+        "in this environment). If this is a production run, check " +
+        "FIREBASE_SERVICE_ACCOUNT_KEY.",
+    );
+  }
   const headers = new Headers({
     "Content-Type":
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

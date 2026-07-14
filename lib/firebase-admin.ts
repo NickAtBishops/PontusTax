@@ -63,13 +63,20 @@ export function adminProjectId(): string {
 // without a trail. Keep both helpers; the tax checker prefers the
 // throwing adminDb() so its API routes fail loudly when Firestore is
 // misconfigured.
-let cachedAdminDbNullable: Firestore | null | undefined;
+// Only the SUCCESS case is cached. Under Fluid Compute, lambda instances
+// are reused across requests, so caching a failure here would let one
+// transient error (a cold-start race reading the env var, a momentary
+// cert() parse hiccup) silently disable the audit log for that
+// instance's entire remaining lifetime. A permanent misconfiguration
+// just keeps re-throwing on every call, which is cheap (no network I/O
+// before the throw) and correct.
+let cachedAdminDb: Firestore | undefined;
 export function getAdminDb(): Firestore | null {
-  if (cachedAdminDbNullable !== undefined) return cachedAdminDbNullable;
+  if (cachedAdminDb !== undefined) return cachedAdminDb;
   try {
-    cachedAdminDbNullable = adminDb();
+    cachedAdminDb = adminDb();
+    return cachedAdminDb;
   } catch {
-    cachedAdminDbNullable = null;
+    return null;
   }
-  return cachedAdminDbNullable;
 }

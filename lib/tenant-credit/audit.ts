@@ -90,6 +90,12 @@ export type RunSummary = {
   computed_ebitda: number;
   status: AuditRunInput["status"];
   worker_warnings: string[];
+  // Already stored on the parent doc (see writeAuditRun below) but
+  // wasn't selected into this summary type, so the History UI had no
+  // way to show what the classifier dropped on a past run without
+  // fetching the run's subcollections. Cheap to include here since it
+  // lives on the same doc read.
+  unused_labels: string[];
   error: string | null;
   written_by: string;
   written_filename: string;
@@ -231,6 +237,9 @@ export async function listRecentRuns(limit: number = 20): Promise<RunSummary[]> 
       status: (d.status ?? "writeback_failed") as RunSummary["status"],
       worker_warnings: Array.isArray(d.worker_warnings)
         ? (d.worker_warnings as string[])
+        : [],
+      unused_labels: Array.isArray(d.unused_labels)
+        ? (d.unused_labels as string[])
         : [],
       error: d.error == null ? null : String(d.error),
       written_by: String(d.written_by ?? ""),

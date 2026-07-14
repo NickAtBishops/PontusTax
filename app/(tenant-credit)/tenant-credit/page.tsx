@@ -212,6 +212,8 @@ type RunSummary = {
   computed_sales: number;
   computed_ebitda: number;
   status: "writeback_success" | "writeback_failed";
+  worker_warnings: string[];
+  unused_labels: string[];
   error: string | null;
   written_by: string;
   written_filename: string;
@@ -321,12 +323,16 @@ function randomId(): string {
 // report the same label with different amounts, pick the one with the
 // largest absolute value. The intuition: a full P&L usually has bigger
 // magnitudes than a partial schedule, so largest-wins picks the
-// authoritative source most of the time. The audit log records every
-// contribution so the analyst can spot the rare wrong-pick.
+// authoritative source most of the time. `conflicts` records every
+// label that disagreed across files (all values seen, which one won) —
+// previously only the winning value ever reached the audit log, so a
+// genuine restatement (not just a duplicate file) could be discarded
+// with no trace anywhere.
 function mergeLineItems(
   extracts: ExtractResponse[],
-): { label: string; amount: number }[] {
+): { merged: { label: string; amount: number }[]; conflicts: string[] } {
   const winners = new Map<string, { amount: number; absAmount: number }>();
+  const seenAmounts = new Map<string, number[]>();
   for (const ex of extracts) {
     for (const item of ex.line_items) {
       const key = item.label.trim();
@@ -336,12 +342,31 @@ function mergeLineItems(
       if (cur === undefined || abs > cur.absAmount) {
         winners.set(key, { amount: item.amount, absAmount: abs });
       }
+      const list = seenAmounts.get(key) ?? [];
+      list.push(item.amount);
+      seenAmounts.set(key, list);
     }
   }
-  return Array.from(winners.entries()).map(([label, v]) => ({
-    label,
-    amount: v.amount,
-  }));
+  const conflicts: string[] = [];
+  for (const [label, amounts] of seenAmounts) {
+    const distinct = new Set(amounts.map((a) => a.toFixed(2)));
+    if (distinct.size <= 1) continue;
+    const winner = winners.get(label)!.amount;
+    const discarded = amounts.filter((a) => a !== winner);
+    conflicts.push(
+      `"${label}" reported ${distinct.size} different values across the ` +
+        `attached files (${amounts.map((a) => a.toLocaleString()).join(", ")}); ` +
+        `kept the largest-magnitude one (${winner.toLocaleString()}), discarded ` +
+        `${discarded.map((a) => a.toLocaleString()).join(", ")}.`,
+    );
+  }
+  return {
+    merged: Array.from(winners.entries()).map(([label, v]) => ({
+      label,
+      amount: v.amount,
+    })),
+    conflicts,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -991,7 +1016,10 @@ export default function TenantCreditPage() {
             ...prev,
             [row]: { ...prev[row], status: "computing", extracts },
           }));
-          const merged = mergeLineItems(extracts);
+          const { merged, conflicts: mergeConflicts } = mergeLineItems(extracts);
+          for (const c of mergeConflicts) {
+            toast.warning(`${entry.tenant.display_name}: ${c}`);
+          }
           const computeRes = await fetch("/api/tenant-credit/compute", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1055,7 +1083,7 @@ export default function TenantCreditPage() {
         tenantsWithData.map(async (s) => {
           const c = s.compute!;
           const first = s.extracts[0] ?? null;
-          const merged = mergeLineItems(s.extracts);
+          const { merged, conflicts: mergeConflicts } = mergeLineItems(s.extracts);
           const filenames = s.files.map((f) => f.name).join(", ");
           const hashes = await Promise.all(
             s.files.map((f) => sha256Hex(f.file).catch(() => "")),
@@ -1078,7 +1106,7 @@ export default function TenantCreditPage() {
             line_items: merged,
             normalization_applied: first?.normalization_applied ?? [],
             passed_through: first?.passed_through ?? [],
-            unused_labels: c.unused_labels,
+            unused_labels: [...c.unused_labels, ...mergeConflicts],
             intercompany_observed: c.intercompany_observed,
             // Per-file metadata for the audit log. Kept verbatim so a
             // future schema can move it into its own Firestore field
@@ -2033,37 +2061,56 @@ function HistoryCard(props: {
                   <TableHead className="text-right">Sales</TableHead>
                   <TableHead className="text-right">EBITDA</TableHead>
                   <TableHead>Status</TableHead>
+                  <TableHead>Flags</TableHead>
                   <TableHead>By</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {props.runs.map((r) => (
-                  <TableRow key={r.id}>
-                    <TableCell className="font-mono text-xs">
-                      {r.created_at != null
-                        ? new Date(r.created_at).toLocaleString()
-                        : "—"}
-                    </TableCell>
-                    <TableCell>{r.source_entity || r.tenant_id}</TableCell>
-                    <TableCell>{r.quarter}</TableCell>
-                    <TableCell className="text-right font-mono tabular-nums">
-                      {r.computed_sales.toLocaleString()}
-                    </TableCell>
-                    <TableCell className="text-right font-mono tabular-nums">
-                      {r.computed_ebitda.toLocaleString()}
-                    </TableCell>
-                    <TableCell>
-                      {r.status === "writeback_success" ? (
-                        <Badge variant="secondary">OK</Badge>
-                      ) : (
-                        <Badge variant="destructive">Failed</Badge>
-                      )}
-                    </TableCell>
-                    <TableCell className="text-xs text-neutral-600">
-                      {r.written_by}
-                    </TableCell>
-                  </TableRow>
-                ))}
+                {props.runs.map((r) => {
+                  // Previously written but never read back: unused_labels
+                  // and worker_warnings sat in Firestore invisibly once a
+                  // run left the current browser session. Surface a count
+                  // with the detail in a native tooltip rather than
+                  // building a full drill-down view.
+                  const flags = [
+                    ...r.unused_labels.map((l) => `dropped: ${l}`),
+                    ...r.worker_warnings.map((w) => `warning: ${w}`),
+                  ];
+                  return (
+                    <TableRow key={r.id}>
+                      <TableCell className="font-mono text-xs">
+                        {r.created_at != null
+                          ? new Date(r.created_at).toLocaleString()
+                          : "—"}
+                      </TableCell>
+                      <TableCell>{r.source_entity || r.tenant_id}</TableCell>
+                      <TableCell>{r.quarter}</TableCell>
+                      <TableCell className="text-right font-mono tabular-nums">
+                        {r.computed_sales.toLocaleString()}
+                      </TableCell>
+                      <TableCell className="text-right font-mono tabular-nums">
+                        {r.computed_ebitda.toLocaleString()}
+                      </TableCell>
+                      <TableCell>
+                        {r.status === "writeback_success" ? (
+                          <Badge variant="secondary">OK</Badge>
+                        ) : (
+                          <Badge variant="destructive">Failed</Badge>
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        {flags.length > 0 ? (
+                          <Badge variant="outline" title={flags.join("\n")}>
+                            {flags.length}
+                          </Badge>
+                        ) : null}
+                      </TableCell>
+                      <TableCell className="text-xs text-neutral-600">
+                        {r.written_by}
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
               </TableBody>
             </Table>
           )}
