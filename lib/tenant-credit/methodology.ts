@@ -20,6 +20,7 @@
 export type LineItem = {
   label: string;
   amount: number;
+  source_reference?: string;
 };
 
 // What units a number is in. Pinnacle's source PDF is in dollars; the

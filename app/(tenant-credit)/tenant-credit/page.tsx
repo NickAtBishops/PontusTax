@@ -6,7 +6,6 @@ import { unzipSync } from "fflate";
 import { Check, X } from "lucide-react";
 
 import {
-  clearAll as clearStoredBlobs,
   deleteBlob,
   getBlob,
   putBlob,
@@ -46,7 +45,11 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { ExcelPreviewTable } from "@/components/excel-preview-table";
 
+import { matchFileToTenant } from "@/lib/tenant-credit/file-routing";
+import { mergeLineItems } from "@/lib/tenant-credit/merge-line-items";
+import { inspectZipArchive } from "@/lib/tenant-credit/zip-safety";
 import {
   ALL_QUARTER_IDS,
   METRIC_LABELS,
@@ -60,13 +63,12 @@ import {
 // Types
 // ---------------------------------------------------------------------------
 
-type Mode = "quick" | "triage";
-
 // Tenant-side vs corporate-side classification per file. Recorded in
 // the audit log so future you can see whether a Q1 26 Sales number
 // came from the tenant entity directly or from a parent rollup.
 // Compute treats both the same today.
 type FileLevel = "tenant" | "corporate";
+type UnitsOverride = "auto" | "dollars" | "thousands" | "millions";
 
 type TenantPickerEntry = {
   display_name: string;
@@ -82,19 +84,56 @@ type TenantFile = {
   // server-side extraction path.
   kind: "pdf" | "xlsx";
   level: FileLevel;
+  unitsOverride: UnitsOverride;
 };
 
 type ExtractResponse = {
   tenant_id: string;
   source_entity: string;
   source_period: string;
-  line_items: { label: string; amount: number }[];
+  source_filename: string;
+  source_file_hash: string;
+  source_units: "dollars" | "thousands" | "millions";
+  source_units_evidence: string;
+  document_type:
+    | "income_statement"
+    | "balance_sheet"
+    | "cash_flow_statement"
+    | "combined_financial_statements"
+    | "other";
+  source_scope: string;
+  source_scope_type:
+    | "entity_wide"
+    | "component_subset"
+    | "single_component"
+    | "unknown";
+  source_scope_identifiers: string[];
+  period_selection:
+    | "printed_quarter_total"
+    | "summed_months"
+    | "single_period_column"
+    | "point_in_time";
+  line_items: {
+    label: string;
+    printed_amount: number;
+    amount: number;
+    source_reference: string;
+  }[];
   normalization_applied: {
     raw_label: string;
     canonical_label: string;
     match_type: "case_or_whitespace" | "alias";
   }[];
   passed_through: string[];
+  client_file_id?: string;
+};
+
+type ExcludedFile = {
+  file_id: string;
+  filename: string;
+  file_hash: string;
+  source_period: string;
+  reason: string;
 };
 
 type ComputeMetricTrace = {
@@ -144,6 +183,8 @@ type TenantState = {
   extracts: ExtractResponse[];
   compute: ComputeResponse | null;
   error: string | null;
+  approved: boolean;
+  excludedFiles: ExcludedFile[];
 };
 
 // Files dropped via zip in triage mode that haven't been assigned to a
@@ -157,16 +198,17 @@ type TriageEntry = {
   recommended_tenant_id: string | null;
   assigned_tenant_id: string | null;
   level: FileLevel;
+  unitsOverride: UnitsOverride;
 };
 
-// Persistent snapshot shape. Stored in localStorage as JSON; the raw
+// Persistent snapshot shape. Stored in per-tab sessionStorage as JSON; the raw
 // file Blobs live in IndexedDB keyed by file.id. The version field
 // makes it safe to evolve the schema later (older snapshots get
 // ignored when v doesn't match what the code expects).
-type SnapshotV1 = {
-  v: 1;
-  mode: Mode;
+type SnapshotV2 = {
+  v: 2;
   quarterId: QuarterId;
+  analystName: string;
   tracker: { name: string; size: number; idbKey: string } | null;
   tenants: TenantPickerEntry[];
   states: Record<
@@ -178,11 +220,14 @@ type SnapshotV1 = {
         name: string;
         kind: "pdf" | "xlsx";
         level: FileLevel;
+        unitsOverride: UnitsOverride;
       }[];
       status: TenantStatus;
       extracts: ExtractResponse[];
       compute: ComputeResponse | null;
       error: string | null;
+      approved: boolean;
+      excludedFiles: ExcludedFile[];
     }
   >;
   triage: {
@@ -192,11 +237,12 @@ type SnapshotV1 = {
     recommended_tenant_id: string | null;
     assigned_tenant_id: string | null;
     level: FileLevel;
+    unitsOverride: UnitsOverride;
   }[];
 };
 
-const SNAPSHOT_STORAGE_KEY = "pontus-tenant-credit-snapshot";
-const TRACKER_IDB_KEY = "tracker";
+const SNAPSHOT_STORAGE_PREFIX = "pontus-tenant-credit-snapshot";
+const WORKSPACE_SESSION_KEY = "pontus-tenant-credit-workspace";
 
 // One row of write-back history. Mirrors the route's RunSummary; the
 // audit module on the server persists these to Firestore so reloads
@@ -210,7 +256,9 @@ type RunSummary = {
   source_pdf_filename: string;
   computed_sales: number;
   computed_ebitda: number;
-  status: "writeback_success" | "writeback_failed";
+  status: "writeback_pending" | "writeback_success" | "writeback_failed";
+  worker_warnings: string[];
+  unused_labels: string[];
   error: string | null;
   written_by: string;
   written_filename: string;
@@ -221,14 +269,6 @@ type RunSummary = {
 // Helpers
 // ---------------------------------------------------------------------------
 
-async function sha256Hex(file: File): Promise<string> {
-  const buf = await file.arrayBuffer();
-  const digest = await crypto.subtle.digest("SHA-256", buf);
-  return Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
-
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
@@ -237,39 +277,6 @@ function formatBytes(n: number): string {
 
 function normalize(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-}
-
-function matchScore(filename: string, tenantName: string): number {
-  const fname = normalize(filename);
-  const tenant = normalize(tenantName);
-  if (!fname || !tenant) return 0;
-  let best = 0;
-  for (const token of tenant.split(/\s+/)) {
-    if (token.length < 4) continue;
-    if (fname.includes(token)) best = Math.max(best, token.length);
-  }
-  return best;
-}
-
-function matchPdfToTenant(
-  filename: string,
-  tenants: TenantPickerEntry[],
-): { winner: TenantPickerEntry | null; tied: boolean } {
-  let bestScore = 0;
-  let winner: TenantPickerEntry | null = null;
-  let tied = false;
-  for (const t of tenants) {
-    const score = matchScore(filename, t.display_name);
-    if (score === 0) continue;
-    if (score > bestScore) {
-      bestScore = score;
-      winner = t;
-      tied = false;
-    } else if (score === bestScore) {
-      tied = true;
-    }
-  }
-  return { winner: tied ? null : winner, tied };
 }
 
 async function mapWithConcurrency<T, R>(
@@ -294,17 +301,6 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
-function guessQuarter(periodHint: string): QuarterId {
-  const text = periodHint.toLowerCase();
-  for (const id of ALL_QUARTER_IDS) {
-    const [q, y] = id.split("_");
-    const yy = y.slice(2);
-    if (text.includes(`${q.toLowerCase()} ${y}`)) return id;
-    if (text.includes(`${q.toLowerCase()} ${yy}`)) return id;
-  }
-  return "Q1_2026";
-}
-
 function fileKind(name: string): "pdf" | "xlsx" | null {
   const n = name.toLowerCase();
   if (n.endsWith(".pdf")) return "pdf";
@@ -312,35 +308,17 @@ function fileKind(name: string): "pdf" | "xlsx" | null {
   return null;
 }
 
-function randomId(): string {
-  return Math.random().toString(36).slice(2, 10);
+function browserWorkspaceId(): string {
+  if (typeof window === "undefined") return "server";
+  const existing = window.sessionStorage.getItem(WORKSPACE_SESSION_KEY);
+  if (existing) return existing;
+  const created = crypto.randomUUID();
+  window.sessionStorage.setItem(WORKSPACE_SESSION_KEY, created);
+  return created;
 }
 
-// Merge line items from N extracts into one list. When two files
-// report the same label with different amounts, pick the one with the
-// largest absolute value. The intuition: a full P&L usually has bigger
-// magnitudes than a partial schedule, so largest-wins picks the
-// authoritative source most of the time. The audit log records every
-// contribution so the analyst can spot the rare wrong-pick.
-function mergeLineItems(
-  extracts: ExtractResponse[],
-): { label: string; amount: number }[] {
-  const winners = new Map<string, { amount: number; absAmount: number }>();
-  for (const ex of extracts) {
-    for (const item of ex.line_items) {
-      const key = item.label.trim();
-      if (!key) continue;
-      const abs = Math.abs(item.amount);
-      const cur = winners.get(key);
-      if (cur === undefined || abs > cur.absAmount) {
-        winners.set(key, { amount: item.amount, absAmount: abs });
-      }
-    }
-  }
-  return Array.from(winners.entries()).map(([label, v]) => ({
-    label,
-    amount: v.amount,
-  }));
+function randomId(workspaceId: string): string {
+  return `${workspaceId}:${crypto.randomUUID()}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -348,15 +326,16 @@ function mergeLineItems(
 // ---------------------------------------------------------------------------
 
 export default function TenantCreditPage() {
-  // Triage is the default since most analysts dump a zip and want
-  // to review each file before it lands on a tenant. Quick mode is
-  // there for the case where filenames are already clean and the
-  // analyst trusts the auto-router.
-  const [mode, setMode] = useState<Mode>("triage");
+  const [workspaceId] = useState(browserWorkspaceId);
+  const snapshotStorageKey = `${SNAPSHOT_STORAGE_PREFIX}:${workspaceId}`;
+  const [trackerIdbKey, setTrackerIdbKey] = useState(() =>
+    randomId(workspaceId),
+  );
   const [trackerFile, setTrackerFile] = useState<File | null>(null);
   const [tenants, setTenants] = useState<TenantPickerEntry[]>([]);
   const [tenantsLoading, setTenantsLoading] = useState(false);
   const [quarterId, setQuarterId] = useState<QuarterId>("Q1_2026");
+  const [analystName, setAnalystName] = useState("");
   const [states, setStates] = useState<Record<number, TenantState>>({});
   const [triage, setTriage] = useState<TriageEntry[]>([]);
   const [running, setRunning] = useState(false);
@@ -413,7 +392,7 @@ export default function TenantCreditPage() {
   }, []);
 
   // ----- Tab-survival persistence ---------------------------------------
-  // On mount: load the snapshot from localStorage + reconstruct File
+  // On mount: load the snapshot from sessionStorage + reconstruct File
   // objects from IndexedDB. On every state change after that: persist
   // the snapshot back. The hydrated flag prevents the first synchronous
   // empty state from being saved over the real saved snapshot before
@@ -423,16 +402,17 @@ export default function TenantCreditPage() {
     let cancelled = false;
     (async () => {
       try {
-        const raw = window.localStorage.getItem(SNAPSHOT_STORAGE_KEY);
+        const raw = window.sessionStorage.getItem(snapshotStorageKey);
         if (!raw) return;
-        const snap = JSON.parse(raw) as SnapshotV1;
-        if (snap?.v !== 1) return;
+        const snap = JSON.parse(raw) as SnapshotV2;
+        if (snap?.v !== 2) return;
 
         const trackerMime =
           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 
         let restoredTracker: File | null = null;
         if (snap.tracker) {
+          setTrackerIdbKey(snap.tracker.idbKey);
           const blob = await getBlob(snap.tracker.idbKey);
           if (blob) {
             restoredTracker = new File([blob], snap.tracker.name, {
@@ -456,6 +436,7 @@ export default function TenantCreditPage() {
               name: fm.name,
               kind: fm.kind,
               level: fm.level,
+              unitsOverride: fm.unitsOverride ?? "auto",
             });
           }
           restoredStates[row] = {
@@ -468,6 +449,8 @@ export default function TenantCreditPage() {
             extracts: s.extracts,
             compute: s.compute,
             error: s.error,
+            approved: false,
+            excludedFiles: s.excludedFiles ?? [],
           };
         }
 
@@ -484,12 +467,13 @@ export default function TenantCreditPage() {
             recommended_tenant_id: t.recommended_tenant_id,
             assigned_tenant_id: t.assigned_tenant_id,
             level: t.level,
+            unitsOverride: t.unitsOverride ?? "auto",
           });
         }
 
         if (cancelled) return;
-        setMode(snap.mode);
         setQuarterId(snap.quarterId);
+        setAnalystName(snap.analystName ?? "");
         setTrackerFile(restoredTracker);
         setTenants(snap.tenants);
         setStates(restoredStates);
@@ -503,21 +487,21 @@ export default function TenantCreditPage() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [snapshotStorageKey]);
 
   useEffect(() => {
     if (!hydrated) return;
     const handle = window.setTimeout(async () => {
       try {
-        const snap: SnapshotV1 = {
-          v: 1,
-          mode,
+        const snap: SnapshotV2 = {
+          v: 2,
           quarterId,
+          analystName,
           tracker: trackerFile
             ? {
                 name: trackerFile.name,
                 size: trackerFile.size,
-                idbKey: TRACKER_IDB_KEY,
+                idbKey: trackerIdbKey,
               }
             : null,
           tenants,
@@ -531,11 +515,14 @@ export default function TenantCreditPage() {
                   name: f.name,
                   kind: f.kind,
                   level: f.level,
+                  unitsOverride: f.unitsOverride,
                 })),
                 status: s.status,
                 extracts: s.extracts,
                 compute: s.compute,
                 error: s.error,
+                approved: s.approved,
+                excludedFiles: s.excludedFiles,
               },
             ]),
           ),
@@ -546,19 +533,20 @@ export default function TenantCreditPage() {
             recommended_tenant_id: e.recommended_tenant_id,
             assigned_tenant_id: e.assigned_tenant_id,
             level: e.level,
+            unitsOverride: e.unitsOverride,
           })),
         };
 
         const writes: Promise<void>[] = [];
-        if (trackerFile) writes.push(putBlob(TRACKER_IDB_KEY, trackerFile));
+        if (trackerFile) writes.push(putBlob(trackerIdbKey, trackerFile));
         for (const s of Object.values(states)) {
           for (const f of s.files) writes.push(putBlob(f.id, f.file));
         }
         for (const e of triage) writes.push(putBlob(e.id, e.file));
         await Promise.all(writes);
 
-        window.localStorage.setItem(
-          SNAPSHOT_STORAGE_KEY,
+        window.sessionStorage.setItem(
+          snapshotStorageKey,
           JSON.stringify(snap),
         );
       } catch {
@@ -566,36 +554,79 @@ export default function TenantCreditPage() {
       }
     }, 500);
     return () => window.clearTimeout(handle);
-  }, [hydrated, mode, quarterId, trackerFile, tenants, states, triage]);
+  }, [
+    hydrated,
+    analystName,
+    quarterId,
+    snapshotStorageKey,
+    trackerFile,
+    trackerIdbKey,
+    tenants,
+    states,
+    triage,
+  ]);
 
-  // Hard reset: clear localStorage + IDB and reset every piece of state.
+  // Hard reset: clear this tab's session snapshot and IDB blobs.
   // Useful when the persisted snapshot is interfering with a fresh
   // upload (or just to start over). Exposed via the Reset button at the
   // top of the page.
   async function resetAll() {
-    window.localStorage.removeItem(SNAPSHOT_STORAGE_KEY);
-    await clearStoredBlobs();
-    setMode("triage");
+    window.sessionStorage.removeItem(snapshotStorageKey);
+    await Promise.all([
+      deleteBlob(trackerIdbKey),
+      ...Object.values(states).flatMap((state) =>
+        state.files.map((file) => deleteBlob(file.id)),
+      ),
+      ...triage.map((entry) => deleteBlob(entry.id)),
+    ]);
     setTrackerFile(null);
     setTenants([]);
     setStates({});
     setTriage([]);
     setQuarterId("Q1_2026");
+    setAnalystName("");
     setPreviewing(null);
     toast.success("Cleared.");
   }
 
-  const tenantsWithData = useMemo(
+  const computedTenants = useMemo(
     () =>
       Object.values(states).filter(
         (s) => s.status === "computed" && s.compute !== null,
       ),
     [states],
   );
+  const tenantsWithData = useMemo(
+    () => computedTenants.filter((state) => state.approved),
+    [computedTenants],
+  );
+
+  function handleQuarterChange(nextQuarter: QuarterId) {
+    if (nextQuarter === quarterId) return;
+    setQuarterId(nextQuarter);
+    setStates((previous) =>
+      Object.fromEntries(
+        Object.entries(previous).map(([row, state]) => [
+          row,
+          {
+            ...state,
+            status: state.files.length > 0 ? "loaded" : "idle",
+            extracts: [],
+            compute: null,
+            error: null,
+            approved: false,
+            excludedFiles: [],
+          },
+        ]),
+      ),
+    );
+  }
 
   // ----- Tracker upload --------------------------------------------------
 
   async function handleTrackerUpload(next: File | null) {
+    void deleteBlob(trackerIdbKey);
+    setTrackerIdbKey(randomId(workspaceId));
     setTrackerFile(next);
     setTenants([]);
     setStates({});
@@ -631,6 +662,8 @@ export default function TenantCreditPage() {
           extracts: [],
           compute: null,
           error: null,
+          approved: false,
+          excludedFiles: [],
         };
       }
       setStates(seeded);
@@ -655,11 +688,12 @@ export default function TenantCreditPage() {
       const cur = prev[row];
       if (!cur) return prev;
       const tf: TenantFile = {
-        id: randomId(),
+        id: randomId(workspaceId),
         file,
         name: file.name,
         kind,
         level,
+        unitsOverride: "auto",
       };
       return {
         ...prev,
@@ -670,6 +704,8 @@ export default function TenantCreditPage() {
           extracts: [],
           compute: null,
           error: null,
+          approved: false,
+          excludedFiles: [],
         },
       };
     });
@@ -693,6 +729,8 @@ export default function TenantCreditPage() {
           extracts: [],
           compute: null,
           error: null,
+          approved: false,
+          excludedFiles: [],
         },
       };
     });
@@ -711,8 +749,56 @@ export default function TenantCreditPage() {
               ? { ...f, level: f.level === "tenant" ? "corporate" : "tenant" }
               : f,
           ),
+          status: "loaded",
+          extracts: [],
+          compute: null,
+          error: null,
+          approved: false,
+          excludedFiles: [],
         },
       };
+    });
+  }
+
+  function setFileUnits(
+    row: number,
+    fileId: string,
+    unitsOverride: UnitsOverride,
+  ) {
+    setStates((prev) => {
+      const cur = prev[row];
+      if (!cur) return prev;
+      return {
+        ...prev,
+        [row]: {
+          ...cur,
+          files: cur.files.map((file) =>
+            file.id === fileId ? { ...file, unitsOverride } : file,
+          ),
+          status: "loaded",
+          extracts: [],
+          compute: null,
+          error: null,
+          approved: false,
+          excludedFiles: [],
+        },
+      };
+    });
+  }
+
+  function setTenantApproval(row: number, approved: boolean) {
+    setStates((previous) => {
+      const state = previous[row];
+      if (
+        !state ||
+        state.status !== "computed" ||
+        !state.compute ||
+        state.compute.sales == null ||
+        state.compute.ebitda == null
+      ) {
+        return previous;
+      }
+      return { ...previous, [row]: { ...state, approved } };
     });
   }
 
@@ -724,31 +810,43 @@ export default function TenantCreditPage() {
       toast.error("Bulk upload must be a .zip file.");
       return;
     }
+    if (zipFile.size > 128 * 1024 * 1024) {
+      toast.error("Bulk zip must be 128 MB or smaller.");
+      return;
+    }
     let entries: Record<string, Uint8Array>;
     try {
       const bytes = new Uint8Array(await zipFile.arrayBuffer());
+      inspectZipArchive(bytes);
       entries = unzipSync(bytes);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Could not unzip.");
       return;
     }
 
-    // Build a normalized list of {file, recommendation} from the zip,
-    // ignoring directories, macOS resource forks, and unsupported
-    // extensions. Both modes consume this list; they differ in where
-    // the files land.
+    // Build a normalized list of review candidates. Known metadata files are
+    // ignored; any other unsupported or malformed member blocks the import so
+    // a partial zip never looks complete on the surface.
     const candidates: {
       file: File;
       kind: "pdf" | "xlsx";
       filename: string;
       recommended: TenantPickerEntry | null;
     }[] = [];
+    const rejected: string[] = [];
     for (const [path, bytes] of Object.entries(entries)) {
       if (path.endsWith("/") || bytes.byteLength === 0) continue;
       const basename = path.split("/").pop() ?? path;
-      if (path.startsWith("__MACOSX/") || basename.startsWith("._")) continue;
+      if (
+        path.startsWith("__MACOSX/") ||
+        basename.startsWith("._") ||
+        basename === ".DS_Store"
+      ) continue;
       const kind = fileKind(basename);
-      if (!kind) continue;
+      if (!kind) {
+        rejected.push(`${basename} (unsupported type)`);
+        continue;
+      }
       // PDF magic byte check; xlsx zips start with PK\x03\x04 which is
       // the ZIP signature so we don't enforce it here (the server
       // validates via ExcelJS).
@@ -759,6 +857,7 @@ export default function TenantCreditPage() {
           bytes[2] !== 0x44 ||
           bytes[3] !== 0x46
         ) {
+          rejected.push(`${basename} (invalid PDF header)`);
           continue;
         }
       }
@@ -768,7 +867,10 @@ export default function TenantCreditPage() {
           : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
       const blob = new Blob([new Uint8Array(bytes)], { type: mime });
       const file = new File([blob], basename, { type: mime });
-      const { winner, tied } = matchPdfToTenant(basename, tenants);
+      // Route on the FULL zip path: in real quarterly zips the tenant
+      // identity lives in the folder name ("Kraf/JANUARY.pdf"), not
+      // the basename.
+      const { winner, tied } = matchFileToTenant(path, tenants);
       candidates.push({
         file,
         kind,
@@ -777,70 +879,31 @@ export default function TenantCreditPage() {
       });
     }
 
+    if (rejected.length > 0) {
+      toast.error(
+        `Zip import stopped: ${rejected.slice(0, 5).join(", ")}` +
+          (rejected.length > 5 ? ` and ${rejected.length - 5} more` : ""),
+      );
+      return;
+    }
+
     if (candidates.length === 0) {
       toast.warning("Zip had no PDFs or .xlsx files we could read.");
       return;
     }
 
-    if (mode === "quick") {
-      // Quick mode: auto-route confident matches to the tenant cards.
-      // Anything ambiguous lands in triage as an unsorted entry.
-      let assigned = 0;
-      const newTriage: TriageEntry[] = [];
-      setStates((prev) => {
-        const next = { ...prev };
-        for (const c of candidates) {
-          if (c.recommended && next[c.recommended.row]) {
-            const tf: TenantFile = {
-              id: randomId(),
-              file: c.file,
-              name: c.filename,
-              kind: c.kind,
-              level: "tenant",
-            };
-            next[c.recommended.row] = {
-              ...next[c.recommended.row],
-              files: [...next[c.recommended.row].files, tf],
-              status: "loaded",
-              extracts: [],
-              compute: null,
-              error: null,
-            };
-            assigned++;
-          } else {
-            newTriage.push({
-              id: randomId(),
-              file: c.file,
-              name: c.filename,
-              kind: c.kind,
-              recommended_tenant_id: null,
-              assigned_tenant_id: null,
-              level: "tenant",
-            });
-          }
-        }
-        return next;
-      });
-      setTriage((cur) => [...cur, ...newTriage]);
-      if (assigned > 0) toast.success(`Routed ${assigned}.`);
-      if (newTriage.length > 0) {
-        toast.warning(`${newTriage.length} unmatched. Assign below.`);
-      }
-    } else {
-      // Triage mode: every file goes through the triage table for
-      // confirmation, even the high-confidence ones.
-      const newTriage: TriageEntry[] = candidates.map((c) => ({
-        id: randomId(),
-        file: c.file,
-        name: c.filename,
-        kind: c.kind,
-        recommended_tenant_id: c.recommended?.tenant_id ?? null,
-        assigned_tenant_id: c.recommended?.tenant_id ?? null,
-        level: "tenant",
-      }));
-      setTriage((cur) => [...cur, ...newTriage]);
-      toast.success(`Imported ${newTriage.length}. Confirm assignments below.`);
-    }
+    const newTriage: TriageEntry[] = candidates.map((candidate) => ({
+      id: randomId(workspaceId),
+      file: candidate.file,
+      name: candidate.filename,
+      kind: candidate.kind,
+      recommended_tenant_id: candidate.recommended?.tenant_id ?? null,
+      assigned_tenant_id: candidate.recommended?.tenant_id ?? null,
+      level: "tenant",
+      unitsOverride: "auto",
+    }));
+    setTriage((current) => [...current, ...newTriage]);
+    toast.success(`Imported ${newTriage.length}. Confirm assignments below.`);
   }
 
   function updateTriageEntry(id: string, patch: Partial<TriageEntry>) {
@@ -868,11 +931,12 @@ export default function TenantCreditPage() {
     setStates((prev) => {
       if (!prev[tenant.row]) return prev;
       const tf: TenantFile = {
-        id: randomId(),
+        id: entry.id,
         file: entry.file,
         name: entry.name,
         kind: entry.kind,
         level: entry.level,
+        unitsOverride: entry.unitsOverride,
       };
       return {
         ...prev,
@@ -883,6 +947,8 @@ export default function TenantCreditPage() {
           extracts: [],
           compute: null,
           error: null,
+          approved: false,
+          excludedFiles: [],
         },
       };
     });
@@ -906,11 +972,12 @@ export default function TenantCreditPage() {
         const tenant = tenants.find((t) => t.tenant_id === e.assigned_tenant_id);
         if (!tenant || !next[tenant.row]) continue;
         const tf: TenantFile = {
-          id: randomId(),
+          id: e.id,
           file: e.file,
           name: e.name,
           kind: e.kind,
           level: e.level,
+          unitsOverride: e.unitsOverride,
         };
         next[tenant.row] = {
           ...next[tenant.row],
@@ -919,6 +986,8 @@ export default function TenantCreditPage() {
           extracts: [],
           compute: null,
           error: null,
+          approved: false,
+          excludedFiles: [],
         };
       }
       return next;
@@ -947,27 +1016,56 @@ export default function TenantCreditPage() {
         const row = entry.tenant.row;
         setStates((prev) => ({
           ...prev,
-          [row]: { ...prev[row], status: "extracting", error: null },
+          [row]: {
+            ...prev[row],
+            status: "extracting",
+            error: null,
+            approved: false,
+            excludedFiles: [],
+          },
         }));
         try {
           const extracts: ExtractResponse[] = [];
+          const excludedFiles: ExcludedFile[] = [];
           const fileFailures: string[] = [];
           for (const tf of entry.files) {
             try {
               const form = new FormData();
               form.append("file", tf.file);
               form.append("tenant_id", entry.tenant.tenant_id);
+              form.append("quarter_id", quarterId);
+              form.append("source_units_override", tf.unitsOverride);
               const res = await fetch("/api/tenant-credit/extract", {
                 method: "POST",
                 body: form,
               });
               if (!res.ok) {
                 const detail = await res.json().catch(() => ({}));
+                if (
+                  detail.code === "SOURCE_PERIOD_OUTSIDE_QUARTER" &&
+                  typeof detail.source_file_hash === "string" &&
+                  typeof detail.source_period === "string"
+                ) {
+                  const reason =
+                    detail.error ?? `${tf.name} is outside the selected quarter.`;
+                  excludedFiles.push({
+                    file_id: tf.id,
+                    filename: tf.name,
+                    file_hash: detail.source_file_hash,
+                    source_period: detail.source_period,
+                    reason,
+                  });
+                  toast.warning(`${entry.tenant.display_name}: ${reason}`);
+                  continue;
+                }
                 throw new Error(
                   detail.error ?? `Extract failed (${res.status}).`,
                 );
               }
-              extracts.push((await res.json()) as ExtractResponse);
+              extracts.push({
+                ...((await res.json()) as ExtractResponse),
+                client_file_id: tf.id,
+              });
             } catch (err) {
               // One bad file shouldn't kill the rest of the tenant's
               // run. Surface the per-file error as a toast so the
@@ -977,6 +1075,13 @@ export default function TenantCreditPage() {
               fileFailures.push(`${tf.name}: ${msg}`);
               toast.error(`${entry.tenant.display_name} · ${tf.name}: ${msg}`);
             }
+          }
+          if (fileFailures.length > 0) {
+            throw new Error(
+              `Blocked writeback: ${fileFailures.length} of ` +
+                `${entry.files.length} attached file(s) failed extraction. ` +
+                fileFailures.join(" | "),
+            );
           }
           if (extracts.length === 0) {
             throw new Error(
@@ -990,7 +1095,20 @@ export default function TenantCreditPage() {
             ...prev,
             [row]: { ...prev[row], status: "computing", extracts },
           }));
-          const merged = mergeLineItems(extracts);
+          const {
+            merged,
+            conflicts: mergeConflicts,
+            excludedExtracts,
+          } = mergeLineItems(extracts, quarterId);
+          for (const exclusion of excludedExtracts) {
+            toast.warning(
+              `${entry.tenant.display_name}: ${exclusion.extract.source_filename} ` +
+                exclusion.reason,
+            );
+          }
+          for (const c of mergeConflicts) {
+            toast.warning(`${entry.tenant.display_name}: ${c}`);
+          }
           const computeRes = await fetch("/api/tenant-credit/compute", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1007,11 +1125,6 @@ export default function TenantCreditPage() {
           }
           const computeData = (await computeRes.json()) as ComputeResponse;
 
-          setQuarterId((cur) => {
-            if (cur !== "Q1_2026") return cur;
-            return guessQuarter(extracts[0]?.source_period ?? "");
-          });
-
           setStates((prev) => ({
             ...prev,
             [row]: {
@@ -1020,13 +1133,20 @@ export default function TenantCreditPage() {
               extracts,
               compute: computeData,
               error: null,
+              approved: false,
+              excludedFiles,
             },
           }));
         } catch (err) {
           const msg = err instanceof Error ? err.message : "Run failed.";
           setStates((prev) => ({
             ...prev,
-            [row]: { ...prev[row], status: "error", error: msg },
+            [row]: {
+              ...prev[row],
+              status: "error",
+              error: msg,
+              approved: false,
+            },
           }));
           toast.error(`${entry.tenant.display_name}: ${msg}`);
         }
@@ -1044,21 +1164,35 @@ export default function TenantCreditPage() {
       toast.error("Upload the tracker first.");
       return;
     }
-    if (tenantsWithData.length === 0) {
+    if (analystName.trim().length < 2) {
+      toast.error("Enter the analyst name before writeback.");
+      return;
+    }
+    if (triage.length > 0) {
+      toast.error("Resolve every triage row before writeback.");
+      return;
+    }
+    const unresolved = Object.values(states).filter(
+      (state) => state.files.length > 0 && state.status !== "computed",
+    );
+    if (unresolved.length > 0) {
+      toast.error(
+        `Resolve ${unresolved.length} loaded tenant run(s) before writeback.`,
+      );
+      return;
+    }
+    if (computedTenants.length === 0) {
       toast.error("Nothing computed yet.");
+      return;
+    }
+    if (tenantsWithData.length !== computedTenants.length) {
+      toast.error("Approve every computed tenant in Review before writeback.");
       return;
     }
     setWriting(true);
     try {
-      const entries = await Promise.all(
-        tenantsWithData.map(async (s) => {
+      const entries = tenantsWithData.map((s) => {
           const c = s.compute!;
-          const first = s.extracts[0] ?? null;
-          const merged = mergeLineItems(s.extracts);
-          const filenames = s.files.map((f) => f.name).join(", ");
-          const hashes = await Promise.all(
-            s.files.map((f) => sha256Hex(f.file).catch(() => "")),
-          );
           return {
             tenant_id: s.tenant.tenant_id,
             tenant_display_name: s.tenant.display_name,
@@ -1070,34 +1204,60 @@ export default function TenantCreditPage() {
             cash: c.cash,
             cfo: c.cfo,
             capex: c.capex,
-            source_pdf_filename: filenames,
-            source_pdf_hash: hashes.join(","),
-            source_entity: first?.source_entity ?? "",
-            source_period: first?.source_period ?? "",
-            line_items: merged,
-            normalization_applied: first?.normalization_applied ?? [],
-            passed_through: first?.passed_through ?? [],
-            unused_labels: c.unused_labels,
-            intercompany_observed: c.intercompany_observed,
-            // Per-file metadata for the audit log. Kept verbatim so a
-            // future schema can move it into its own Firestore field
-            // without changing the route contract.
-            files: s.files.map((f) => ({
-              name: f.name,
-              kind: f.kind,
-              level: f.level,
+            extracts: s.extracts.map((extract, index) => {
+              const file =
+                s.files.find(
+                  (candidate) => candidate.id === extract.client_file_id,
+                ) ??
+                s.files.find(
+                  (candidate) => candidate.name === extract.source_filename,
+                ) ??
+                s.files[index];
+              if (!file) {
+                throw new Error(
+                  `Lost attached-file metadata for ${extract.source_filename}.`,
+                );
+              }
+              return {
+                source_entity: extract.source_entity,
+                source_period: extract.source_period,
+                source_filename: extract.source_filename,
+                source_file_hash: extract.source_file_hash,
+                source_units: extract.source_units,
+                source_units_evidence: extract.source_units_evidence,
+                document_type: extract.document_type,
+                source_scope: extract.source_scope,
+                source_scope_type: extract.source_scope_type,
+                source_scope_identifiers: extract.source_scope_identifiers,
+                period_selection: extract.period_selection,
+                line_items: extract.line_items,
+                level: file.level,
+              };
+            }),
+            excluded_files: s.excludedFiles.map((file) => ({
+              filename: file.filename,
+              file_hash: file.file_hash,
+              source_period: file.source_period,
+              reason: file.reason,
             })),
-            calculations: {
-              sales: traceToAudit(c.metrics.sales),
-              ebitda: traceToAudit(c.metrics.ebitda),
-            },
+            normalization_applied: s.extracts.flatMap(
+              (extract) => extract.normalization_applied,
+            ),
+            entity_override_reason:
+              "Analyst reviewed and approved the source assignment and all computed values.",
           };
-        }),
-      );
+        });
 
       const form = new FormData();
       form.append("tracker_xlsx", trackerFile);
-      form.append("payload", JSON.stringify({ quarter_id: quarterId, entries }));
+      form.append(
+        "payload",
+        JSON.stringify({
+          quarter_id: quarterId,
+          analyst_name: analystName.trim(),
+          entries,
+        }),
+      );
       const res = await fetch("/api/tenant-credit/writeback", {
         method: "POST",
         body: form,
@@ -1145,14 +1305,14 @@ export default function TenantCreditPage() {
   // ----- Render --------------------------------------------------------
 
   const allTenants = Object.values(states).sort((a, b) => a.tenant.row - b.tenant.row);
-  const readyCount = allTenants.filter((s) => s.status === "computed").length;
+  const readyCount = tenantsWithData.length;
+  const computedCount = computedTenants.length;
   const loadedCount = allTenants.filter((s) => s.files.length > 0).length;
 
   return (
     <ConfigGate>
       <AppShell title="Tenant Credit Tracker">
-        <div className="flex items-center justify-between gap-2">
-          <ModeToggle mode={mode} onChange={setMode} />
+        <div className="flex justify-end">
           <Button size="sm" variant="outline" onClick={resetAll}>
             Reset
           </Button>
@@ -1169,14 +1329,13 @@ export default function TenantCreditPage() {
           <>
             <QuarterAndZipCard
               quarterId={quarterId}
-              onQuarterChange={setQuarterId}
+              onQuarterChange={handleQuarterChange}
               onZipUpload={handleZipUpload}
               loadedCount={loadedCount}
               totalCount={allTenants.length}
-              mode={mode}
             />
 
-            {mode === "triage" && triage.length > 0 && (
+            {triage.length > 0 && (
               <TriageCard
                 entries={triage}
                 tenants={tenants}
@@ -1187,29 +1346,21 @@ export default function TenantCreditPage() {
               />
             )}
 
-            {mode === "quick" && triage.length > 0 && (
-              <UnassignedCard
-                entries={triage}
-                tenants={tenants}
-                onAssign={(id, tenant_id) => {
-                  updateTriageEntry(id, { assigned_tenant_id: tenant_id });
-                }}
-                onCommit={confirmTriage}
-              />
-            )}
-
             <TenantGrid
               tenants={allTenants}
               running={running}
               onAddFile={addFileToTenant}
               onRemoveFile={removeFile}
               onToggleLevel={toggleFileLevel}
+              onSetUnits={setFileUnits}
               onPreviewFile={setPreviewing}
             />
 
             <ActionsCard
               loadedCount={loadedCount}
               readyCount={readyCount}
+              analystName={analystName}
+              onAnalystNameChange={setAnalystName}
               running={running}
               writing={writing}
               onRunAll={handleRunAll}
@@ -1217,7 +1368,13 @@ export default function TenantCreditPage() {
               quarterLabel={quarterLabel(quarterId)}
             />
 
-            {readyCount > 0 && <ResultsTable rows={tenantsWithData} />}
+            {computedCount > 0 && (
+              <ResultsTable
+                rows={computedTenants}
+                quarterId={quarterId}
+                onApprovalChange={setTenantApproval}
+              />
+            )}
           </>
         )}
 
@@ -1239,27 +1396,6 @@ export default function TenantCreditPage() {
 // ---------------------------------------------------------------------------
 // Sub-components
 // ---------------------------------------------------------------------------
-
-function ModeToggle(props: { mode: Mode; onChange: (m: Mode) => void }) {
-  return (
-    <div className="flex gap-2">
-      <Button
-        size="sm"
-        variant={props.mode === "quick" ? "default" : "outline"}
-        onClick={() => props.onChange("quick")}
-      >
-        Quick
-      </Button>
-      <Button
-        size="sm"
-        variant={props.mode === "triage" ? "default" : "outline"}
-        onClick={() => props.onChange("triage")}
-      >
-        Triage
-      </Button>
-    </div>
-  );
-}
 
 function TrackerCard(props: {
   file: File | null;
@@ -1304,16 +1440,13 @@ function QuarterAndZipCard(props: {
   onZipUpload: (file: File | null) => void;
   loadedCount: number;
   totalCount: number;
-  mode: Mode;
 }) {
   return (
     <Card>
       <CardHeader>
         <CardTitle>2. Quarter &amp; files</CardTitle>
         <CardDescription>
-          {props.mode === "quick"
-            ? "Confident matches auto-route to cards. Ambiguous ones surface for review."
-            : "Every file from the zip lands in the triage table for confirmation."}
+          Every file from the zip lands in triage for confirmation.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -1643,23 +1776,8 @@ function TriageCard(props: {
                               title={e.name}
                             />
                           ) : (
-                            <div className="flex h-32 items-center justify-center rounded border bg-white text-center">
-                              <div>
-                                <p className="text-sm text-neutral-600">
-                                  {e.name}
-                                </p>
-                                <p className="text-xs text-neutral-500">
-                                  {formatBytes(e.file.size)} · Excel preview
-                                  not rendered inline.
-                                </p>
-                                <a
-                                  href={previewUrl}
-                                  download={e.name}
-                                  className="text-xs text-primary hover:underline"
-                                >
-                                  Download to open in Excel
-                                </a>
-                              </div>
+                            <div className="h-[800px] w-full">
+                              <ExcelPreviewTable key={e.id} file={e.file} />
                             </div>
                           )}
                         </div>
@@ -1680,70 +1798,13 @@ function TriageCard(props: {
   );
 }
 
-function UnassignedCard(props: {
-  entries: TriageEntry[];
-  tenants: TenantPickerEntry[];
-  onAssign: (id: string, tenant_id: string) => void;
-  onCommit: () => void;
-}) {
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Unassigned</CardTitle>
-        <CardDescription>Pick a tenant for each.</CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        <ul className="space-y-2">
-          {props.entries.map((e) => (
-            <li
-              key={e.id}
-              className="flex flex-wrap items-center justify-between gap-2 rounded border bg-neutral-50 px-3 py-2"
-            >
-              <span className="flex items-center gap-2 font-mono text-xs">
-                <Badge variant="outline" className="uppercase">
-                  {e.kind}
-                </Badge>
-                {e.name}
-              </span>
-              <Select
-                value={e.assigned_tenant_id ?? ""}
-                onValueChange={(v) => props.onAssign(e.id, v)}
-              >
-                <SelectTrigger className="w-72">
-                  <SelectValue placeholder="Assign to tenant" />
-                </SelectTrigger>
-                <SelectContent>
-                  {props.tenants.map((t) => (
-                    <SelectItem key={t.row} value={t.tenant_id}>
-                      <span className="flex items-center gap-2">
-                        <span className="font-mono text-xs text-neutral-500">
-                          row {t.row}
-                        </span>
-                        {t.display_name}
-                      </span>
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </li>
-          ))}
-        </ul>
-        <div className="flex justify-end">
-          <Button onClick={props.onCommit} size="sm">
-            Commit assignments
-          </Button>
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
 function TenantGrid(props: {
   tenants: TenantState[];
   running: boolean;
   onAddFile: (row: number, file: File, level?: FileLevel) => void;
   onRemoveFile: (row: number, fileId: string) => void;
   onToggleLevel: (row: number, fileId: string) => void;
+  onSetUnits: (row: number, fileId: string, units: UnitsOverride) => void;
   onPreviewFile: (file: TenantFile) => void;
 }) {
   return (
@@ -1761,6 +1822,7 @@ function TenantGrid(props: {
               onAddFile={props.onAddFile}
               onRemoveFile={props.onRemoveFile}
               onToggleLevel={props.onToggleLevel}
+              onSetUnits={props.onSetUnits}
               onPreviewFile={props.onPreviewFile}
             />
           ))}
@@ -1776,6 +1838,7 @@ function TenantCard(props: {
   onAddFile: (row: number, file: File, level?: FileLevel) => void;
   onRemoveFile: (row: number, fileId: string) => void;
   onToggleLevel: (row: number, fileId: string) => void;
+  onSetUnits: (row: number, fileId: string, units: UnitsOverride) => void;
   onPreviewFile: (file: TenantFile) => void;
 }) {
   const { state } = props;
@@ -1848,6 +1911,24 @@ function TenantCard(props: {
                 <span className="truncate text-xs text-neutral-700">{f.name}</span>
               </button>
               <span className="flex shrink-0 items-center gap-1.5">
+                <select
+                  value={f.unitsOverride}
+                  onChange={(event) =>
+                    props.onSetUnits(
+                      state.tenant.row,
+                      f.id,
+                      event.target.value as UnitsOverride,
+                    )
+                  }
+                  className="h-6 border-0 bg-transparent text-[10px] text-neutral-600 outline-none"
+                  title="Source units"
+                  disabled={props.running}
+                >
+                  <option value="auto">Units: auto</option>
+                  <option value="dollars">Units: $</option>
+                  <option value="thousands">Units: $000</option>
+                  <option value="millions">Units: $mm</option>
+                </select>
                 <button
                   type="button"
                   className="text-[10px] uppercase text-neutral-500 hover:text-foreground"
@@ -1905,6 +1986,8 @@ function TenantCard(props: {
 function ActionsCard(props: {
   loadedCount: number;
   readyCount: number;
+  analystName: string;
+  onAnalystNameChange: (name: string) => void;
   running: boolean;
   writing: boolean;
   onRunAll: () => void;
@@ -1916,7 +1999,18 @@ function ActionsCard(props: {
       <CardHeader>
         <CardTitle>4. Run &amp; write</CardTitle>
       </CardHeader>
-      <CardContent className="flex flex-wrap items-center gap-3">
+      <CardContent className="flex flex-wrap items-end gap-3">
+        <div className="w-56 space-y-1.5">
+          <label htmlFor="analyst-name" className="text-sm font-medium">
+            Analyst
+          </label>
+          <Input
+            id="analyst-name"
+            value={props.analystName}
+            onChange={(event) => props.onAnalystNameChange(event.target.value)}
+            autoComplete="name"
+          />
+        </div>
         <Button
           onClick={props.onRunAll}
           disabled={props.running || props.writing || props.loadedCount === 0}
@@ -1925,7 +2019,12 @@ function ActionsCard(props: {
         </Button>
         <Button
           onClick={props.onWriteAll}
-          disabled={props.running || props.writing || props.readyCount === 0}
+          disabled={
+            props.running ||
+            props.writing ||
+            props.readyCount === 0 ||
+            props.analystName.trim().length < 2
+          }
           variant={props.readyCount > 0 ? "default" : "outline"}
         >
           {props.writing ? "Writing…" : `Write ${props.readyCount} to ${props.quarterLabel}`}
@@ -1935,7 +2034,11 @@ function ActionsCard(props: {
   );
 }
 
-function ResultsTable(props: { rows: TenantState[] }) {
+function ResultsTable(props: {
+  rows: TenantState[];
+  quarterId: QuarterId;
+  onApprovalChange: (row: number, approved: boolean) => void;
+}) {
   return (
     <Card>
       <CardHeader>
@@ -1954,6 +2057,7 @@ function ResultsTable(props: { rows: TenantState[] }) {
                 </TableHead>
               ))}
               <TableHead className="text-right">Margin</TableHead>
+              <TableHead className="text-center">Approved</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -1964,24 +2068,118 @@ function ResultsTable(props: { rows: TenantState[] }) {
                   ? (c.ebitda / c.sales) * 100
                   : null;
               const corpCount = s.files.filter((f) => f.level === "corporate").length;
+              const merged = mergeLineItems(s.extracts, props.quarterId);
+              const excludedReasons = new Map(
+                merged.excludedExtracts.map(({ extract, reason }) => [
+                  extract.source_file_hash,
+                  reason,
+                ]),
+              );
+              const canApprove = c.sales !== null && c.ebitda !== null;
               return (
-                <TableRow key={s.tenant.row}>
-                  <TableCell className="max-w-64 truncate">
-                    {s.tenant.display_name}
-                  </TableCell>
-                  <TableCell className="text-right font-mono text-xs tabular-nums text-neutral-500">
-                    {s.files.length}
-                    {corpCount > 0 ? ` (${corpCount}C)` : ""}
-                  </TableCell>
-                  {WRITABLE_METRICS.map((m) => (
-                    <TableCell key={m} className="text-right font-mono tabular-nums">
-                      {fmtMetric(c[m])}
+                <Fragment key={s.tenant.row}>
+                  <TableRow>
+                    <TableCell className="max-w-64 truncate">
+                      {s.tenant.display_name}
                     </TableCell>
-                  ))}
-                  <TableCell className="text-right font-mono tabular-nums">
-                    {margin === null ? "—" : `${margin.toFixed(1)}%`}
-                  </TableCell>
-                </TableRow>
+                    <TableCell className="text-right font-mono text-xs tabular-nums text-neutral-500">
+                      {s.files.length}
+                      {corpCount > 0 ? ` (${corpCount}C)` : ""}
+                    </TableCell>
+                    {WRITABLE_METRICS.map((metric) => (
+                      <TableCell
+                        key={metric}
+                        className="text-right font-mono tabular-nums"
+                      >
+                        {fmtMetric(c[metric])}
+                      </TableCell>
+                    ))}
+                    <TableCell className="text-right font-mono tabular-nums">
+                      {margin === null ? "—" : `${margin.toFixed(1)}%`}
+                    </TableCell>
+                    <TableCell className="text-center">
+                      <input
+                        type="checkbox"
+                        checked={s.approved}
+                        disabled={!canApprove}
+                        onChange={(event) =>
+                          props.onApprovalChange(
+                            s.tenant.row,
+                            event.target.checked,
+                          )
+                        }
+                        aria-label={`Approve ${s.tenant.display_name}`}
+                        className="h-4 w-4 accent-emerald-700"
+                      />
+                    </TableCell>
+                  </TableRow>
+                  <TableRow className="hover:bg-transparent">
+                    <TableCell colSpan={11} className="bg-neutral-50 py-2">
+                      <details>
+                        <summary className="cursor-pointer text-xs font-medium text-neutral-700">
+                          Sources, exclusions, and calculation trace
+                        </summary>
+                        <div className="mt-3 space-y-3 text-xs">
+                          <div className="space-y-1">
+                            {s.extracts.map((extract) => {
+                              const exclusion = excludedReasons.get(
+                                extract.source_file_hash,
+                              );
+                              return (
+                                <p key={extract.source_file_hash}>
+                                  <span className="font-mono">
+                                    {extract.source_filename}
+                                  </span>{" "}
+                                  <Badge
+                                    variant={exclusion ? "outline" : "secondary"}
+                                  >
+                                    {exclusion ? "excluded" : "included"}
+                                  </Badge>{" "}
+                                  {extract.source_period} · {extract.source_scope} ·{" "}
+                                  {extract.source_units} · {extract.period_selection}
+                                  {exclusion ? ` · ${exclusion}` : ""}
+                                </p>
+                              );
+                            })}
+                            {s.excludedFiles.map((file) => (
+                              <p key={file.file_id}>
+                                <span className="font-mono">{file.filename}</span>{" "}
+                                <Badge variant="outline">excluded</Badge>{" "}
+                                {file.source_period} · outside selected quarter
+                              </p>
+                            ))}
+                          </div>
+                          <div className="grid gap-2 md:grid-cols-2">
+                            {WRITABLE_METRICS.map((metric) => {
+                              const trace = c.metrics[metric];
+                              return (
+                                <div key={metric} className="border-t pt-2">
+                                  <p className="font-medium">
+                                    {METRIC_LABELS[metric]}: {trace.formula}
+                                  </p>
+                                  {trace.contributions.map((item, index) => (
+                                    <p
+                                      key={`${item.label}-${index}`}
+                                      className="font-mono text-neutral-600"
+                                    >
+                                      {item.label}: {item.amount_source.toLocaleString()} →{" "}
+                                      {item.amount_tracker.toLocaleString()} ({item.reason})
+                                    </p>
+                                  ))}
+                                </div>
+                              );
+                            })}
+                          </div>
+                          {c.unused_labels.length > 0 && (
+                            <p className="text-amber-800">
+                              Unmatched: {c.unused_labels.join(", ")}
+                            </p>
+                          )}
+                        </div>
+                      </details>
+                    </TableCell>
+                  </TableRow>
+                </Fragment>
               );
             })}
           </TableBody>
@@ -2047,37 +2245,58 @@ function HistoryCard(props: {
                   <TableHead className="text-right">Sales</TableHead>
                   <TableHead className="text-right">EBITDA</TableHead>
                   <TableHead>Status</TableHead>
+                  <TableHead>Flags</TableHead>
                   <TableHead>By</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {props.runs.map((r) => (
-                  <TableRow key={r.id}>
-                    <TableCell className="font-mono text-xs">
-                      {r.created_at != null
-                        ? new Date(r.created_at).toLocaleString()
-                        : "—"}
-                    </TableCell>
-                    <TableCell>{r.source_entity || r.tenant_id}</TableCell>
-                    <TableCell>{r.quarter}</TableCell>
-                    <TableCell className="text-right font-mono tabular-nums">
-                      {r.computed_sales.toLocaleString()}
-                    </TableCell>
-                    <TableCell className="text-right font-mono tabular-nums">
-                      {r.computed_ebitda.toLocaleString()}
-                    </TableCell>
-                    <TableCell>
-                      {r.status === "writeback_success" ? (
-                        <Badge variant="secondary">OK</Badge>
-                      ) : (
-                        <Badge variant="destructive">Failed</Badge>
-                      )}
-                    </TableCell>
-                    <TableCell className="text-xs text-neutral-600">
-                      {r.written_by}
-                    </TableCell>
-                  </TableRow>
-                ))}
+                {props.runs.map((r) => {
+                  // Previously written but never read back: unused_labels
+                  // and worker_warnings sat in Firestore invisibly once a
+                  // run left the current browser session. Surface a count
+                  // with the detail in a native tooltip rather than
+                  // building a full drill-down view.
+                  const flags = [
+                    ...r.unused_labels.map((l) => `dropped: ${l}`),
+                    ...r.worker_warnings.map((w) => `warning: ${w}`),
+                  ];
+                  return (
+                    <TableRow key={r.id}>
+                      <TableCell className="font-mono text-xs">
+                        {r.created_at != null
+                          ? new Date(r.created_at).toLocaleString()
+                          : "—"}
+                      </TableCell>
+                      <TableCell>{r.source_entity || r.tenant_id}</TableCell>
+                      <TableCell>{r.quarter}</TableCell>
+                      <TableCell className="text-right font-mono tabular-nums">
+                        {r.computed_sales.toLocaleString()}
+                      </TableCell>
+                      <TableCell className="text-right font-mono tabular-nums">
+                        {r.computed_ebitda.toLocaleString()}
+                      </TableCell>
+                      <TableCell>
+                        {r.status === "writeback_success" ? (
+                          <Badge variant="secondary">OK</Badge>
+                        ) : r.status === "writeback_pending" ? (
+                          <Badge variant="outline">Pending</Badge>
+                        ) : (
+                          <Badge variant="destructive">Failed</Badge>
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        {flags.length > 0 ? (
+                          <Badge variant="outline" title={flags.join("\n")}>
+                            {flags.length}
+                          </Badge>
+                        ) : null}
+                      </TableCell>
+                      <TableCell className="text-xs text-neutral-600">
+                        {r.written_by}
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
               </TableBody>
             </Table>
           )}
@@ -2128,18 +2347,10 @@ function FilePreviewSheet(props: {
                   title={props.file.name}
                 />
               ) : (
-                <div className="flex h-full flex-col items-center justify-center gap-3 rounded border bg-neutral-50 text-center">
-                  <p className="text-sm text-neutral-600">
-                    Excel preview not rendered in the browser.
-                  </p>
-                  <a
-                    href={url}
-                    download={props.file.name}
-                    className="text-sm text-primary hover:underline"
-                  >
-                    Download to open in Excel
-                  </a>
-                </div>
+                <ExcelPreviewTable
+                  key={props.file.name}
+                  file={props.file.file}
+                />
               )}
             </div>
           </>
@@ -2152,17 +2363,4 @@ function FilePreviewSheet(props: {
 function fmtMetric(n: number | null): string {
   if (n === null || n === undefined || Number.isNaN(n)) return "—";
   return n.toLocaleString();
-}
-
-function traceToAudit(trace: ComputeMetricTrace) {
-  return {
-    formula: trace.formula,
-    inputs: trace.contributions.map((c) => ({
-      label: c.label,
-      amount_source: c.amount_source,
-      amount_tracker: c.amount_tracker,
-    })),
-    total_tracker_unrounded: trace.total_tracker_unrounded,
-    result: trace.result_tracker ?? 0,
-  };
 }

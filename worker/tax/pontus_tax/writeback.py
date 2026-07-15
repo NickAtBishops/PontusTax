@@ -17,9 +17,11 @@ from __future__ import annotations
 import datetime as dt
 import logging
 from copy import copy
+from dataclasses import dataclass
 from typing import Any
 
 from openpyxl import load_workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from .canonical import NEEDS_REVIEW, PAID, UNREACHABLE, LOW, RowOutcome
@@ -34,6 +36,17 @@ from .validate import parse_date, parse_money
 # sets these formats on the sample rows, but we re-apply on bare sheets.
 _CURRENCY_FMT = '"$"#,##0.00'
 _DATE_FMT = "yyyy-mm-dd"
+
+# Pulled verbatim from templates/PTAX_Master.xlsx (2026-07-02) — used only
+# for the analyst-owned columns (BOV bands, Actual assessment) that
+# `_write_structured_cell` never touches, so whatever format is set at
+# creation time is what persists. Payment amount / Payment date reuse
+# _CURRENCY_FMT / _DATE_FMT above instead, since _write_structured_cell
+# overwrites the number_format on every real write anyway — matching the
+# template's own format for those two would just get replaced the moment
+# a value lands.
+_CURRENCY_FMT_BOV = '\\$#,##0;"($"#,##0\\);\\-'
+_CREAM_FILL = "FFFFF8DC"
 
 # Canonical fields the writeback OWNS. The writeback may write into the
 # detected column for any of these (subject to per-cell formula protection
@@ -285,6 +298,110 @@ def _resolve_notes_column(ws, sheet: SheetIntake) -> int:
     return new_col
 
 
+# ---- PTAX_Master structured-column parity --------------------------------
+# Any workbook that predates the PTAX_Master template (or was never built
+# from it — the older per-state trackers like "Property Taxes- California
+# .xlsx") is missing the BOV / Jurisdiction Links / Payment amount / Payment
+# date / Actual assessment / Confidence band entirely, so those cells can
+# never populate no matter how good the scrape is. `_ensure_structured_
+# columns` adds whichever of these the sheet doesn't already have — by
+# EXACT header text, never by letter, so a file that already carries any of
+# these columns (in whatever position) is left completely untouched — styled
+# to match templates/PTAX_Master.xlsx cell-for-cell (pulled directly from
+# the template on 2026-07-02, not eyeballed).
+@dataclass
+class _StructuredColumnSpec:
+    header: str
+    # None for the analyst-owned columns (BOV, Jurisdiction links, Actual
+    # assessment) — the app never writes values there, same as on
+    # PTAX_Master itself; the column is created empty for the analyst to
+    # fill in by hand. Set only for the three cells the writeback owns.
+    fieldname: str | None
+    width: float
+    number_format: str
+    header_align: str
+    data_fill: str | None  # ARGB hex, or None for no fill
+
+
+_STRUCTURED_COLUMNS: list[_StructuredColumnSpec] = [
+    _StructuredColumnSpec("BOV high", None, 18.0, _CURRENCY_FMT_BOV, "center", None),
+    _StructuredColumnSpec("BOV mid", None, 13.0, _CURRENCY_FMT_BOV, "center", None),
+    _StructuredColumnSpec("BOV low", None, 13.0, _CURRENCY_FMT_BOV, "center", None),
+    _StructuredColumnSpec(
+        "Jurisdiction link primary", None, 22.42578125, "General", "left", None,
+    ),
+    _StructuredColumnSpec(
+        "Jurisdiction link secondary", None, 13.0, "General", "left", None,
+    ),
+    _StructuredColumnSpec(
+        "Jurisdiction link tertiary", None, 13.0, "General", "left", None,
+    ),
+    _StructuredColumnSpec(
+        "Payment amount", "payment_amount", 18.0, _CURRENCY_FMT, "center",
+        _CREAM_FILL,
+    ),
+    _StructuredColumnSpec(
+        "Payment date", "payment_date", 13.0, _DATE_FMT, "center", _CREAM_FILL,
+    ),
+    _StructuredColumnSpec("Actual assessment", None, 13.0, _CURRENCY_FMT_BOV, "center", None),
+    _StructuredColumnSpec(
+        "Confidence", "run_confidence", 12.0, "General", "center", _CREAM_FILL,
+    ),
+]
+
+
+def _find_header_column(ws, header_row: int, text: str) -> int | None:
+    target = " ".join(text.strip().lower().split())
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(row=header_row, column=c).value
+        if v is not None and " ".join(str(v).strip().lower().split()) == target:
+            return c
+    return None
+
+
+def _ensure_structured_columns(ws, sheet: SheetIntake) -> dict[str, ColumnInfo]:
+    """Add whichever PTAX_Master structured columns this sheet is missing;
+    leave every column that already exists completely alone. Returns
+    ColumnInfo for the fields the writeback can populate THIS run
+    (payment_amount, payment_date, run_confidence) — found via a fresh
+    header-text scan, since the intake pass that produced `sheet.columns`
+    ran before this function could have added them."""
+    resolved: dict[str, ColumnInfo] = {}
+    data_rows = [r.row_number for r in sheet.rows]
+    data_start, data_end = min(data_rows), max(data_rows)
+
+    for spec in _STRUCTURED_COLUMNS:
+        existing = _find_header_column(ws, sheet.header_row, spec.header)
+        if existing is not None:
+            if spec.fieldname:
+                letter = get_column_letter(existing)
+                resolved[spec.fieldname] = ColumnInfo(
+                    existing, letter, spec.header, spec.header, spec.fieldname,
+                )
+            continue
+
+        new_col = _last_used_column(ws, sheet) + 1
+        letter = get_column_letter(new_col)
+        header_cell = ws.cell(row=sheet.header_row, column=new_col)
+        header_cell.value = spec.header
+        header_cell.font = Font(name="Aptos Narrow", size=11, bold=True)
+        header_cell.alignment = Alignment(
+            horizontal=spec.header_align, vertical="center",
+        )
+        ws.column_dimensions[letter].width = spec.width
+        for r in range(data_start, data_end + 1):
+            cell = ws.cell(row=r, column=new_col)
+            cell.font = Font(name="Aptos Narrow", size=11)
+            cell.number_format = spec.number_format
+            if spec.data_fill:
+                cell.fill = PatternFill(fill_type="solid", fgColor=spec.data_fill)
+        if spec.fieldname:
+            resolved[spec.fieldname] = ColumnInfo(
+                new_col, letter, spec.header, spec.header, spec.fieldname,
+            )
+    return resolved
+
+
 def write_output(
     intake: WorkbookIntake,
     outcomes: dict[str, RowOutcome],
@@ -311,6 +428,14 @@ def write_output(
         data_rows = [r.row_number for r in sheet.rows]
         data_start, data_end = min(data_rows), max(data_rows)
 
+        # ---- PTAX_Master column parity: add whichever structured columns
+        # this sheet doesn't already have (BOV bands, Jurisdiction links,
+        # Payment amount/date, Actual assessment, Confidence), styled to
+        # match the template. Columns that already exist are untouched.
+        # Runs BEFORE the notes column resolves so notes still lands as
+        # the rightmost column, same as before this existed.
+        structured = _ensure_structured_columns(ws, sheet)
+
         # ---- Notes column: single, fixed-position, overwritten per run.
         notes_col = _resolve_notes_column(ws, sheet)
         notes_header = str(
@@ -324,10 +449,13 @@ def write_output(
         amount_cols = sheet.columns.get("amounts", [])
         # PTAX_Master structured cells (S–W). Absent on legacy workbooks
         # like the older Florida sheet; present on the master template.
+        # `structured` fills in whichever of the three the sheet didn't
+        # already have — freshly created above, so they populate THIS run
+        # instead of only becoming usable on the next re-upload.
         ultimate_info = sheet.first_col("ultimate_payment_due")
-        confidence_info = sheet.first_col("run_confidence")
-        paydate_info = sheet.first_col("payment_date")
-        payamt_info = sheet.first_col("payment_amount")
+        confidence_info = sheet.first_col("run_confidence") or structured.get("run_confidence")
+        paydate_info = sheet.first_col("payment_date") or structured.get("payment_date")
+        payamt_info = sheet.first_col("payment_amount") or structured.get("payment_amount")
         nextdue_info = sheet.first_col("next_due_date")
         date_fmt = (
             _column_number_format(ws, date_info.index, data_start, data_end)

@@ -21,6 +21,7 @@ import { NextResponse } from "next/server";
 import ExcelJS from "exceljs";
 
 import { TRACKER_LAYOUT } from "@/lib/tenant-credit/tracker-layout";
+import { stripExcelCommentsForExcelJs } from "@/lib/tenant-credit/xlsx-sanitize";
 
 // The corporate-financials master xlsx is ~200 KB. Cap at 8 MB so a
 // fat-finger upload of the wrong workbook (or a rich-media variant)
@@ -100,7 +101,8 @@ export async function POST(req: Request) {
   let workbook: ExcelJS.Workbook;
   try {
     workbook = new ExcelJS.Workbook();
-    await workbook.xlsx.load(await file.arrayBuffer());
+    const bytes = stripExcelCommentsForExcelJs(await file.arrayBuffer());
+    await workbook.xlsx.load(bytes);
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     return NextResponse.json(

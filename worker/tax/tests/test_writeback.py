@@ -124,9 +124,12 @@ def test_no_new_column_appended(florida_workbook, ptax_master_workbook, tmp_path
 
 
 def test_main_sheet_layout_unchanged(florida_workbook, tmp_path):
-    # Under the fixed-layout model (§10) the sheet width never grows on
-    # legacy workbooks: notes overwrite the rightmost existing month-
-    # update column, no per-run column append.
+    # Notes still never appends a per-run column — it overwrites the
+    # rightmost existing month-update column, same as before. But the
+    # sheet width DOES grow now: a legacy workbook like this one has none
+    # of the PTAX_Master structured columns (BOV bands, Jurisdiction
+    # links, Payment amount/date, Actual assessment, Confidence), so
+    # _ensure_structured_columns appends all 10 of them once.
     intake = parse_workbook(florida_workbook)
     out_path = str(tmp_path / "out.xlsx")
     write_output(intake, _outcomes(), RUN_DATE, out_path)
@@ -144,7 +147,29 @@ def test_main_sheet_layout_unchanged(florida_workbook, tmp_path):
     out_header_max = max(c for c in range(1, out_ws.max_column + 1)
                          if out_ws.cell(row=2, column=c).value is not None)
     assert in_header_max == 23
-    assert out_header_max == 23
+    assert out_header_max == 33  # 23 original + 10 new structured columns
+
+    new_headers = [
+        out_ws.cell(row=2, column=c).value for c in range(24, 34)
+    ]
+    assert new_headers == [
+        "BOV high", "BOV mid", "BOV low",
+        "Jurisdiction link primary", "Jurisdiction link secondary",
+        "Jurisdiction link tertiary", "Payment amount", "Payment date",
+        "Actual assessment", "Confidence",
+    ]
+
+    # Running it again on the freshly-written output must NOT add a
+    # second set of these columns — they already exist by header text.
+    intake2 = parse_workbook(out_path)
+    out_path2 = str(tmp_path / "out2.xlsx")
+    write_output(intake2, _outcomes(), RUN_DATE, out_path2)
+    out_ws2 = load_workbook(out_path2)["Florida Prop Tax"]
+    out_header_max2 = max(
+        c for c in range(1, out_ws2.max_column + 1)
+        if out_ws2.cell(row=2, column=c).value is not None
+    )
+    assert out_header_max2 == 33
 
 
 # ---------------------------------------------------------------------------

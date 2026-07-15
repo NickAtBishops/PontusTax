@@ -333,6 +333,19 @@ class FirestoreStore:
                 "assessed_value": outcome.write_assessed_value,
                 "amount_due": outcome.write_amount_due,
                 "discovered_url": outcome.discovered_url,
+                # PTAX_Master structured cells (§10) — computed by
+                # RowProcessor.process() but never round-tripped through
+                # Firestore until now, so write_output() (which reads
+                # back via collect_outcomes(), not the in-memory
+                # RowOutcome from processing) always saw these as None.
+                # Payment amount/date/Confidence — and BOV/Jurisdiction/
+                # Actual assessment once ensure_structured_columns gave
+                # them somewhere to land — silently never populated in
+                # the output workbook (2026-07-02).
+                "ultimate_payment_due": outcome.write_ultimate_payment_due,
+                "payment_date": outcome.write_payment_date,
+                "payment_amount": outcome.write_payment_amount,
+                "next_due_date": outcome.write_next_due_date,
             },
             "updated_at": self._ts(),
         }
@@ -448,6 +461,10 @@ class FirestoreStore:
                 write_assessed_value=writes.get("assessed_value"),
                 write_amount_due=writes.get("amount_due"),
                 discovered_url=writes.get("discovered_url"),
+                write_ultimate_payment_due=writes.get("ultimate_payment_due"),
+                write_payment_date=writes.get("payment_date"),
+                write_payment_amount=writes.get("payment_amount"),
+                write_next_due_date=writes.get("next_due_date"),
             )
         return out
 
