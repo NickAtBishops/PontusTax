@@ -32,6 +32,7 @@ export type SourceUnitsOverride = Exclude<SourceUnits, "unknown"> | "auto";
 export type ExtractionContext = {
   quarterId: QuarterId;
   unitsOverride: SourceUnitsOverride;
+  sourceFilename: string;
 };
 
 // The minimal shape the extractor returns. The route layer normalizes
@@ -227,7 +228,7 @@ Rules you follow without exception:
 
 5. Include statement subtotals, all revenue/profit/addback/rent/interest lines, cash and cash equivalents, cash from operations, and capital expenditures. Include intercompany lines verbatim. Exclude header-only rows.
 
-6. Report document_type, source_scope, source_scope_type, source_scope_identifiers, source_period, period_selection, and a source_reference for every item. entity_wide means the entire named tenant, not merely a report titled "Consolidated" for a subset of cost units. For a component report, list every actual location/cost-unit column identifier. Use period_selection=unresolved if the requested period cannot be isolated.
+6. Report document_type, source_scope, source_scope_type, source_scope_identifiers, source_period, period_selection, and a source_reference for every item. entity_wide means the entire named tenant, not merely a report titled "Consolidated" for a subset of cost units. The source filename is scope evidence: a filename suffix that names a location, facility, branch, store, or cost unit means that scope is single_component or component_subset even when the PDF header still shows the parent legal entity. For example, a file ending in "Boca" is a Boca component statement, not entity-wide. For a component report, list every actual location/cost-unit identifier, including an identifier supplied by the filename. Use period_selection=unresolved if the requested period cannot be isolated.
 
 7. Do not invent. If a label or amount is unreadable, omit it rather than guess.`;
 
@@ -236,7 +237,7 @@ function userInstruction(context: ExtractionContext): string {
     context.unitsOverride === "auto"
       ? "Detect units from explicit source evidence. Return unknown when evidence is absent."
       : `The analyst explicitly declares source units=${context.unitsOverride}; use that scale and cite the override as evidence.`;
-  return `Target period: ${quarterLabel(context.quarterId)} (${context.quarterId}). ${units} Extract only this target period, classify the document and scope, and return one selected-period amount per source row. Do not combine a rollup with component columns.`;
+  return `Source filename: ${JSON.stringify(context.sourceFilename)}. Target period: ${quarterLabel(context.quarterId)} (${context.quarterId}). ${units} Use both the filename and document contents to classify scope. A location or cost-unit qualifier in the filename is component scope even if the document header names the parent entity. Extract only this target period, classify the document and scope, and return one selected-period amount per source row. Do not combine a rollup with component columns.`;
 }
 
 // Defense-in-depth shape check. Structured outputs guarantees the JSON
@@ -357,7 +358,9 @@ async function runExtraction(
   const client = new Anthropic({ timeout: 100_000, maxRetries: 1 });
 
   const response = await client.messages.create({
-    model: "claude-opus-4-8",
+    model:
+      process.env.ANTHROPIC_TENANT_CREDIT_MODEL?.trim() ||
+      "claude-opus-4-8",
     max_tokens: 16000,
     thinking: { type: "adaptive" },
     output_config: {

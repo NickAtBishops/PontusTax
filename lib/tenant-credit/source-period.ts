@@ -100,6 +100,21 @@ export function parseSourcePeriod(value: string): SourcePeriod | null {
     return { startMonth, endMonth, year: Number(monthsEnded[3]) };
   }
 
+  // Annual / rolling-window phrasings that the month-name fallback
+  // below would misread as a single month. "Fiscal year ended March
+  // 31, 2026" and "Trailing 12 Months March 2026" would both parse as
+  // a March monthly and slip an ANNUAL statement past the quarter
+  // gate whenever the fiscal year happens to end inside the selected
+  // quarter. Refuse to guess instead — the merge layer turns null
+  // into a loud per-file error.
+  if (
+    /\b(fiscal\s+year|years?\s*[-\s]?end(?:ed|ing)?|annual(?:ized)?|trailing|rolling|t12m?|ltm|year[\s-]?to[\s-]?date|ytd|since\s+inception)\b/.test(
+      text,
+    )
+  ) {
+    return null;
+  }
+
   const isoDates = Array.from(
     text.matchAll(/\b(20\d{2})-(\d{1,2})-(\d{1,2})\b/g),
   );

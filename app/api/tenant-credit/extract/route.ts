@@ -177,6 +177,7 @@ export async function POST(req: Request) {
   const context = {
     quarterId: quarterIdRaw,
     unitsOverride: unitsOverrideRaw,
+    sourceFilename: file.name,
   };
 
   // The route no longer looks up a per-tenant config. The generic
