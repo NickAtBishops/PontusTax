@@ -29,6 +29,13 @@ import { quarterLabel, type QuarterId } from "./tracker-layout";
 export type SourceUnits = KnownSourceUnits | "unknown";
 export type SourceUnitsOverride = Exclude<SourceUnits, "unknown"> | "auto";
 
+export class ExtractionTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ExtractionTimeoutError";
+  }
+}
+
 export type ExtractionContext = {
   quarterId: QuarterId;
   unitsOverride: SourceUnitsOverride;
@@ -357,22 +364,44 @@ async function runExtraction(
   // ~200s. The route layer maxDuration is raised to 240s to match.
   const client = new Anthropic({ timeout: 100_000, maxRetries: 1 });
 
-  const response = await client.messages.create({
-    model:
-      process.env.ANTHROPIC_TENANT_CREDIT_MODEL?.trim() ||
-      "claude-opus-4-8",
-    max_tokens: 16000,
-    thinking: { type: "adaptive" },
-    output_config: {
-      effort: "high",
-      format: {
-        type: "json_schema",
-        schema: EXTRACTION_SCHEMA,
+  const controller = new AbortController();
+  let wallClockExpired = false;
+  const wallClockTimer = setTimeout(() => {
+    wallClockExpired = true;
+    controller.abort();
+  }, 215_000);
+
+  let response: Anthropic.Messages.Message;
+  try {
+    response = await client.messages.create(
+      {
+        model:
+          process.env.ANTHROPIC_TENANT_CREDIT_MODEL?.trim() ||
+          "claude-opus-4-8",
+        max_tokens: 16000,
+        thinking: { type: "adaptive" },
+        output_config: {
+          effort: "high",
+          format: {
+            type: "json_schema",
+            schema: EXTRACTION_SCHEMA,
+          },
+        },
+        system: SYSTEM_PROMPT,
+        messages: [{ role: "user", content: userContent }],
       },
-    },
-    system: SYSTEM_PROMPT,
-    messages: [{ role: "user", content: userContent }],
-  });
+      { signal: controller.signal, timeout: 100_000 },
+    );
+  } catch (error) {
+    if (wallClockExpired) {
+      throw new ExtractionTimeoutError(
+        "Anthropic extraction exceeded the 215-second hard deadline after retries.",
+      );
+    }
+    throw error;
+  } finally {
+    clearTimeout(wallClockTimer);
+  }
 
   if (response.stop_reason !== "end_turn") {
     throw new Error(
