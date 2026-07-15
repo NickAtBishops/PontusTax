@@ -70,6 +70,17 @@ STRICT_HEADERS: dict[str, str] = {
     "confidence":           "run_confidence",      # PTAX_Master AB
     "ultimate payment due": "ultimate_payment_due",  # legacy template only
     "next due date":        "next_due_date",         # legacy template only
+    # Jurisdiction Links band (PTAX_Master V/W/X). These headers contain the
+    # word "link", which the fuzzy `website` synonym would otherwise match —
+    # collapsing all three into the same bucket as "Website" and silently
+    # dropping them (only the first-encountered column wins per fieldname
+    # outside MULTI_FIELDS). Strict, exact-header matches give each of these
+    # three its own canonical field so the scraping engine can visit them as
+    # additional jurisdictions to check (analyst-filled; write-back never
+    # writes to them — see writeback._WRITABLE_FIELDS).
+    "jurisdiction link primary":   "jurisdiction_link_primary",
+    "jurisdiction link secondary": "jurisdiction_link_secondary",
+    "jurisdiction link tertiary":  "jurisdiction_link_tertiary",
 }
 _STRICT_SPECIFICITY = 1000  # any strict hit beats every fuzzy hit
 
@@ -105,6 +116,15 @@ class RowIntake:
     accounts: list[AccountCandidates] = field(default_factory=list)
     tax_year: str | None = None
     url: str | None = None
+    # Jurisdiction Links band (PTAX_Master V/W/X) — analyst-filled reference
+    # URLs for OTHER taxing authorities/portals this same property may owe
+    # to (e.g. a county tax collector plus a special assessment district).
+    # Read-only reference data: the write-back never writes to these (§10.5)
+    # but the scraping engine checks each one that's filled in, in addition
+    # to `url` (the "Website" column) — see `check_urls()` below.
+    jurisdiction_link_primary: str | None = None
+    jurisdiction_link_secondary: str | None = None
+    jurisdiction_link_tertiary: str | None = None
     responsible_party: str | None = None
     date_paid_existing: Any = None
     confirmation_existing: Any = None
@@ -116,6 +136,37 @@ class RowIntake:
     def full_address(self) -> str:
         parts = [self.address, self.city, self.state, self.zip]
         return ", ".join(str(p).strip() for p in parts if p)
+
+    def check_urls(self) -> list[tuple[str, str]]:
+        """Every portal URL this row should be checked against, as ordered
+        (label, url) pairs: "Website" first (when non-empty — an empty
+        Website is a §4.6 discovery concern, not something this method
+        fills in), then whichever of the three Jurisdiction Link columns
+        carry a URL, in primary/secondary/tertiary order.
+
+        A single property can owe tax to more than one taxing authority
+        (e.g. county + a special assessment district), so every non-empty
+        link is checked — not merely as a fallback when Website fails.
+
+        Duplicate URLs (identical string, analyst pasted the same link into
+        two columns) are checked only ONCE; the first-listed label wins.
+        """
+        candidates = [
+            ("Website", self.url),
+            ("Jurisdiction link primary", self.jurisdiction_link_primary),
+            ("Jurisdiction link secondary", self.jurisdiction_link_secondary),
+            ("Jurisdiction link tertiary", self.jurisdiction_link_tertiary),
+        ]
+        seen: set[str] = set()
+        out: list[tuple[str, str]] = []
+        for label, url in candidates:
+            if not url:
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
+            out.append((label, url))
+        return out
 
 
 @dataclass
@@ -354,6 +405,25 @@ def parse_workbook(path: str) -> WorkbookIntake:
             web_info = columns.get("website", [None])[0] if columns.get("website") else None
             if web_info is not None:
                 url = _extract_url(ws.cell(row=r, column=web_info.index))
+            jl_primary = jl_secondary = jl_tertiary = None
+            jl_primary_info = (
+                columns.get("jurisdiction_link_primary", [None])[0]
+                if columns.get("jurisdiction_link_primary") else None
+            )
+            if jl_primary_info is not None:
+                jl_primary = _extract_url(ws.cell(row=r, column=jl_primary_info.index))
+            jl_secondary_info = (
+                columns.get("jurisdiction_link_secondary", [None])[0]
+                if columns.get("jurisdiction_link_secondary") else None
+            )
+            if jl_secondary_info is not None:
+                jl_secondary = _extract_url(ws.cell(row=r, column=jl_secondary_info.index))
+            jl_tertiary_info = (
+                columns.get("jurisdiction_link_tertiary", [None])[0]
+                if columns.get("jurisdiction_link_tertiary") else None
+            )
+            if jl_tertiary_info is not None:
+                jl_tertiary = _extract_url(ws.cell(row=r, column=jl_tertiary_info.index))
             address = _clean(val("address", r)) or None
             if not (account_raw or url or address):
                 continue  # totals row, spacer, narrative row
@@ -376,6 +446,9 @@ def parse_workbook(path: str) -> WorkbookIntake:
                     accounts=split_accounts(account_raw),
                     tax_year=_clean(year_val) or None,
                     url=url,
+                    jurisdiction_link_primary=jl_primary,
+                    jurisdiction_link_secondary=jl_secondary,
+                    jurisdiction_link_tertiary=jl_tertiary,
                     responsible_party=_clean(val("responsible_party", r)) or None,
                     date_paid_existing=val("date_paid", r),
                     confirmation_existing=val("confirmation", r),

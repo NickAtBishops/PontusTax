@@ -446,8 +446,12 @@ def test_writeback_guard_blocks_protected_columns(ptax_master_workbook):
                     break
             if info:
                 break
-        # BOV high (S) and Jurisdiction primary (V) aren't mapped to any
-        # canonical field at all — synthesize a bare ColumnInfo for them.
+        # BOV high (S) isn't mapped to any canonical field at all —
+        # synthesize a bare ColumnInfo for it. Jurisdiction link primary (V)
+        # IS mapped now (to jurisdiction_link_primary, added so the scraping
+        # engine can also check it — see intake.STRICT_HEADERS), so the loop
+        # above finds its real ColumnInfo; the guard must still fire for it
+        # since jurisdiction_link_primary is not in _WRITABLE_FIELDS.
         if info is None:
             info = ColumnInfo(
                 index=col, letter=get_column_letter(col),

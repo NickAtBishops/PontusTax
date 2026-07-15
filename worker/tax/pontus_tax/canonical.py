@@ -66,6 +66,12 @@ class AccountRecord:
     source_url: str | None = None
     evidence: str | None = None
     confidence: str = LOW
+    # Which of the row's checked URLs produced this record — e.g. "Website"
+    # or "Jurisdiction link secondary" (see intake.RowIntake.check_urls()).
+    # None when the row only had one URL to check (the common case), which
+    # keeps single-URL rows' evidence/output text identical to before this
+    # field existed.
+    jurisdiction_label: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

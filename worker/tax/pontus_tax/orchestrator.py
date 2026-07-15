@@ -86,6 +86,76 @@ def _roll_type_for(row: RowIntake) -> str:
     return "real_estate"
 
 
+def _job_domains(job: "RowJob") -> list[str]:
+    """Every portal domain this row's job could touch this run: the
+    Website domain plus each non-empty Jurisdiction Link domain, or the
+    §4.6 discovery placeholder domain (`discover:{county}-{state}`) when
+    the row has no URL at all. Used by `_group_jobs_by_shared_domain` so
+    two rows sharing a domain — even when it's only a SECONDARY/TERTIARY
+    link on one of them, not its primary Website — still get bucketed
+    into the same sequential, one-session-at-a-time group (CLAUDE.md §11:
+    "several rows share the same portal; reuse the session, don't
+    hammer")."""
+    urls = job.row.check_urls()
+    if not urls:
+        return [
+            f"discover:{(job.row.county or 'unknown').lower()}-"
+            f"{(job.row.state or '').lower()}"
+        ]
+    domains = {domain_of(url) for _, url in urls}
+    return sorted(domains)
+
+
+def _group_jobs_by_shared_domain(jobs: list["RowJob"]) -> list[list["RowJob"]]:
+    """Connected-components grouping: two jobs are linked if they share ANY
+    domain (from `_job_domains` — the row's FULL url-list domains, not just
+    its Website). All jobs in the same connected component become one
+    sequential bucket, so a portal domain that appears as row A's Website
+    AND row B's Jurisdiction link secondary is never scheduled on two
+    concurrent sessions at once.
+
+    Buckets are returned in a stable, deterministic order (sorted by each
+    bucket's smallest domain string, mirroring the previous
+    `sorted(by_domain.items())` determinism); jobs within a bucket keep
+    their relative order from the input `jobs` list."""
+    parent: dict[int, int] = {}
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i in range(len(jobs)):
+        parent[i] = i
+
+    domain_owner: dict[str, int] = {}
+    for i, job in enumerate(jobs):
+        for domain in _job_domains(job):
+            if domain in domain_owner:
+                union(domain_owner[domain], i)
+            else:
+                domain_owner[domain] = i
+
+    components: dict[int, list[int]] = {}
+    for i in range(len(jobs)):
+        components.setdefault(find(i), []).append(i)
+
+    def bucket_key(indices: list[int]) -> str:
+        return min(
+            (d for i in indices for d in _job_domains(jobs[i])),
+            default="",
+        )
+
+    ordered = sorted(components.values(), key=bucket_key)
+    return [[jobs[i] for i in indices] for indices in ordered]
+
+
 def _needs_review_record(account: str, reason: str) -> AccountRecord:
     return AccountRecord(
         account_searched=account,
@@ -138,64 +208,50 @@ class RowProcessor:
             outcome.confidence = LOW
             return outcome
 
-        # ---- portal URL (§4.6: discover when the cell is empty) --------
-        url = row.url
-        if not url:
+        # ---- portal URL list (§4.6: discover Website when the cell is
+        # empty; the Jurisdiction Link columns are reference-only and are
+        # NEVER independently discovered — an empty link cell just means
+        # nothing to check there). A property can owe tax to more than one
+        # taxing authority, so every non-empty URL on the row is checked,
+        # not merely as a fallback when Website fails.
+        urls = row.check_urls()
+        if not row.url:
             if row.county:
-                url = await discover_portal(row.county, row.state)
-            if url:
-                outcome.discovered_url = url
-                self.discovered_urls.append(
-                    f"{job.sheet.name} row {row.row_number}: discovered {url}"
-                )
-            else:
-                outcome.row_status = NEEDS_REVIEW
-                outcome.needs_review_reason = (
-                    "no portal URL in the sheet and no official portal found"
-                )
-                outcome.status_note = f"NEEDS REVIEW — {outcome.needs_review_reason}"
-                outcome.confidence = LOW
-                return outcome
+                discovered = await discover_portal(row.county, row.state)
+                if discovered:
+                    outcome.discovered_url = discovered
+                    self.discovered_urls.append(
+                        f"{job.sheet.name} row {row.row_number}: discovered {discovered}"
+                    )
+                    # Insert at the front, mirroring Website's normal slot,
+                    # but dedupe against any jurisdiction link that already
+                    # carries the exact same URL.
+                    if discovered not in {u for _, u in urls}:
+                        urls = [("Website", discovered)] + urls
 
-        playbook = match_playbook(url, self.playbooks)
-        taxonomy = classify_url(url, playbook)
-        roll_type = _roll_type_for(row)
-        domain = domain_of(url)
-
-        groups = row.accounts or [
-            AccountCandidates(display=row.address or "property", candidates=[])
-        ]
-        multi_note = None
-        if len(groups) > 1:
-            ids = ", ".join(g.display for g in groups)
-            multi_note = (
-                f"This spreadsheet row covers {len(groups)} separate accounts "
-                f"({ids}). THIS task is about ONE of them only — see the "
-                "search value."
+        if not urls:
+            outcome.row_status = NEEDS_REVIEW
+            outcome.needs_review_reason = (
+                "no portal URL in the sheet and no official portal found"
             )
+            outcome.status_note = f"NEEDS REVIEW — {outcome.needs_review_reason}"
+            outcome.confidence = LOW
+            return outcome
 
+        multi_url = len(urls) > 1
         records: list[AccountRecord] = []
-        portal_dead = False
+        for label, url in urls:
+            url_label = label if multi_url else None
+            records.extend(await self._process_url(job, url, url_label, outcome))
 
-        for group in groups:
-            if portal_dead:
-                records.append(
-                    _needs_review_record(group.display, "portal blocked earlier in this row")
-                )
-                continue
-            rec, dead = await self._check_account(
-                job, group, url, domain, taxonomy, roll_type, playbook,
-                multi_note, outcome,
-            )
-            records.append(rec)
-            portal_dead = dead
-
-        # ---- aggregate (§5.6) ------------------------------------------
+        # ---- aggregate (§5.6) — across ALL urls checked -----------------
         outcome.accounts = records
         outcome.row_status = aggregate_status([r.status for r in records])
         outcome.confidence = min_confidence([r.confidence for r in records])
         outcome.evidence = " | ".join(
-            f"{r.account_searched}: {r.evidence}" for r in records if r.evidence
+            (f"[{r.jurisdiction_label}] " if r.jurisdiction_label else "")
+            + f"{r.account_searched}: {r.evidence}"
+            for r in records if r.evidence
         )[:3000]
         if outcome.row_status in (NEEDS_REVIEW, UNREACHABLE):
             outcome.needs_review_reason = next(
@@ -243,6 +299,68 @@ class RowProcessor:
                 outcome.write_next_due_date = min(upcoming)
 
         return outcome
+
+    # ------------------------------------------------------------------
+    async def _process_url(
+        self,
+        job: RowJob,
+        url: str,
+        url_label: str | None,
+        outcome: RowOutcome,
+    ) -> list[AccountRecord]:
+        """Run the full per-URL body — playbook match, taxonomy
+        classification, roll-type/domain resolution, and the row's account
+        ladder — against ONE portal URL. Returns the AccountRecords produced
+        (one per account group on the row).
+
+        `url_label` is the jurisdiction label ("Website", "Jurisdiction
+        link secondary", …) when the row has more than one URL to check;
+        None for the common single-URL case, so a single-URL row's records
+        get `jurisdiction_label=None` — identical to before this method
+        existed.
+
+        `portal_dead` (a Type-E block/login-wall discovered mid-ladder) is
+        scoped to THIS url only: a dead Website portal must not skip a
+        different jurisdiction link's account checks for the same row.
+        """
+        row = job.row
+        playbook = match_playbook(url, self.playbooks)
+        taxonomy = classify_url(url, playbook)
+        roll_type = _roll_type_for(row)
+        domain = domain_of(url)
+
+        groups = row.accounts or [
+            AccountCandidates(display=row.address or "property", candidates=[])
+        ]
+        multi_note = None
+        if len(groups) > 1:
+            ids = ", ".join(g.display for g in groups)
+            multi_note = (
+                f"This spreadsheet row covers {len(groups)} separate accounts "
+                f"({ids}). THIS task is about ONE of them only — see the "
+                "search value."
+            )
+
+        records: list[AccountRecord] = []
+        portal_dead = False
+
+        for group in groups:
+            if portal_dead:
+                rec = _needs_review_record(
+                    group.display, "portal blocked earlier in this row"
+                )
+                rec.jurisdiction_label = url_label
+                records.append(rec)
+                continue
+            rec, dead = await self._check_account(
+                job, group, url, domain, taxonomy, roll_type, playbook,
+                multi_note, outcome,
+            )
+            rec.jurisdiction_label = url_label
+            records.append(rec)
+            portal_dead = dead
+
+        return records
 
     # ------------------------------------------------------------------
     async def _check_account(
@@ -647,18 +765,20 @@ async def execute_run(
                 "info", f"reaped {reaped} orphaned browser session(s) at startup"
             )
 
-    # Group by portal domain — same portal: one session, sequential, polite.
-    by_domain: dict[str, list[RowJob]] = {}
-    for job in todo:
-        domain = domain_of(job.row.url) if job.row.url else (
-            f"discover:{(job.row.county or 'unknown').lower()}-{(job.row.state or '').lower()}"
-        )
-        by_domain.setdefault(domain, []).append(job)
+    # Group by shared portal domain — same portal: one session, sequential,
+    # polite. A row can now touch MULTIPLE domains (its Website's domain
+    # plus each non-empty Jurisdiction Link's domain), so this is a
+    # connected-components grouping rather than a single-domain-per-job
+    # dict: two jobs land in the same sequential bucket if they share ANY
+    # domain, even when that shared domain is only a secondary/tertiary
+    # link on one of them — otherwise two different rows could be
+    # scheduled concurrently against the same live portal.
+    domain_groups = _group_jobs_by_shared_domain(todo)
 
     sem = asyncio.Semaphore(max(1, cfg.max_concurrency))
     canceled = False
 
-    async def run_domain(domain: str, domain_jobs: list[RowJob]) -> None:
+    async def run_domain(domain_jobs: list[RowJob]) -> None:
         async with sem:
             for job in domain_jobs:
                 if canceled:
@@ -690,9 +810,7 @@ async def execute_run(
                     )
                     store.mark_failed(job.key, err, oc)
 
-    work = asyncio.gather(*(
-        run_domain(d, js) for d, js in sorted(by_domain.items())
-    ))
+    work = asyncio.gather(*(run_domain(js) for js in domain_groups))
 
     async def watch_cancel() -> None:
         # Poll the cancel flag while rows run; on cancel, abort the in-flight

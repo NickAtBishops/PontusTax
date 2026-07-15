@@ -166,3 +166,139 @@ def test_strict_header_is_case_and_whitespace_tolerant():
     # ultimate_payment_due. (It falls through to a fuzzy match elsewhere
     # or returns None; here we just assert the strict path doesn't fire.)
     assert _match_field("Amount due now")[0] != "ultimate_payment_due"
+
+
+# ---------------------------------------------------------------------------
+# Jurisdiction Link columns (V/W/X) — checker must visit these too, not just
+# "Website". The word "link" in these headers otherwise fuzzy-collides with
+# the `website` synonym table; STRICT_HEADERS gives them their own fields.
+# ---------------------------------------------------------------------------
+
+
+def test_jurisdiction_link_headers_resolve_via_strict_match_not_fuzzy():
+    assert _match_field("Jurisdiction link primary")[0] == "jurisdiction_link_primary"
+    assert _match_field("Jurisdiction link secondary")[0] == "jurisdiction_link_secondary"
+    assert _match_field("Jurisdiction link tertiary")[0] == "jurisdiction_link_tertiary"
+    # Case/whitespace tolerant, like every other strict header.
+    assert _match_field("  JURISDICTION   LINK  PRIMARY  ")[0] == (
+        "jurisdiction_link_primary"
+    )
+
+
+def test_jurisdiction_link_columns_no_longer_ambiguous_on_real_template(
+    ptax_master_workbook,
+):
+    from openpyxl import load_workbook
+
+    wb = load_workbook(ptax_master_workbook)
+    ws = wb["Property Tax"]
+    # Row 5 is the template's sample data row; V/W/X already carry a URL
+    # (V) and are blank (W, X) — fill W/X too so all three are exercised.
+    ws["W5"] = "https://example-secondary.county-taxes.net/public"
+    ws["X5"] = "https://example-tertiary.county-taxes.net/public"
+    wb.save(ptax_master_workbook)
+
+    intake = parse_workbook(ptax_master_workbook)
+    sheet = intake.sheets[0]
+    m = sheet.mapping_doc()
+
+    assert m["jurisdiction_link_primary"] == "V"
+    assert m["jurisdiction_link_secondary"] == "W"
+    assert m["jurisdiction_link_tertiary"] == "X"
+    # "website" must map ONLY to R — none of V/W/X collide into it anymore.
+    assert m["website"] == "R"
+
+    # No ambiguous-column log entries mentioning V, W, or X.
+    for letter in ("V", "W", "X"):
+        assert not any(
+            f"column {letter} " in note for note in sheet.ambiguous
+        ), sheet.ambiguous
+
+    row5 = next(r for r in sheet.rows if r.row_number == 5)
+    assert row5.jurisdiction_link_primary == (
+        "https://county-taxes.net/fl-clay/property-tax/"
+        "Y2xheTpyZWFsX2VzdGF0ZTpwYXJlbnRzOjM2OTQwMzc0LTM0N2MtMTFlZC05NzQ1LThlM2ZlZjFhN2Q3MQ=="
+    )
+    assert row5.jurisdiction_link_secondary == (
+        "https://example-secondary.county-taxes.net/public"
+    )
+    assert row5.jurisdiction_link_tertiary == (
+        "https://example-tertiary.county-taxes.net/public"
+    )
+
+
+def test_row_intake_exposes_jurisdiction_link_fields(florida_workbook):
+    # Even on a workbook with none of these columns, RowIntake still
+    # carries the three attributes (defaulting to None).
+    sheet = parse_workbook(florida_workbook).sheets[0]
+    row = sheet.rows[0]
+    assert row.jurisdiction_link_primary is None
+    assert row.jurisdiction_link_secondary is None
+    assert row.jurisdiction_link_tertiary is None
+
+
+def _clear_cell(ws, ref: str) -> None:
+    """Blank a cell's value AND any hyperlink object — plain `ws[ref] = None`
+    leaves a pre-existing hyperlink target in place (openpyxl stores it
+    separately from `.value`), which would make `_extract_url` keep
+    resolving a URL from a cell the test meant to empty out."""
+    cell = ws[ref]
+    cell.value = None
+    cell.hyperlink = None
+
+
+def test_check_urls_orders_dedupes_and_skips_blank_website(ptax_master_workbook):
+    from openpyxl import load_workbook
+
+    wb = load_workbook(ptax_master_workbook)
+    ws = wb["Property Tax"]
+    # Row 5: give Website (R) and Jurisdiction link primary (V) distinct
+    # URLs (the template ships them mirrored), duplicate Website's URL
+    # into secondary (W) to prove dedup, and give tertiary (X) a third,
+    # distinct URL.
+    website_url = "https://example-website.county-taxes.net/public"
+    primary_url = "https://example-primary.county-taxes.net/public"
+    tertiary_url = "https://example-tertiary.county-taxes.net/public"
+    _clear_cell(ws, "R5")
+    _clear_cell(ws, "V5")
+    ws["R5"] = website_url
+    ws["V5"] = primary_url
+    ws["W5"] = website_url  # exact-string duplicate of Website
+    ws["X5"] = tertiary_url
+    wb.save(ptax_master_workbook)
+
+    sheet = parse_workbook(ptax_master_workbook).sheets[0]
+    row5 = next(r for r in sheet.rows if r.row_number == 5)
+    urls = row5.check_urls()
+
+    # Website + primary + tertiary; secondary is deduped away (same string
+    # as Website, and Website is listed first, so Website's label wins).
+    assert urls == [
+        ("Website", website_url),
+        ("Jurisdiction link primary", primary_url),
+        ("Jurisdiction link tertiary", tertiary_url),
+    ]
+
+
+def test_check_urls_includes_jurisdiction_link_when_website_blank(
+    ptax_master_workbook,
+):
+    from openpyxl import load_workbook
+
+    wb = load_workbook(ptax_master_workbook)
+    ws = wb["Property Tax"]
+    _clear_cell(ws, "R5")  # blank out Website (clears its hyperlink too)
+    _clear_cell(ws, "V5")  # blank out the template's default primary link
+    ws["W5"] = "https://only-jurisdiction-link.county-taxes.net/public"
+    wb.save(ptax_master_workbook)
+
+    sheet = parse_workbook(ptax_master_workbook).sheets[0]
+    row5 = next(r for r in sheet.rows if r.row_number == 5)
+    assert row5.url is None
+    urls = row5.check_urls()
+    assert urls == [
+        (
+            "Jurisdiction link secondary",
+            "https://only-jurisdiction-link.county-taxes.net/public",
+        )
+    ]
