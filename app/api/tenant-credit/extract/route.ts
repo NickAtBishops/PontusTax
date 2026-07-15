@@ -28,6 +28,7 @@ import ExcelJS from "exceljs";
 import { createHash } from "node:crypto";
 
 import {
+  ExtractionTimeoutError,
   extractFromPdf,
   extractFromXlsxText,
   type SourceUnitsOverride,
@@ -37,6 +38,7 @@ import {
   ALL_QUARTER_IDS,
   type QuarterId,
 } from "@/lib/tenant-credit/tracker-layout";
+import { applyFilenameScopeGuard } from "@/lib/tenant-credit/source-scope";
 import { stripExcelCommentsForExcelJs } from "@/lib/tenant-credit/xlsx-sanitize";
 
 const XLSX_MIME =
@@ -148,6 +150,13 @@ export async function POST(req: Request) {
   const tenantIdRaw = form.get("tenant_id");
   const quarterIdRaw = form.get("quarter_id");
   const unitsOverrideRaw = form.get("source_units_override") ?? "auto";
+  // Optional per-file analyst override: when set (a non-empty reason
+  // string), a period that doesn't match the selected quarter is
+  // accepted anyway instead of refused with 422. Modeled on the
+  // existing entity_override_reason pattern in the writeback route —
+  // an explicit reason is required, and it is threaded back into the
+  // response so the merge layer and audit trail can see it.
+  const periodOverrideReasonRaw = form.get("period_override_reason");
 
   if (!(file instanceof File)) {
     return NextResponse.json(
@@ -174,6 +183,16 @@ export async function POST(req: Request) {
       { status: 400 },
     );
   }
+  if (
+    periodOverrideReasonRaw !== null &&
+    typeof periodOverrideReasonRaw !== "string"
+  ) {
+    return NextResponse.json(
+      { error: "`period_override_reason` must be a string." },
+      { status: 400 },
+    );
+  }
+  const periodOverrideReason = (periodOverrideReasonRaw ?? "").trim();
   const context = {
     quarterId: quarterIdRaw,
     unitsOverride: unitsOverrideRaw,
@@ -324,6 +343,30 @@ export async function POST(req: Request) {
         { status: 429 },
       );
     }
+    if (
+      err instanceof ExtractionTimeoutError ||
+      err instanceof Anthropic.APIConnectionTimeoutError ||
+      err instanceof Anthropic.APIUserAbortError
+    ) {
+      return NextResponse.json(
+        {
+          error:
+            "Anthropic extraction timed out before a complete structured response. " +
+            "No values were accepted; retry the file.",
+        },
+        { status: 504 },
+      );
+    }
+    if (err instanceof Anthropic.APIConnectionError) {
+      return NextResponse.json(
+        {
+          error:
+            "Could not connect to Anthropic after retries. No values were accepted; " +
+            "retry when the service or network is available.",
+        },
+        { status: 502 },
+      );
+    }
     if (err instanceof Anthropic.APIError) {
       return NextResponse.json(
         { error: `Anthropic API error (${err.status}): ${err.message}` },
@@ -338,8 +381,15 @@ export async function POST(req: Request) {
     );
   }
 
+  const scopeGuard = applyFilenameScopeGuard(raw, file.name);
+  raw = scopeGuard.extraction;
+
   const parsedPeriod = parseSourcePeriod(raw.source_period);
-  if (parsedPeriod && !periodInsideQuarter(parsedPeriod, quarterIdRaw)) {
+  if (
+    parsedPeriod &&
+    !periodInsideQuarter(parsedPeriod, quarterIdRaw) &&
+    !periodOverrideReason
+  ) {
     return NextResponse.json(
       {
         code: "SOURCE_PERIOD_OUTSIDE_QUARTER",
@@ -389,12 +439,22 @@ export async function POST(req: Request) {
       { status: 422 },
     );
   }
-  if (!parsedPeriod || !periodInsideQuarter(parsedPeriod, quarterIdRaw)) {
+  if (
+    (!parsedPeriod || !periodInsideQuarter(parsedPeriod, quarterIdRaw)) &&
+    !periodOverrideReason
+  ) {
+    // Same machine-readable shape as the SOURCE_PERIOD_OUTSIDE_QUARTER
+    // check above (this one additionally catches a genuinely unparseable
+    // period, not just a parseable-but-wrong one) so the UI can offer
+    // the same "Include anyway" override retry for either case.
     return NextResponse.json(
       {
+        code: "SOURCE_PERIOD_OUTSIDE_QUARTER",
         error:
           `${file.name}: extracted period "${raw.source_period}" does not fall ` +
           `inside ${quarterIdRaw.replace("_", " ")}.`,
+        source_period: raw.source_period,
+        source_file_hash: sourceFileHash,
       },
       { status: 422 },
     );
@@ -412,9 +472,12 @@ export async function POST(req: Request) {
     source_scope: raw.source_scope,
     source_scope_type: raw.source_scope_type,
     source_scope_identifiers: raw.source_scope_identifiers,
+    scope_guard_applied: scopeGuard.applied,
+    scope_guard_evidence: scopeGuard.evidence,
     period_selection: raw.period_selection,
     line_items: raw.line_items,
     normalization_applied: [],
     passed_through: raw.line_items.map((i) => i.label),
+    period_override_reason: periodOverrideReason || undefined,
   });
 }

@@ -32,6 +32,18 @@ export type MergeExtract = {
     amount: number;
     source_reference: string;
   }[];
+  // Analyst-supplied reason when this extract's own source_period does
+  // NOT fall inside the selected quarter but the analyst wants it
+  // included anyway (an explicit judgment call, not a mistake). Empty
+  // string ("") means no override. Mirrors the existing
+  // entity_override_reason pattern in the writeback route: a non-empty
+  // reason is required before the mismatch is allowed through, and the
+  // reason is surfaced in the audit trail (see writeback route). This
+  // ONLY waives the "does this extract's period match the selected
+  // quarter" check below — every other check (coverage, overlap,
+  // entity-wide exclusion, unparseable-period-with-NO-override) still
+  // runs and can still throw.
+  period_override_reason?: string;
 };
 
 export type ExcludedExtract = {
@@ -87,9 +99,19 @@ function assertQuarterCoverage(
   quarterId: QuarterId,
 ): void {
   const quarter = quarterPeriod(quarterId);
-  const types = new Set(extracts.map((extract) => extract.document_type));
+  // An overridden extract whose period is genuinely unparseable has no
+  // entry in `periods` — it has no known months, so it cannot
+  // contribute to (or be checked against) month-coverage math. It is
+  // still summed into totals by the caller; this function only
+  // decides whether the REMAINING extracts fully cover the quarter.
+  const withKnownPeriod = extracts.filter((extract) =>
+    periods.has(extract.source_file_hash),
+  );
+  const types = new Set(withKnownPeriod.map((extract) => extract.document_type));
   for (const type of types) {
-    const sameType = extracts.filter((extract) => extract.document_type === type);
+    const sameType = withKnownPeriod.filter(
+      (extract) => extract.document_type === type,
+    );
     if (type === "balance_sheet") {
       for (const extract of sameType) {
         const period = periods.get(extract.source_file_hash)!;
@@ -242,6 +264,18 @@ export function mergeLineItems(
 ): MergeResult {
   if (extracts.length === 0) throw new Error("No source extracts to merge.");
 
+  // Extracts whose own period doesn't match the selected quarter but
+  // carry an analyst-supplied period_override_reason skip ONLY the two
+  // throws below (unparseable period / outside the quarter). Every
+  // other check in this function — coverage, overlap, entity-wide
+  // exclusion — still runs against them unchanged. When the period IS
+  // parseable (just outside the quarter), it's still recorded in
+  // `periods` so overlap/coverage math has a real period to use. When
+  // it's genuinely unparseable even with the override, the extract has
+  // no entry in `periods` at all: it is still summed into totals below,
+  // but excluded from month-coverage accounting (assertQuarterCoverage)
+  // and from any check that requires comparing periods, since there is
+  // no period to compare. See `hasKnownPeriod` guards below.
   const periods = new Map<string, SourcePeriod>();
   const hashes = new Set<string>();
   for (const extract of extracts) {
@@ -254,14 +288,16 @@ export function mergeLineItems(
       );
     }
     hashes.add(extract.source_file_hash);
+    const overridden = Boolean(extract.period_override_reason);
     const period = parseSourcePeriod(extract.source_period);
     if (!period) {
+      if (overridden) continue;
       throw new Error(
         `${extract.source_filename}: source period "${extract.source_period}" ` +
           "could not be converted to a calendar period. Refusing to guess.",
       );
     }
-    if (!periodInsideQuarter(period, quarterId)) {
+    if (!periodInsideQuarter(period, quarterId) && !overridden) {
       throw new Error(
         `${extract.source_filename}: source period "${extract.source_period}" ` +
           `does not fall inside ${quarterId.replace("_", " ")}.`,
@@ -270,14 +306,24 @@ export function mergeLineItems(
     periods.set(extract.source_file_hash, period);
   }
 
+  // An overridden extract with a genuinely unparseable period has no
+  // entry in `periods` (see the loop above). It cannot be compared by
+  // period to anything else, so it can neither be excluded as
+  // overlapping a rollup nor flag ANOTHER extract as overlapping it —
+  // it simply skips every period-comparison check below and goes
+  // straight to the sum.
+  const hasKnownPeriod = (extract: MergeExtract): boolean =>
+    periods.has(extract.source_file_hash);
+
   const excluded = new Map<string, string>();
   for (const rollup of extracts.filter(
-    (extract) => extract.source_scope_type === "entity_wide",
+    (extract) => extract.source_scope_type === "entity_wide" && hasKnownPeriod(extract),
   )) {
     const rollupPeriod = periods.get(rollup.source_file_hash)!;
     const overlappingRollups = extracts.filter((candidate) => {
       if (candidate.source_file_hash === rollup.source_file_hash) return false;
       if (candidate.source_scope_type !== "entity_wide") return false;
+      if (!hasKnownPeriod(candidate)) return false;
       return (
         documentTypesOverlap(rollup.document_type, candidate.document_type) &&
         periodsOverlap(rollupPeriod, periods.get(candidate.source_file_hash)!)
@@ -289,7 +335,9 @@ export function mergeLineItems(
           "are overlapping entity-wide statements. Keep exactly one rollup.",
       );
     }
-    for (const component of extracts.filter(isComponent)) {
+    for (const component of extracts.filter(
+      (extract) => isComponent(extract) && hasKnownPeriod(extract),
+    )) {
       if (
         documentTypesOverlap(rollup.document_type, component.document_type) &&
         periodsOverlap(rollupPeriod, periods.get(component.source_file_hash)!)
@@ -310,6 +358,7 @@ export function mergeLineItems(
     for (let j = i + 1; j < included.length; j += 1) {
       const left = included[i];
       const right = included[j];
+      if (!hasKnownPeriod(left) || !hasKnownPeriod(right)) continue;
       if (!documentTypesOverlap(left.document_type, right.document_type)) continue;
       const overlap = periodsOverlap(
         periods.get(left.source_file_hash)!,

@@ -84,7 +84,7 @@ export function parseSourcePeriod(value: string): SourcePeriod | null {
   const monthsEnded = new RegExp(
     `\\b(three|3|six|6|nine|9|twelve|12)\\s+months?\\s+end(?:ed|ing)?` +
       `(?:\\s+(?:on|at))?\\s+(${Object.keys(MONTHS).join("|")})` +
-      `(?:\\s+\\d{1,2}(?:st|nd|rd|th)?)?[,]?\\s+(20\\d{2})\\b`,
+      `(?:\\s+\\d{1,2}(?:st|nd|rd|th)?)?[,]?\\s+(20\\d{2}|\\d{2})\\b`,
   ).exec(text);
   if (monthsEnded) {
     const durationWords: Record<string, number> = {
@@ -97,7 +97,7 @@ export function parseSourcePeriod(value: string): SourcePeriod | null {
     const endMonth = MONTHS[monthsEnded[2]];
     const startMonth = endMonth - duration + 1;
     if (startMonth < 1) return null;
-    return { startMonth, endMonth, year: Number(monthsEnded[3]) };
+    return { startMonth, endMonth, year: fourDigitYear(monthsEnded[3]) };
   }
 
   // Annual / rolling-window phrasings that the month-name fallback
@@ -146,16 +146,41 @@ export function parseSourcePeriod(value: string): SourcePeriod | null {
   const monthMatches = Array.from(
     text.matchAll(new RegExp(`\\b(${monthPattern})\\b`, "g")),
   );
-  const years = Array.from(text.matchAll(/\b(20\d{2})\b/g));
-  if (monthMatches.length === 0 || years.length === 0) return null;
+  if (monthMatches.length === 0) return null;
 
-  const yearValues = new Set(years.map((match) => Number(match[1])));
-  if (yearValues.size !== 1) return null;
+  // Prefer 4-digit years when any appear.
+  const fourDigitYears = Array.from(text.matchAll(/\b(20\d{2})\b/g));
+  let yearValue: number;
+  if (fourDigitYears.length > 0) {
+    const yearValues = new Set(fourDigitYears.map((match) => Number(match[1])));
+    if (yearValues.size !== 1) return null;
+    yearValue = [...yearValues][0];
+  } else {
+    // No 4-digit year anywhere — fall back to a 2-digit year, but ONLY
+    // when it sits immediately after the LAST month token (whitespace
+    // and/or a dash in between, optionally a day-of-month + comma —
+    // "Jan - Mar 25", "Mar 25", "March 31, 26"). Scanning the WHOLE
+    // text for any bare 2-digit number (the previous approach) misread
+    // a suite number, invoice number, or street address that happened
+    // to sit near an unrelated month name as if it were the year
+    // (e.g. "123 March Street Suite 25", "Invoice #25 for March").
+    // Anchoring to what comes directly after the month — nothing else
+    // in between — rules those out while still accepting every real
+    // period shape.
+    const lastMonth = monthMatches[monthMatches.length - 1];
+    const tail = text.slice((lastMonth.index ?? 0) + lastMonth[0].length);
+    const tailYear = /^[\s-]*(?:\d{1,2}(?:st|nd|rd|th)?\s*,\s*)?(\d{2})\b(?!\d)/.exec(
+      tail,
+    );
+    if (!tailYear) return null;
+    yearValue = fourDigitYear(tailYear[1]);
+  }
+
   const months = monthMatches.map((match) => MONTHS[match[1]]);
   return {
     startMonth: months[0],
     endMonth: months[months.length - 1],
-    year: [...yearValues][0],
+    year: yearValue,
   };
 }
 

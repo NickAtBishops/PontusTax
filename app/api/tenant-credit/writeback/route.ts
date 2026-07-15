@@ -77,9 +77,11 @@ import {
 } from "@/lib/tenant-credit/merge-line-items";
 import type { LineItem } from "@/lib/tenant-credit/methodology";
 import { patchWorkbookCells, type OoxmlCellPatch } from "@/lib/tenant-credit/ooxml-writeback";
-import type {
-  SourceDocumentType,
-  SourceScopeType,
+import {
+  parseSourcePeriod,
+  periodInsideQuarter,
+  type SourceDocumentType,
+  type SourceScopeType,
 } from "@/lib/tenant-credit/source-period";
 import {
   cellExactText,
@@ -283,6 +285,10 @@ function asPacketExtracts(value: unknown): PacketExtract[] | null {
       period_selection: source.period_selection,
       line_items: lineItems,
       level,
+      // Optional per-file analyst override (see extract route + merge
+      // layer). Empty string means "no override" — mergeLineItems
+      // treats a falsy value identically to the field being absent.
+      period_override_reason: asString(source.period_override_reason),
     };
     if (
       !parsed.source_filename ||
@@ -335,6 +341,28 @@ function traceToAudit(trace: ComputeResult["metrics"][MetricKey]): AuditCalculat
     total_tracker_unrounded: trace.total_tracker_unrounded,
     result: trace.result_tracker ?? 0,
   };
+}
+
+// Mirrors the entity-mismatch override warning below: when an extract
+// carries a period_override_reason AND its own period genuinely doesn't
+// match the selected quarter (or can't be parsed at all), record an
+// explicit "Period mismatch approved" note so a later reviewer of the
+// audit trail sees the override rather than nothing. An override
+// reason on an extract whose period DOES match the quarter (a no-op
+// override) produces no warning — there was nothing to approve.
+function periodOverrideWarning(
+  extract: PacketExtract,
+  quarterId: QuarterId,
+): string | null {
+  if (!extract.period_override_reason) return null;
+  const parsed = parseSourcePeriod(extract.source_period);
+  const matches = parsed !== null && periodInsideQuarter(parsed, quarterId);
+  if (matches) return null;
+  const quarterLabel = quarterId.replace("_", " ");
+  return (
+    `Period mismatch approved: ${extract.period_override_reason}. ` +
+    `Extracted period: ${extract.source_period}, selected quarter: ${quarterLabel}.`
+  );
 }
 
 function sha256(value: ArrayBuffer | Uint8Array | string): string {
@@ -707,6 +735,9 @@ export async function POST(req: Request) {
         ...excludedSourceFiles.map(
           (source) => `${source.filename}: excluded (${source.reason})`,
         ),
+        ...packetExtracts
+          .map((extract) => periodOverrideWarning(extract, quarterId))
+          .filter((warning): warning is string => warning !== null),
       ],
       entity_override_reason: asString(o.entity_override_reason),
       audit,

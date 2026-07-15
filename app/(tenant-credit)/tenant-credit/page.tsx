@@ -126,6 +126,12 @@ type ExtractResponse = {
   }[];
   passed_through: string[];
   client_file_id?: string;
+  // Set only when this extract was accepted despite its period not
+  // matching the selected quarter, via the "Include anyway" retry
+  // (see retryWithPeriodOverride). Threaded through to the writeback
+  // payload so the merge layer waives its own quarter-match check for
+  // this extract specifically and the audit trail records the reason.
+  period_override_reason?: string;
 };
 
 type ExcludedFile = {
@@ -1157,6 +1163,124 @@ export default function TenantCreditPage() {
     }
   }
 
+  // Re-run merge + compute for one tenant against whatever extracts are
+  // currently in state. Shared by handleRunAll's tail and
+  // retryWithPeriodOverride below so "include this file anyway" doesn't
+  // duplicate the merge/compute wiring.
+  async function recomputeTenant(row: number, extracts: ExtractResponse[]) {
+    const tenant = states[row]?.tenant;
+    if (!tenant) return;
+    const { merged, conflicts: mergeConflicts, excludedExtracts } =
+      mergeLineItems(extracts, quarterId);
+    for (const exclusion of excludedExtracts) {
+      toast.warning(
+        `${tenant.display_name}: ${exclusion.extract.source_filename} ` +
+          exclusion.reason,
+      );
+    }
+    for (const c of mergeConflicts) {
+      toast.warning(`${tenant.display_name}: ${c}`);
+    }
+    const computeRes = await fetch("/api/tenant-credit/compute", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tenant_id: tenant.tenant_id, line_items: merged }),
+    });
+    if (!computeRes.ok) {
+      const detail = await computeRes.json().catch(() => ({}));
+      throw new Error(detail.error ?? `Compute failed (${computeRes.status}).`);
+    }
+    return (await computeRes.json()) as ComputeResponse;
+  }
+
+  // "Include anyway" escape hatch (per-file, per CLAUDE.md's
+  // period_override_reason design): re-submits ONE previously-excluded
+  // file's extraction with an analyst-supplied reason, folds the
+  // resulting extract into that tenant's extracts on success, and
+  // recomputes. This is a distinct, explicit user action — never
+  // automatic — exactly like the existing entity-mismatch override
+  // requires an explicit reason before writeback proceeds.
+  async function retryWithPeriodOverride(
+    row: number,
+    excludedFile: ExcludedFile,
+    reason: string,
+  ) {
+    const trimmedReason = reason.trim();
+    if (trimmedReason.length === 0) {
+      toast.error("Enter a reason before including this file.");
+      return;
+    }
+    const state = states[row];
+    if (!state) return;
+    const tf = state.files.find((f) => f.id === excludedFile.file_id);
+    if (!tf) {
+      toast.error(`${excludedFile.filename}: original file is no longer attached.`);
+      return;
+    }
+    setStates((prev) => ({
+      ...prev,
+      [row]: { ...prev[row], status: "extracting", error: null },
+    }));
+    try {
+      const form = new FormData();
+      form.append("file", tf.file);
+      form.append("tenant_id", state.tenant.tenant_id);
+      form.append("quarter_id", quarterId);
+      form.append("source_units_override", tf.unitsOverride);
+      form.append("period_override_reason", trimmedReason);
+      const res = await fetch("/api/tenant-credit/extract", {
+        method: "POST",
+        body: form,
+      });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail.error ?? `Extract failed (${res.status}).`);
+      }
+      const extract: ExtractResponse = {
+        ...((await res.json()) as ExtractResponse),
+        client_file_id: tf.id,
+        period_override_reason: trimmedReason,
+      };
+      const nextExtracts = [
+        ...state.extracts.filter((e) => e.source_file_hash !== extract.source_file_hash),
+        extract,
+      ];
+      const nextExcluded = state.excludedFiles.filter(
+        (f) => f.file_id !== excludedFile.file_id,
+      );
+      setStates((prev) => ({
+        ...prev,
+        [row]: {
+          ...prev[row],
+          status: "computing",
+          extracts: nextExtracts,
+          excludedFiles: nextExcluded,
+        },
+      }));
+      const computeData = await recomputeTenant(row, nextExtracts);
+      setStates((prev) => ({
+        ...prev,
+        [row]: {
+          ...prev[row],
+          status: "computed",
+          extracts: nextExtracts,
+          compute: computeData ?? prev[row].compute,
+          error: null,
+          approved: false,
+          excludedFiles: nextExcluded,
+        },
+      }));
+      toast.success(`${state.tenant.display_name}: included ${tf.name} anyway.`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Include-anyway retry failed.";
+      setStates((prev) => ({
+        ...prev,
+        [row]: { ...prev[row], status: "error", error: msg },
+      }));
+      toast.error(`${state.tenant.display_name} · ${tf.name}: ${msg}`);
+    }
+  }
+
   // ----- Batch writeback ------------------------------------------------
 
   async function handleWriteAll() {
@@ -1232,6 +1356,7 @@ export default function TenantCreditPage() {
                 period_selection: extract.period_selection,
                 line_items: extract.line_items,
                 level: file.level,
+                period_override_reason: extract.period_override_reason ?? "",
               };
             }),
             excluded_files: s.excludedFiles.map((file) => ({
@@ -1373,6 +1498,7 @@ export default function TenantCreditPage() {
                 rows={computedTenants}
                 quarterId={quarterId}
                 onApprovalChange={setTenantApproval}
+                onIncludeAnyway={retryWithPeriodOverride}
               />
             )}
           </>
@@ -2038,6 +2164,11 @@ function ResultsTable(props: {
   rows: TenantState[];
   quarterId: QuarterId;
   onApprovalChange: (row: number, approved: boolean) => void;
+  onIncludeAnyway: (
+    row: number,
+    excludedFile: ExcludedFile,
+    reason: string,
+  ) => void;
 }) {
   return (
     <Card>
@@ -2142,11 +2273,13 @@ function ResultsTable(props: {
                               );
                             })}
                             {s.excludedFiles.map((file) => (
-                              <p key={file.file_id}>
-                                <span className="font-mono">{file.filename}</span>{" "}
-                                <Badge variant="outline">excluded</Badge>{" "}
-                                {file.source_period} · outside selected quarter
-                              </p>
+                              <IncludeAnywayRow
+                                key={file.file_id}
+                                file={file}
+                                onIncludeAnyway={(reason) =>
+                                  props.onIncludeAnyway(s.tenant.row, file, reason)
+                                }
+                              />
                             ))}
                           </div>
                           <div className="grid gap-2 md:grid-cols-2">
@@ -2186,6 +2319,71 @@ function ResultsTable(props: {
         </Table>
       </CardContent>
     </Card>
+  );
+}
+
+// Per-file "Include anyway" escape hatch for a period-mismatch
+// exclusion (SOURCE_PERIOD_OUTSIDE_QUARTER, or an unparseable period).
+// A distinct click plus a required reason — never automatic — mirrors
+// the existing entity-mismatch override, which likewise demands an
+// explicit analyst-supplied reason before the mismatch is allowed
+// through. Collapsed behind a toggle so the exclusion list stays
+// scannable when nothing needs overriding.
+function IncludeAnywayRow(props: {
+  file: ExcludedFile;
+  onIncludeAnyway: (reason: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [reason, setReason] = useState("");
+  return (
+    <div className="rounded border border-dashed border-amber-300 bg-amber-50 px-2 py-1.5">
+      <p>
+        <span className="font-mono">{props.file.filename}</span>{" "}
+        <Badge variant="outline">excluded</Badge>{" "}
+        {props.file.source_period} · {props.file.reason}
+      </p>
+      {!open ? (
+        <button
+          type="button"
+          className="mt-1 text-[11px] font-medium text-amber-800 underline underline-offset-2 hover:text-amber-900"
+          onClick={() => setOpen(true)}
+        >
+          Include anyway
+        </button>
+      ) : (
+        <div className="mt-1.5 flex items-center gap-1.5">
+          <Input
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            placeholder="Reason this file should be included despite the period mismatch"
+            className="h-7 text-xs"
+          />
+          <Button
+            size="sm"
+            className="h-7"
+            disabled={reason.trim().length === 0}
+            onClick={() => {
+              props.onIncludeAnyway(reason.trim());
+              setOpen(false);
+              setReason("");
+            }}
+          >
+            Confirm
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-7"
+            onClick={() => {
+              setOpen(false);
+              setReason("");
+            }}
+          >
+            Cancel
+          </Button>
+        </div>
+      )}
+    </div>
   );
 }
 

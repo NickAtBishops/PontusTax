@@ -227,4 +227,108 @@ describe("mergeLineItems", () => {
     expect(result.merged).toHaveLength(1);
     expect(result.merged[0].amount).toBe(10_000);
   });
+
+  // Per-file period-mismatch override (2026-07-15). Modeled on the
+  // existing entity_override_reason pattern: an analyst-supplied,
+  // non-empty reason lets ONE extract's own period-vs-quarter mismatch
+  // through, while every other check (here: nothing else to trip)
+  // keeps running normally.
+  describe("period_override_reason", () => {
+    it("rejects a mismatched period with no override, exactly as before", () => {
+      expect(() =>
+        mergeLineItems(
+          [source("q2.pdf", "Apr 2026 - Jun 2026", 100_000)],
+          "Q1_2026",
+        ),
+      ).toThrow(/does not fall inside Q1 2026/);
+    });
+
+    it("accepts an override-flagged extract whose period is outside the quarter", () => {
+      // The override only waives THIS extract's own period-vs-quarter
+      // check; assertQuarterCoverage still requires Q1's months to be
+      // covered by SOME income-statement source, so pair the override
+      // with a normal Jan-Mar packet to isolate what's under test.
+      const overridden = source("q2.pdf", "Apr 2026 - Jun 2026", 100_000, {
+        period_override_reason:
+          "Analyst confirmed this statement should be attributed to Q1 2026.",
+      });
+      const jan = source("jan.pdf", "Jan 2026", 10_000);
+      const feb = source("feb.pdf", "Feb 2026", 10_000);
+      const mar = source("mar.pdf", "Mar 2026", 10_000);
+      const result = mergeLineItems([overridden, jan, feb, mar], "Q1_2026");
+      expect(result.merged[0].amount).toBe(130_000);
+      expect(result.includedExtracts.map((e) => e.source_filename)).toContain(
+        "q2.pdf",
+      );
+    });
+
+    it("still throws for a NON-overridden mismatched extract mixed with an overridden one", () => {
+      const overridden = source("q2.pdf", "Apr 2026 - Jun 2026", 100_000, {
+        period_override_reason: "Analyst approved.",
+      });
+      const notOverridden = source("q2b.pdf", "May 2026", 50_000);
+      expect(() =>
+        mergeLineItems([overridden, notOverridden], "Q1_2026"),
+      ).toThrow(/does not fall inside Q1 2026/);
+    });
+
+    it("still enforces cross-file overlap detection for an overridden extract", () => {
+      // Two entity-wide statements whose periods overlap once the
+      // override lets both of their real (out-of-quarter) periods
+      // through — the overlap check has nothing to do with matching
+      // the selected quarter and must still fire.
+      const overridden = source("full-q2.pdf", "Apr 2026 - Jun 2026", 300_000, {
+        period_override_reason: "Analyst approved.",
+      });
+      const overlapping = source("may.pdf", "May 2026", 50_000, {
+        period_override_reason: "Analyst approved.",
+      });
+      expect(() =>
+        mergeLineItems([overridden, overlapping], "Q1_2026"),
+      ).toThrow(/overlapping entity-wide statements/);
+    });
+
+    it("still enforces month-coverage for the non-overridden sources", () => {
+      // The overridden extract's period (Q2) can't count toward Q1
+      // coverage; the remaining Jan/Mar sources are still missing
+      // February, so coverage must still fail.
+      const overridden = source("q2.pdf", "Apr 2026 - Jun 2026", 300_000, {
+        period_override_reason: "Analyst approved.",
+      });
+      const jan = source("jan.pdf", "Jan 2026", 100_000);
+      const mar = source("mar.pdf", "Mar 2026", 50_000);
+      expect(() => mergeLineItems([overridden, jan, mar], "Q1_2026")).toThrow(
+        /month 2 is missing/,
+      );
+    });
+
+    // Decision (documented in merge-line-items.ts): when an overridden
+    // extract's period is genuinely UNPARSEABLE (even after the
+    // source-period 2-digit-year fix), it is summed into totals but
+    // excluded from month-coverage accounting entirely — there is no
+    // known period to place it in the quarter.
+    it("sums an overridden extract with an unparseable period, excluded from coverage", () => {
+      const unparseable = source("annual-report.pdf", "Fiscal year ended", 40_000, {
+        period_override_reason:
+          "Analyst confirmed this covers Q1 2026 despite the annual label.",
+      });
+      const jan = source("jan.pdf", "Jan 2026", 100_000);
+      const feb = source("feb.pdf", "Feb 2026", 100_000);
+      const mar = source("mar.pdf", "Mar 2026", 100_000);
+      const result = mergeLineItems([unparseable, jan, feb, mar], "Q1_2026");
+      expect(result.merged[0].amount).toBe(340_000);
+      expect(result.includedExtracts.map((e) => e.source_filename)).toContain(
+        "annual-report.pdf",
+      );
+    });
+
+    it("still throws for a NON-overridden unparseable period", () => {
+      expect(() =>
+        mergeLineItems(
+          [source("annual-report.pdf", "Fiscal year ended", 40_000)],
+          "Q1_2026",
+        ),
+      ).toThrow(/could not be converted to a calendar period/);
+    });
+  });
 });
