@@ -47,4 +47,45 @@ describe("resolveTrackerTarget", () => {
       /header is merged/,
     );
   });
+
+  // Regression (2026-07-15): a known, documented data-entry typo in the
+  // analyst's tracker — the Q1 2026 EBITDA header cell reads "Q4 26"
+  // instead of "Q1 26" — used to be tolerated by the old hardcoded
+  // column-offset resolver. This dynamic scanner dropped that tolerance
+  // during the migration, so a real copy of the tracker with the typo
+  // still present threw "EBITDA must have exactly one Q1 26 column
+  // ...; found 0" and refused the whole batch.
+  it("tolerates the known Q1 2026 EBITDA header typo (Q4 26)", () => {
+    const sheet = fixture();
+    const ebitdaCol = WRITABLE_METRICS.indexOf("ebitda") + 2;
+    sheet.getCell(3, ebitdaCol).value = "Q4 26";
+    const target = resolveTrackerTarget(sheet, "Q1_2026");
+    const ebitdaCell = target.cells.find((cell) => cell.metric === "ebitda")!;
+    expect(ebitdaCell.col).toBe(ebitdaCol);
+    expect(ebitdaCell.header_alternate).toBe("Q4 26");
+    // Every other metric is unaffected and still resolves without an
+    // alternate.
+    for (const cell of target.cells) {
+      if (cell.metric === "ebitda") continue;
+      expect(cell.header_alternate).toBeNull();
+    }
+  });
+
+  it("prefers an exact Q1 26 EBITDA header over the typo alternate when both exist", () => {
+    const sheet = fixture();
+    const ebitdaCol = WRITABLE_METRICS.indexOf("ebitda") + 2;
+    sheet.getCell(3, ebitdaCol).value = "Q1 26";
+    const target = resolveTrackerTarget(sheet, "Q1_2026");
+    const ebitdaCell = target.cells.find((cell) => cell.metric === "ebitda")!;
+    expect(ebitdaCell.header_alternate).toBeNull();
+  });
+
+  it("does not tolerate the typo on any metric other than EBITDA", () => {
+    const sheet = fixture();
+    const salesCol = WRITABLE_METRICS.indexOf("sales") + 2;
+    sheet.getCell(3, salesCol).value = "Q4 26";
+    expect(() => resolveTrackerTarget(sheet, "Q1_2026")).toThrow(
+      /Sales must have exactly one Q1 26 column.*found 0/,
+    );
+  });
 });
