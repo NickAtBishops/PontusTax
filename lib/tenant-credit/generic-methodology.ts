@@ -23,6 +23,7 @@ import type { LineItem } from "@/lib/tenant-credit/methodology";
 export type LineCategory =
   | "sales"
   | "net_income"
+  | "ebitda_direct"
   | "ebitda_addback"
   | "interest_expense"
   | "rent_expense"
@@ -39,6 +40,7 @@ export type CategoryDecision = {
   // bucket (e.g. QuickBooks "Total Income"). computeGeneric keeps the
   // subtotal and drops its constituents when both appear.
   subtotal?: boolean;
+  subtotalPriority?: number;
 };
 
 type Rule = {
@@ -48,6 +50,7 @@ type Rule = {
   category: LineCategory;
   reason: string;
   subtotal?: true;
+  subtotalPriority?: number;
 };
 
 const RULES: Rule[] = [
@@ -112,10 +115,29 @@ const RULES: Rule[] = [
   // individual revenue lines ALSO classify as sales — computeGeneric
   // keeps only this line instead of doubling the metric.
   {
-    pattern: /^total (income|revenue|sales|net sales)$/,
+    pattern: /^total (?:for )?income:?$/,
     category: "sales",
-    reason: "top-line revenue total (sum of all revenue accounts)",
+    reason: "authoritative total income for the reporting period",
     subtotal: true,
+    subtotalPriority: 30,
+  },
+  // Plural ("Total Revenues") and "Total Operating Revenues" are the
+  // same authoritative top line; before the plural was accepted these
+  // fell through to the blanket "total" ignore and Sales was silently
+  // rebuilt from constituents (or left empty).
+  {
+    pattern: /^total (?:for )?(?:operating )?revenues?:?$/,
+    category: "sales",
+    reason: "authoritative total revenue for the reporting period",
+    subtotal: true,
+    subtotalPriority: 20,
+  },
+  {
+    pattern: /^total (?:for )?(sales|net sales|net revenues?):?$/,
+    category: "sales",
+    reason: "sales subtotal nested within broader income totals",
+    subtotal: true,
+    subtotalPriority: 10,
   },
   // Subtotals: would double-count.
   {
@@ -170,10 +192,21 @@ const RULES: Rule[] = [
   },
 
   // -- Income statement bottom-line + EBITDA addbacks ------------------
+  // "Net Profit" and "Profit/(Loss) for the period" are the standard
+  // non-US phrasings of the same bottom line; without them the EBITDA
+  // reconstruction silently proceeds from addbacks alone. "Profit
+  // before tax" must NOT land here — taxes are added back separately,
+  // so a pre-tax line would double them.
   {
-    pattern: /\bnet (income|earnings|loss)\b/,
+    pattern:
+      /\bnet (income|earnings|loss|profit)\b|\b(profit|loss)(?: or loss)?(?:\s*\/\s*\(loss\))? for the (period|year|quarter)\b/,
     category: "net_income",
     reason: "starting point of the EBITDA reconstruction",
+  },
+  {
+    pattern: /^adjusted ebitda$|^ebitda$|\bpbitda\b/,
+    category: "ebitda_direct",
+    reason: "statement-provided EBITDA/PBITDA metric",
   },
   // Interest expense double-duties: it goes into the EBITDA addback
   // bucket AND into the Interest tracker column. We pick the more
@@ -191,6 +224,11 @@ const RULES: Rule[] = [
     pattern: /\brent (receivable|deposit)\b|\bprepaid rent\b/,
     category: "ignore",
     reason: "balance-sheet rent asset (receivable/deposit/prepaid), not a current-period expense",
+  },
+  {
+    pattern: /\brent smoothing\b|\bstraight[- ]line rent\b|\bdeferred rent\b/,
+    category: "ignore",
+    reason: "non-cash rent accounting adjustment, not contractual rent expense",
   },
   // Rent expense same shape: feeds EBITDA-neutral (rent is operating, so
   // NOT added back for plain EBITDA), but populates the Rent tracker col.
@@ -212,7 +250,7 @@ const RULES: Rule[] = [
     reason: "non-cash; added back for EBITDA",
   },
   {
-    pattern: /\bamortization\b/,
+    pattern: /\bamorti(?:[sz]|\s*)ation\b/,
     category: "ebitda_addback",
     reason: "non-cash; added back for EBITDA",
   },
@@ -227,6 +265,37 @@ const RULES: Rule[] = [
     reason: "income taxes; added back for EBITDA",
   },
 
+  // Direct costs carry revenue words ("Cost of Sales") but are NOT
+  // revenue. Expense magnitudes arrive positive, so letting the sales
+  // catch-all match them ADDS cost on top of revenue instead of
+  // netting it out — {Revenue 1.5M, Cost of Sales 0.9M} would report
+  // Sales of 2.4M. Only statements without an authoritative "Total
+  // ..." line are exposed (the subtotal dedup masks it otherwise),
+  // which is exactly what makes the error hard to spot.
+  {
+    pattern: /\bcost of\b|\bcogs\b/,
+    category: "ignore",
+    reason: "direct cost (COGS-family), not revenue",
+  },
+  // Contra-revenue: discounts/returns/allowances reduce revenue but are
+  // extracted as positive magnitudes; summing them into Sales inflates
+  // it. The statement's own Net/Total line already reflects them.
+  {
+    pattern:
+      /\b(sales|revenue) (discounts?|returns?|allowances?)\b|\b(discounts?|returns?) and allowances\b/,
+    category: "ignore",
+    reason: "contra-revenue line; the statement's net/total line already reflects it",
+  },
+  // Balance-sheet accrual labels that carry revenue words ("Sales Tax
+  // Payable", "Deferred Revenue", "Unearned Revenue", "Accounts
+  // Receivable - Trade Sales") are positions, not current-period
+  // activity, and must not reach the sales catch-all.
+  {
+    pattern: /\b(payable|receivable|accrued|prepaid|deferred|unearned)\b/,
+    category: "ignore",
+    reason: "balance-sheet accrual/position line, not current-period activity",
+  },
+
   // -- Sales (loose include; runs last so excludes get first crack).
   {
     pattern: /\bnet (sales|revenue)\b/,
@@ -234,7 +303,7 @@ const RULES: Rule[] = [
     reason: "explicit net-of-returns top line",
   },
   {
-    pattern: /\b(sales|revenue|income)\b/,
+    pattern: /\b(sales|revenue|income|turnover)\b/,
     category: "sales",
     reason: "label looks like operating revenue",
   },
@@ -254,6 +323,7 @@ export function classifyLineItem(label: string): CategoryDecision {
         category: rule.category,
         reason: rule.reason,
         subtotal: rule.subtotal ?? false,
+        subtotalPriority: rule.subtotalPriority ?? 0,
       };
     }
   }
@@ -391,7 +461,10 @@ function traceFor(
   // A null result tells the writer "no source data — leave the cell
   // alone". Zero is a real value (e.g. paid off all debt) and gets
   // written.
-  const result = contributions.length === 0 ? null : Math.round(totalTracker);
+  const rounded =
+    totalTracker < 0 ? -Math.round(-totalTracker) : Math.round(totalTracker);
+  const result =
+    contributions.length === 0 ? null : Object.is(rounded, -0) ? 0 : rounded;
 
   return {
     metric,
@@ -431,18 +504,92 @@ export function computeGeneric(items: LineItem[]): ComputeResult {
     const subtotals = bucket.filter(
       (i) => classifications.get(i.label)?.subtotal,
     );
-    if (subtotals.length === 0 || subtotals.length === bucket.length) continue;
-    for (const item of bucket) {
+    if (subtotals.length === 0) continue;
+    if (subtotals.length > 1) {
+      const highestPriority = Math.max(
+        ...subtotals.map(
+          (item) => classifications.get(item.label)?.subtotalPriority ?? 0,
+        ),
+      );
+      const preferred = subtotals.filter(
+        (item) =>
+          (classifications.get(item.label)?.subtotalPriority ?? 0) ===
+          highestPriority,
+      );
+      const [first, ...samePriority] = preferred;
+      const mismatched = samePriority.filter(
+        (item) => Math.abs(item.amount - first.amount) >= 0.01,
+      );
+      if (mismatched.length > 0) {
+        throw new Error(
+          `Multiple conflicting subtotal lines classified as ${category}: ` +
+            preferred.map((i) => `${i.label}=${i.amount}`).join(", "),
+        );
+      }
+      for (const item of subtotals.filter((item) => item !== first)) {
+        const reason = preferred.includes(item)
+          ? `duplicate subtotal already represented by ${first.label}`
+          : `nested subtotal superseded by ${first.label}`;
+        droppedConstituents.push(
+          `${item.label} (${reason}; dropped to avoid double-count)`,
+        );
+      }
+      byCategory.set(category, [
+        first,
+        ...bucket.filter((item) => !classifications.get(item.label)?.subtotal),
+      ]);
+    }
+    const currentBucket = byCategory.get(category) ?? bucket;
+    const currentSubtotals = currentBucket.filter(
+      (i) => classifications.get(i.label)?.subtotal,
+    );
+    if (
+      currentSubtotals.length === 0 ||
+      currentSubtotals.length === currentBucket.length
+    ) {
+      continue;
+    }
+    for (const item of currentBucket) {
       if (!classifications.get(item.label)?.subtotal) {
         droppedConstituents.push(
           `${item.label} (already summed into the statement's own subtotal; dropped to avoid double-count)`,
         );
       }
     }
-    byCategory.set(category, subtotals);
+    byCategory.set(category, currentSubtotals);
   }
 
   const grab = (c: LineCategory) => byCategory.get(c) ?? [];
+
+  // Gross-vs-net: when a statement carries BOTH a gross revenue line
+  // and its net counterpart (Gross Sales → discounts → Net Sales),
+  // summing the two double-counts revenue. The net line is the
+  // authoritative one; drop the gross line(s) and log them. When only
+  // a gross line exists it stays — a slightly-gross Sales figure with
+  // the discount logged in unused_labels beats an empty cell.
+  {
+    const salesBucket = grab("sales");
+    const hasNetLine = salesBucket.some((i) =>
+      /\bnet (sales|revenue)\b/.test(normalize(i.label)),
+    );
+    if (hasNetLine) {
+      const grossLines = salesBucket.filter((i) =>
+        /\bgross (sales|revenue|receipts)\b/.test(normalize(i.label)),
+      );
+      if (grossLines.length > 0) {
+        for (const item of grossLines) {
+          droppedConstituents.push(
+            `${item.label} (gross revenue line; the statement's net line ` +
+              "already reflects it — dropped to avoid double-count)",
+          );
+        }
+        byCategory.set(
+          "sales",
+          salesBucket.filter((i) => !grossLines.includes(i)),
+        );
+      }
+    }
+  }
 
   // Sales: every operating-revenue line, summed.
   const salesTrace = traceFor(
@@ -455,11 +602,49 @@ export function computeGeneric(items: LineItem[]): ComputeResult {
   // EBITDA reconstruction: Net Income + addbacks + interest expense
   // (interest is always added back for EBITDA, regardless of whether it
   // also feeds the Interest tracker column).
-  const ebitdaContribs: { item: LineItem; sign: 1 | -1 }[] = [
-    ...grab("net_income").map((item) => ({ item, sign: 1 as const })),
-    ...grab("ebitda_addback").map((item) => ({ item, sign: 1 as const })),
-    ...grab("interest_expense").map((item) => ({ item, sign: 1 as const })),
-  ];
+  const directEbitda = grab("ebitda_direct");
+  if (directEbitda.length > 1) {
+    const [first, ...rest] = directEbitda;
+    if (rest.some((item) => Math.abs(item.amount - first.amount) >= 0.01)) {
+      throw new Error(
+        "Multiple direct EBITDA/PBITDA figures disagree: " +
+          directEbitda.map((item) => `${item.label}=${item.amount}`).join(", "),
+      );
+    }
+    for (const item of rest) {
+      droppedConstituents.push(
+        `${item.label} (duplicate direct EBITDA already represented by ${first.label})`,
+      );
+    }
+  }
+  const selectedDirectEbitda = directEbitda.slice(0, 1);
+  // The reconstruction is only meaningful anchored on the statement's
+  // bottom line. Addbacks/interest with NO Net Income/Net Profit line
+  // (e.g. a bottom line phrased in a way no rule matched) would
+  // otherwise produce a small, plausible-looking, badly wrong EBITDA —
+  // leave the cell blank and say why instead.
+  const bottomLineMissing =
+    selectedDirectEbitda.length === 0 &&
+    grab("net_income").length === 0 &&
+    (grab("ebitda_addback").length > 0 || grab("interest_expense").length > 0);
+  if (bottomLineMissing) {
+    for (const item of [...grab("ebitda_addback"), ...grab("interest_expense")]) {
+      droppedConstituents.push(
+        `${item.label} (EBITDA addback found, but no bottom-line Net ` +
+          "Income/Net Profit line was recognized — EBITDA left blank " +
+          "rather than reconstructed from addbacks alone)",
+      );
+    }
+  }
+  const ebitdaContribs: { item: LineItem; sign: 1 | -1 }[] = bottomLineMissing
+    ? []
+    : selectedDirectEbitda.length > 0
+      ? selectedDirectEbitda.map((item) => ({ item, sign: 1 as const }))
+      : [
+          ...grab("net_income").map((item) => ({ item, sign: 1 as const })),
+          ...grab("ebitda_addback").map((item) => ({ item, sign: 1 as const })),
+          ...grab("interest_expense").map((item) => ({ item, sign: 1 as const })),
+        ];
   const ebitdaTrace = traceFor(
     "ebitda",
     items,
@@ -507,7 +692,10 @@ export function computeGeneric(items: LineItem[]): ComputeResult {
     "capex",
     items,
     classifications,
-    grab("capex").map((item) => ({ item, sign: 1 })),
+    grab("capex").map((item) => ({
+      item: { ...item, amount: Math.abs(item.amount) },
+      sign: 1,
+    })),
   );
 
   const intercompany_observed = findIntercompanyPairs(items, classifications);

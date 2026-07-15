@@ -87,13 +87,21 @@ export async function isValidSessionCookie(
   cookie: string | undefined,
   sessionSecret: string,
 ): Promise<boolean> {
-  if (!cookie) return false;
+  return (await parseSessionCookie(cookie, sessionSecret)) !== null;
+}
+
+export async function parseSessionCookie(
+  cookie: string | undefined,
+  sessionSecret: string,
+): Promise<{ expiry: number; id: string } | null> {
+  if (!cookie) return null;
   const parts = cookie.split(":");
-  if (parts.length !== 3) return false;
+  if (parts.length !== 3) return null;
   const [expiryStr, id, sig] = parts;
   const expiry = Number(expiryStr);
-  if (!Number.isFinite(expiry)) return false;
-  if (expiry < Math.floor(Date.now() / 1000)) return false;
+  if (!Number.isFinite(expiry)) return null;
+  if (expiry < Math.floor(Date.now() / 1000)) return null;
   const expected = await hmacSha256(sessionSecret, `${expiryStr}:${id}`);
-  return safeEqual(sig, expected);
+  if (!safeEqual(sig, expected)) return null;
+  return { expiry, id };
 }

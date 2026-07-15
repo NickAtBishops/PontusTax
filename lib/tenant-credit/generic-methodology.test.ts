@@ -105,6 +105,39 @@ describe("Total Income subtotal handling", () => {
     expect(result.metrics.sales.contributions).toHaveLength(1);
     expect(result.metrics.sales.contributions[0].label).toBe("Total Revenue");
   });
+
+  it("does not double-count duplicate subtotal labels with the same amount", () => {
+    const result = computeGeneric([
+      { label: "Total Income", amount: 800_000 },
+      { label: "Total for Income", amount: 800_000 },
+    ]);
+    expect(result.sales).toBe(800);
+    expect(result.metrics.sales.contributions).toHaveLength(1);
+    expect(result.unused_labels.some((l) => l.includes("duplicate subtotal"))).toBe(
+      true,
+    );
+  });
+
+  it("prefers Total Income over a nested Total Sales subtotal", () => {
+    const result = computeGeneric([
+      { label: "Total Sales", amount: 750_000 },
+      { label: "Total Income", amount: 800_000 },
+    ]);
+    expect(result.sales).toBe(800);
+    expect(result.metrics.sales.contributions[0].label).toBe("Total Income");
+    expect(result.unused_labels.some((label) => label.includes("nested subtotal"))).toBe(
+      true,
+    );
+  });
+
+  it("fails loudly when same-priority income subtotals disagree", () => {
+    expect(() =>
+      computeGeneric([
+        { label: "Total Income", amount: 800_000 },
+        { label: "Total for Income", amount: 810_000 },
+      ]),
+    ).toThrow(/Multiple conflicting subtotal lines/);
+  });
 });
 
 // Regression coverage for a real GPM Investments statement (2026-07-14):
@@ -179,5 +212,248 @@ describe("orphaned intercompany lines", () => {
     expect(
       result.unused_labels.some((l) => l.includes("no matching counterpart")),
     ).toBe(false);
+  });
+
+  it("logs paired management fees without adding either leg to EBITDA", () => {
+    const result = computeGeneric([
+      { label: "Net Income", amount: 100_000 },
+      { label: "Management Income", amount: 50_000 },
+      { label: "Management Fee", amount: 50_000 },
+    ]);
+    expect(result.ebitda).toBe(100);
+    expect(result.intercompany_observed).toHaveLength(1);
+    expect(result.metrics.ebitda.contributions.map((item) => item.label)).toEqual([
+      "Net Income",
+    ]);
+  });
+});
+
+describe("non-standard but common financial labels", () => {
+  it("classifies Turnover as sales", () => {
+    const result = computeGeneric([{ label: "Turnover", amount: 1_200_000 }]);
+    expect(result.sales).toBe(1_200);
+  });
+
+  it("uses a statement-provided PBITDA line as EBITDA", () => {
+    const result = computeGeneric([{ label: "PBITDA", amount: 300_000 }]);
+    expect(result.ebitda).toBe(300);
+    expect(result.metrics.ebitda.contributions[0].label).toBe("PBITDA");
+  });
+});
+
+describe("unmatched label surfacing", () => {
+  it("puts no-rule-matched labels in unused_labels", () => {
+    const result = computeGeneric([{ label: "Payroll Expenses", amount: 120_000 }]);
+    expect(result.unused_labels).toEqual([
+      "Payroll Expenses (no rule matched; assumed non-revenue)",
+    ]);
+  });
+});
+
+describe("economic signs and rounding", () => {
+  it("keeps a Net Loss negative when reconstructing EBITDA", () => {
+    const result = computeGeneric([
+      { label: "Net Loss", amount: -1_500_000 },
+      { label: "Depreciation Expense", amount: 200_000 },
+      { label: "Interest Expense", amount: 100_000 },
+    ]);
+    expect(result.ebitda).toBe(-1_200);
+  });
+
+  it("rounds negative half-thousands away from zero", () => {
+    expect(computeGeneric([{ label: "Net Loss", amount: -1_500 }]).ebitda).toBe(
+      -2,
+    );
+  });
+
+  it("stores cash-flow capex as a positive magnitude", () => {
+    const result = computeGeneric([
+      { label: "Purchases of property and equipment", amount: -250_000 },
+    ]);
+    expect(result.capex).toBe(250);
+  });
+
+  it("rejects disagreeing direct EBITDA figures instead of summing them", () => {
+    expect(() =>
+      computeGeneric([
+        { label: "EBITDA", amount: 300_000 },
+        { label: "PBITDA", amount: 325_000 },
+      ]),
+    ).toThrow(/direct EBITDA\/PBITDA figures disagree/);
+  });
+});
+
+describe("Pinnacle Q1 2026 tracker regression", () => {
+  it("uses Total Income rather than the nested Total Sales subtotal", () => {
+    const result = computeGeneric([
+      { label: "Total for Sales", amount: 51_700_008.54 },
+      { label: "Total for Income", amount: 59_784_204.82 },
+      { label: "Net Income", amount: 5_258_230.36 },
+      { label: "Depreciation Expense", amount: 821_457.93 },
+      { label: "Interest Paid", amount: 1_381_082.34 },
+      { label: "Rent", amount: 9_905_979.21 },
+      { label: "Management Income", amount: 355_360 },
+      { label: "Management Fee", amount: 355_360 },
+    ]);
+    expect(result.sales).toBe(59_784);
+    expect(result.ebitda).toBe(7_461);
+    expect(result.interest).toBe(1_381);
+    expect(result.rent).toBe(9_906);
+  });
+});
+
+describe("Ethema/Evernia Q1 2026 tracker regression", () => {
+  it("handles split-word amortization and excludes rent smoothing", () => {
+    const result = computeGeneric([
+      { label: "Total Income", amount: 1_365_000 },
+      { label: "Net Income", amount: -617_618.71 },
+      { label: "Depreciation", amount: 35_025.39 },
+      { label: "Discount Amorti ation", amount: 38_468.95 },
+      { label: "Interest Expense", amount: 28_478.93 },
+      { label: "Rent - Boca cove", amount: 94_423.47 },
+      { label: "Rent - Other buildings", amount: 18_000 },
+      { label: "Rent Smoothing", amount: -948.81 },
+      { label: "Interco - Rent", amount: 229_227.45 },
+    ]);
+    expect(result.sales).toBe(1_365);
+    expect(result.ebitda).toBe(-516);
+    expect(result.interest).toBe(28);
+    expect(result.rent).toBe(112);
+    expect(result.unused_labels.some((label) => label.includes("Rent Smoothing"))).toBe(
+      true,
+    );
+  });
+});
+
+// Regression coverage (2026-07-14 deep review): labels that carry
+// revenue words but are NOT revenue used to reach the sales catch-all.
+// Because expense magnitudes arrive positive, "Cost of Sales" was
+// ADDED to Sales — {Revenue 1.5M, COGS 0.9M} reported Sales of 2.4M
+// whenever no authoritative "Total ..." subtotal existed to mask it.
+describe("cost and contra-revenue labels are not revenue", () => {
+  it("ignores COGS-family labels", () => {
+    expect(classifyLineItem("Cost of Sales").category).toBe("ignore");
+    expect(classifyLineItem("Cost of Goods Sold").category).toBe("ignore");
+    expect(classifyLineItem("COGS").category).toBe("ignore");
+    expect(classifyLineItem("Cost of Revenue").category).toBe("ignore");
+  });
+
+  it("ignores contra-revenue labels", () => {
+    expect(classifyLineItem("Sales Discounts").category).toBe("ignore");
+    expect(classifyLineItem("Sales Returns and Allowances").category).toBe(
+      "ignore",
+    );
+    expect(classifyLineItem("Revenue Discounts").category).toBe("ignore");
+  });
+
+  it("ignores balance-sheet accrual labels that carry revenue words", () => {
+    expect(classifyLineItem("Sales Tax Payable").category).toBe("ignore");
+    expect(classifyLineItem("Deferred Revenue").category).toBe("ignore");
+    expect(classifyLineItem("Unearned Revenue").category).toBe("ignore");
+    expect(classifyLineItem("Accounts Receivable").category).toBe("ignore");
+  });
+
+  it("does not add Cost of Sales into the Sales metric", () => {
+    const result = computeGeneric([
+      { label: "Product Revenue", amount: 1_000_000 },
+      { label: "Service Revenue", amount: 500_000 },
+      { label: "Cost of Sales", amount: 900_000 },
+    ]);
+    expect(result.sales).toBe(1_500);
+    expect(
+      result.unused_labels.some((label) => label.includes("Cost of Sales")),
+    ).toBe(true);
+  });
+
+  it("drops a gross revenue line when the statement's net line is present", () => {
+    const result = computeGeneric([
+      { label: "Gross Sales", amount: 100_000 },
+      { label: "Sales Discounts", amount: 2_000 },
+      { label: "Net Sales", amount: 98_000 },
+    ]);
+    expect(result.sales).toBe(98);
+    expect(
+      result.unused_labels.some((label) => label.includes("Gross Sales")),
+    ).toBe(true);
+  });
+
+  it("keeps a gross revenue line when it is the only revenue line", () => {
+    const result = computeGeneric([
+      { label: "Gross Sales", amount: 100_000 },
+      { label: "Payroll", amount: 40_000 },
+    ]);
+    expect(result.sales).toBe(100);
+  });
+});
+
+// Regression coverage (2026-07-14 deep review): "Net Profit" (and
+// "Profit for the period") are the standard non-US bottom-line
+// phrasings. They fell through to "ignore", so EBITDA was silently
+// reconstructed from addbacks alone — {Net Profit 100k, D&A 50k}
+// wrote EBITDA 50 instead of 150.
+describe("non-US bottom-line phrasings feed EBITDA", () => {
+  it("classifies Net Profit variants as the bottom line", () => {
+    expect(classifyLineItem("Net Profit").category).toBe("net_income");
+    expect(classifyLineItem("Net Profit/(Loss)").category).toBe("net_income");
+    expect(classifyLineItem("Profit for the period").category).toBe(
+      "net_income",
+    );
+    expect(classifyLineItem("Profit for the year").category).toBe("net_income");
+  });
+
+  it("does not treat pre-tax profit as the bottom line", () => {
+    expect(classifyLineItem("Profit before tax").category).not.toBe(
+      "net_income",
+    );
+  });
+
+  it("reconstructs EBITDA from a Net Profit bottom line", () => {
+    const result = computeGeneric([
+      { label: "Net Profit", amount: 100_000 },
+      { label: "Depreciation", amount: 50_000 },
+    ]);
+    expect(result.ebitda).toBe(150);
+  });
+
+  it("leaves EBITDA blank when addbacks exist but no bottom line was recognized", () => {
+    const result = computeGeneric([
+      { label: "Bottom line phrased unrecognizably", amount: 100_000 },
+      { label: "Depreciation", amount: 50_000 },
+      { label: "Interest Expense", amount: 20_000 },
+    ]);
+    expect(result.ebitda).toBeNull();
+    // Interest still feeds its own tracker column.
+    expect(result.interest).toBe(20);
+    expect(
+      result.unused_labels.some((label) => label.includes("EBITDA left blank")),
+    ).toBe(true);
+  });
+});
+
+// Regression coverage (2026-07-14 deep review): plural and prefixed
+// top-line totals ("Total Revenues", "Total Operating Revenues") hit
+// the blanket "total" ignore rule, so Sales was silently rebuilt from
+// constituents — or left empty on chart-of-accounts statements.
+describe("plural top-line totals are subtotals", () => {
+  it("classifies plural and operating revenue totals as sales subtotals", () => {
+    for (const label of [
+      "Total Revenues",
+      "Total Operating Revenues",
+      "Total Net Revenues",
+    ]) {
+      const decision = classifyLineItem(label);
+      expect(decision.category).toBe("sales");
+      expect(decision.subtotal).toBe(true);
+    }
+  });
+
+  it("prefers Total Revenues over its constituents", () => {
+    const result = computeGeneric([
+      { label: "PHP Revenue", amount: 137_767 },
+      { label: "Net Revenue", amount: 6_052_222 },
+      { label: "Total Revenues", amount: 6_169_482 },
+    ]);
+    expect(result.sales).toBe(6_169);
+    expect(result.metrics.sales.contributions).toHaveLength(1);
   });
 });

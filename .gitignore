@@ -33,3 +33,4 @@ python/
 templates/*.bak
 /PTAX_Master copy*.xlsx
 /PTAX_Master*— checked*.xlsx
+coverage/

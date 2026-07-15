@@ -12,12 +12,6 @@
 // stateless cell-writer. All knowledge of layout, tenants, and
 // quarters lives on the Next.js side so the worker can stay generic.
 
-// Header note: cell AI3 in the actual spreadsheet reads "Q4 26" instead
-// of "Q1 26" — a typo in the source, not in this code. The writer
-// accepts the typo on the EBITDA section for Q1 2026 only and emits
-// a warning rather than refusing the write.
-const Q1_2026_EBITDA_HEADER_TYPO = "Q4 26";
-
 export const TRACKER_LAYOUT = {
   // Trailing space is part of the sheet name. ExcelJS / openpyxl are
   // both whitespace-sensitive on sheet lookups, so this constant must
@@ -114,8 +108,10 @@ export type MetricCell = {
   col: number;
   // The text the header row should carry for this column.
   header_expected: string;
-  // Optional alternate header the writer should also accept (only set
-  // for EBITDA Q1 26 today, where AI3 = "Q4 26" in the source).
+  // Optional alternate header the writer should also accept.
+  // Keep null unless there is a non-ambiguous workbook migration path:
+  // accepting a different quarter label can write the right value under
+  // the wrong visible period.
   header_alternate: string | null;
 };
 
@@ -135,7 +131,6 @@ export function trackerColumnsForQuarter(quarterId: QuarterId): TrackerTarget {
     );
   }
   const entry = QUARTER_ORDER[idx];
-  const isQ1_2026 = quarterId === "Q1_2026";
 
   // Build the cells array in the order WRITABLE_METRICS declares so
   // the writer can iterate metrics deterministically and the audit log
@@ -144,11 +139,7 @@ export function trackerColumnsForQuarter(quarterId: QuarterId): TrackerTarget {
     metric,
     col: TRACKER_LAYOUT.section_starts[metric] + idx,
     header_expected: entry.label,
-    // The Q1 26 EBITDA column header has a typo in the source xlsx
-    // (AI3 = "Q4 26" instead of "Q1 26"). The writer accepts either
-    // for that one cell and reports it as a soft warning.
-    header_alternate:
-      metric === "ebitda" && isQ1_2026 ? Q1_2026_EBITDA_HEADER_TYPO : null,
+    header_alternate: null,
   }));
 
   return {
@@ -164,4 +155,3 @@ export function quarterLabel(id: QuarterId): string {
   if (!entry) throw new Error(`Unknown quarter_id "${id}".`);
   return entry.label;
 }
-

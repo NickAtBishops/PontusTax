@@ -40,6 +40,8 @@
 //     source_pdf_hash?: string,
 //     source_entity?: string,
 //     source_period?: string,
+//     source_units?: string,
+//     source_units_evidence?: string,
 //     line_items?: { label: string; amount: number }[],
 //     calculations?: { sales?: AuditCalculationTrace,
 //                      ebitda?: AuditCalculationTrace },
@@ -55,64 +57,86 @@
 // gets a clean retry path either way.
 
 import { NextResponse } from "next/server";
+import { cookies } from "next/headers";
 import ExcelJS from "exceljs";
+import { createHash } from "node:crypto";
 
+import { COOKIE_NAME, parseSessionCookie } from "@/lib/auth-session";
 import {
   ALL_QUARTER_IDS,
   METRIC_LABELS,
   WRITABLE_METRICS,
-  trackerColumnsForQuarter,
   type MetricCell,
   type MetricKey,
   type QuarterId,
 } from "@/lib/tenant-credit/tracker-layout";
+import { computeGeneric, type ComputeResult } from "@/lib/tenant-credit/generic-methodology";
 import {
+  mergeLineItems,
+  type MergeExtract,
+} from "@/lib/tenant-credit/merge-line-items";
+import type { LineItem } from "@/lib/tenant-credit/methodology";
+import { patchWorkbookCells, type OoxmlCellPatch } from "@/lib/tenant-credit/ooxml-writeback";
+import type {
+  SourceDocumentType,
+  SourceScopeType,
+} from "@/lib/tenant-credit/source-period";
+import {
+  cellExactText,
+  resolveTrackerTarget,
+  TARGET_SHEET_NAME,
+} from "@/lib/tenant-credit/tracker-target";
+import {
+  entityLooksLikeTenant,
+  tenantIdentity,
+} from "@/lib/tenant-credit/tenant-identity";
+import { amountMatchesSourceUnits } from "@/lib/tenant-credit/source-units";
+import { stripExcelCommentsForExcelJs } from "@/lib/tenant-credit/xlsx-sanitize";
+import {
+  finalizeAuditRuns,
   writeAuditRun,
   type AuditCalculationTrace,
-  type AuditIntercompany,
+  type AuditExcludedSourceFile,
   type AuditNormalization,
+  type AuditSourceFile,
+  type AuditWrittenCell,
 } from "@/lib/tenant-credit/audit";
 
 // 8 MB cap on the tracker upload. The corporate-financials master is
 // ~200 KB; anything larger is almost certainly the wrong file.
 const MAX_TRACKER_BYTES = 8 * 1024 * 1024;
 
-// Number-format strings applied when writing each metric. Matches the
-// formats Excel renders on the per-tenant Q1 26 sample cells in the
-// bundled tracker, so the written values look identical to data the
-// analyst typed in by hand.
-const METRIC_NUMBER_FORMATS: Record<MetricKey, string> = {
-  sales:    "#,##0",
-  ebitda:   "#,##0",
-  interest: "#,##0",
-  rent:     "#,##0",
-  cash:     "#,##0",
-  cfo:      "#,##0",
-  capex:    "#,##0",
-};
-
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-// Default actor recorded in tenant_tracker_runs.written_by until
-// Firebase Auth lands; same default as the previous single-tenant
-// route used.
-const DEFAULT_WRITTEN_BY =
-  process.env.AUDIT_DEFAULT_WRITTEN_BY ?? "pending-auth";
+async function currentAuditActor(analystName: string): Promise<string | null> {
+  if (process.env.AUDIT_DEFAULT_WRITTEN_BY) {
+    return process.env.AUDIT_DEFAULT_WRITTEN_BY;
+  }
+  const secret = process.env.SESSION_SECRET;
+  if (secret) {
+    const cookieStore = await cookies();
+    const parsed = await parseSessionCookie(
+      cookieStore.get(COOKIE_NAME)?.value,
+      secret,
+    );
+    if (parsed) return `session:${parsed.id}`;
+  }
+  const trimmed = analystName.trim().replace(/\s+/g, " ");
+  if (trimmed.length >= 2 && trimmed.length <= 100) {
+    return `analyst:${trimmed}`;
+  }
+  return null;
+}
 
 function isQuarterId(s: unknown): s is QuarterId {
   return typeof s === "string" && (ALL_QUARTER_IDS as string[]).includes(s);
 }
 
-// The tenant-substring check guards against silently writing into the
-// wrong row. We use the first whitespace/comma-separated token of the
-// display name; that's the most stable piece across column-A spelling
-// drift ("Pinnacle Oil & Gas Holdings, Inc" vs "Pinnacle Oil & Gas
-// Holdings, Inc." both pass when the substring is "Pinnacle").
-function tenantNameSubstring(tenantName: string): string {
-  return tenantName.split(/[\s,]+/, 1)[0] ?? tenantName;
-}
-
+// Server-side row identity check. The UI sends the row number, but the
+// workbook is the source of truth: rederive the same slug from column A
+// and require it to match the payload tenant_id. This catches substring
+// collisions such as "Pinnacle ..." vs "Pinnacle Services ...".
 // Does the entity name Claude read off the actual statement resemble the
 // tenant we're about to write into? This is NOT the same check as
 // tenantNameSubstring above — that one re-derives its expected value from
@@ -123,18 +147,6 @@ function tenantNameSubstring(tenantName: string): string {
 // one check that looks at what was actually extracted. Soft only —
 // legal-entity names drift too much (subsidiaries, DBAs, recently
 // acquired properties still showing the seller's name) to hard-refuse on.
-function entityLooksLikeTenant(sourceEntity: string, tenantName: string): boolean {
-  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-  const tokens = (s: string) => norm(s).split(" ").filter((t) => t.length >= 4);
-  const entityTokens = tokens(sourceEntity);
-  const tenantTokens = tokens(tenantName);
-  if (entityTokens.length === 0 || tenantTokens.length === 0) return true;
-  return (
-    entityTokens.some((t) => tenantTokens.includes(t)) ||
-    tenantTokens.some((t) => entityTokens.includes(t))
-  );
-}
-
 function timestamp(): string {
   const now = new Date();
   const p = (n: number) => String(n).padStart(2, "0");
@@ -148,37 +160,209 @@ function timestamp(): string {
 function asString(x: unknown, dflt = ""): string {
   return typeof x === "string" ? x : dflt;
 }
-function asStringArray(x: unknown): string[] {
-  return Array.isArray(x) ? x.filter((s) => typeof s === "string") : [];
-}
 function asObjectArray<T>(x: unknown): T[] {
   return Array.isArray(x) ? (x as T[]) : [];
 }
-function asCalculationTrace(x: unknown): AuditCalculationTrace {
-  const empty: AuditCalculationTrace = {
-    formula: "",
-    inputs: [],
-    total_tracker_unrounded: 0,
-    result: 0,
-  };
-  if (!x || typeof x !== "object") return empty;
-  const o = x as Record<string, unknown>;
+
+function isSourceDocumentType(value: unknown): value is SourceDocumentType {
+  return (
+    value === "income_statement" ||
+    value === "balance_sheet" ||
+    value === "cash_flow_statement" ||
+    value === "combined_financial_statements" ||
+    value === "other"
+  );
+}
+
+function isSourceScopeType(value: unknown): value is SourceScopeType {
+  return (
+    value === "entity_wide" ||
+    value === "component_subset" ||
+    value === "single_component" ||
+    value === "unknown"
+  );
+}
+
+function asLineItems(value: unknown): MergeExtract["line_items"] | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const items: MergeExtract["line_items"] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") return null;
+    const record = item as Record<string, unknown>;
+    if (
+      typeof record.label !== "string" ||
+      record.label.trim() === "" ||
+      typeof record.printed_amount !== "number" ||
+      !Number.isFinite(record.printed_amount) ||
+      typeof record.amount !== "number" ||
+      !Number.isFinite(record.amount) ||
+      typeof record.source_reference !== "string" ||
+      record.source_reference.trim() === ""
+    ) {
+      return null;
+    }
+    items.push({
+      label: record.label,
+      printed_amount: record.printed_amount,
+      amount: record.amount,
+      source_reference: record.source_reference,
+    });
+  }
+  return items;
+}
+
+type PacketExtract = MergeExtract & { level: "tenant" | "corporate" };
+
+function asPacketExtracts(value: unknown): PacketExtract[] | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const extracts: PacketExtract[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") return null;
+    const source = item as Record<string, unknown>;
+    const level = source.level;
+    const sourceUnits = source.source_units;
+    if (level !== "tenant" && level !== "corporate") return null;
+    if (!isSourceDocumentType(source.document_type)) return null;
+    if (!isSourceScopeType(source.source_scope_type)) return null;
+    if (
+      sourceUnits !== "dollars" &&
+      sourceUnits !== "thousands" &&
+      sourceUnits !== "millions"
+    ) {
+      return null;
+    }
+    if (
+      source.period_selection !== "printed_quarter_total" &&
+      source.period_selection !== "summed_months" &&
+      source.period_selection !== "single_period_column" &&
+      source.period_selection !== "point_in_time"
+    ) {
+      return null;
+    }
+    if (
+      !Array.isArray(source.source_scope_identifiers) ||
+      source.source_scope_identifiers.some(
+        (identifier) =>
+          typeof identifier !== "string" || identifier.trim() === "",
+      )
+    ) {
+      return null;
+    }
+    if (
+      (source.source_scope_type === "component_subset" ||
+        source.source_scope_type === "single_component") &&
+      source.source_scope_identifiers.length === 0
+    ) {
+      return null;
+    }
+    const lineItems = asLineItems(source.line_items);
+    if (!lineItems) return null;
+    if (
+      lineItems.some(
+        (item) =>
+          !amountMatchesSourceUnits(
+            item.printed_amount,
+            item.amount,
+            sourceUnits,
+          ),
+      )
+    ) {
+      return null;
+    }
+    const parsed: PacketExtract = {
+      source_filename: asString(source.source_filename),
+      source_file_hash: asString(source.source_file_hash),
+      source_entity: asString(source.source_entity),
+      source_period: asString(source.source_period),
+      source_units: sourceUnits,
+      source_units_evidence: asString(source.source_units_evidence),
+      document_type: source.document_type,
+      source_scope: asString(source.source_scope),
+      source_scope_type: source.source_scope_type,
+      source_scope_identifiers: source.source_scope_identifiers as string[],
+      period_selection: source.period_selection,
+      line_items: lineItems,
+      level,
+    };
+    if (
+      !parsed.source_filename ||
+      !/^[a-f0-9]{64}$/.test(parsed.source_file_hash) ||
+      !parsed.source_entity ||
+      !parsed.source_period ||
+      !parsed.source_scope ||
+      !parsed.source_units_evidence
+    ) {
+      return null;
+    }
+    extracts.push(parsed);
+  }
+  return extracts;
+}
+
+function asExcludedSourceFiles(value: unknown): AuditExcludedSourceFile[] {
+  if (!Array.isArray(value)) return [];
+  const result: AuditExcludedSourceFile[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const source = item as Record<string, unknown>;
+    const parsed = {
+      filename: asString(source.filename),
+      file_hash: asString(source.file_hash),
+      source_period: asString(source.source_period),
+      reason: asString(source.reason),
+    };
+    if (
+      parsed.filename &&
+      /^[a-f0-9]{64}$/.test(parsed.file_hash) &&
+      parsed.source_period &&
+      parsed.reason
+    ) {
+      result.push(parsed);
+    }
+  }
+  return result;
+}
+
+function traceToAudit(trace: ComputeResult["metrics"][MetricKey]): AuditCalculationTrace {
   return {
-    formula: asString(o.formula),
-    inputs: Array.isArray(o.inputs)
-      ? (o.inputs as AuditCalculationTrace["inputs"])
-      : [],
-    total_tracker_unrounded:
-      typeof o.total_tracker_unrounded === "number"
-        ? o.total_tracker_unrounded
-        : 0,
-    result:
-      typeof o.result === "number"
-        ? o.result
-        : typeof o.result_tracker === "number"
-          ? (o.result_tracker as number)
-          : 0,
+    formula: trace.formula,
+    inputs: trace.contributions.map((item) => ({
+      label: item.label,
+      amount_source: item.amount_source,
+      amount_tracker: item.amount_tracker,
+      reason: item.reason,
+    })),
+    total_tracker_unrounded: trace.total_tracker_unrounded,
+    result: trace.result_tracker ?? 0,
   };
+}
+
+function sha256(value: ArrayBuffer | Uint8Array | string): string {
+  const hash = createHash("sha256");
+  if (typeof value === "string") hash.update(value);
+  else if (value instanceof Uint8Array) hash.update(value);
+  else hash.update(Buffer.from(value));
+  return hash.digest("hex");
+}
+
+function exactArrayBuffer(value: Uint8Array): ArrayBuffer {
+  return value.buffer.slice(
+    value.byteOffset,
+    value.byteOffset + value.byteLength,
+  ) as ArrayBuffer;
+}
+
+function auditCellValue(value: ExcelJS.CellValue): string | number | boolean | null {
+  if (value == null) return null;
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return value;
+  }
+  if (value instanceof Date) return value.toISOString();
+  return cellPlainText(value);
 }
 
 // Per-tenant cell write summary fed to both the audit log and the
@@ -190,6 +374,9 @@ type BatchEntry = {
   tenant_display_name: string;
   tracker_row: number;
   values: Partial<Record<MetricKey, number>>;
+  source_files: AuditSourceFile[];
+  source_warnings: string[];
+  entity_override_reason: string;
   audit: Parameters<typeof writeAuditRun>[0];
 };
 
@@ -273,11 +460,24 @@ export async function POST(req: Request) {
     );
   }
   const quarterId = p.quarter_id;
+  const writtenBy = await currentAuditActor(asString(p.analyst_name));
+  if (!writtenBy) {
+    return NextResponse.json(
+      {
+        error:
+          "Analyst name is required because this deployment has no authenticated session.",
+      },
+      { status: 400 },
+    );
+  }
 
   // Parse and validate every entry up front. A single bad entry kills
   // the batch — the analyst should fix it and retry; partial writes
   // would leave the tracker in an ambiguous state.
   const entries: BatchEntry[] = [];
+  const seenRows = new Set<number>();
+  const seenTenantIds = new Set<string>();
+  const sourceHashOwners = new Map<string, string>();
   for (const [i, raw] of p.entries.entries()) {
     if (!raw || typeof raw !== "object") {
       return NextResponse.json(
@@ -308,78 +508,219 @@ export async function POST(req: Request) {
         { status: 400 },
       );
     }
+    if (seenRows.has(o.tracker_row) || seenTenantIds.has(o.tenant_id)) {
+      return NextResponse.json(
+        {
+          error:
+            `entries[${i}] duplicates tracker row ${o.tracker_row} or tenant ` +
+            `id "${o.tenant_id}". Each target may appear once.`,
+        },
+        { status: 400 },
+      );
+    }
+    seenRows.add(o.tracker_row);
+    seenTenantIds.add(o.tenant_id);
+
+    const packetExtracts = asPacketExtracts(o.extracts);
+    if (!packetExtracts) {
+      return NextResponse.json(
+        {
+          error:
+            `entries[${i}].extracts must contain the complete validated ` +
+            "per-file extraction packet.",
+        },
+        { status: 400 },
+      );
+    }
+    for (const extract of packetExtracts) {
+      const owner = sourceHashOwners.get(extract.source_file_hash);
+      if (owner) {
+        return NextResponse.json(
+          {
+            error:
+              `${extract.source_filename} is attached to both ${owner} and ` +
+              `${o.tenant_display_name}. The same source file cannot feed two tenants.`,
+          },
+          { status: 422 },
+        );
+      }
+      sourceHashOwners.set(extract.source_file_hash, o.tenant_display_name);
+    }
+    let merged: ReturnType<typeof mergeLineItems>;
+    try {
+      merged = mergeLineItems(packetExtracts, quarterId);
+    } catch (error) {
+      return NextResponse.json(
+        {
+          error:
+            `entries[${i}] source packet is ambiguous: ` +
+            (error instanceof Error ? error.message : String(error)),
+        },
+        { status: 422 },
+      );
+    }
+    const lineItems: LineItem[] = merged.merged;
+    let computed: ComputeResult;
+    try {
+      computed = computeGeneric(lineItems);
+    } catch (error) {
+      return NextResponse.json(
+        {
+          error:
+            `entries[${i}] failed server-side computation: ` +
+            (error instanceof Error ? error.message : String(error)),
+        },
+        { status: 422 },
+      );
+    }
+    if (computed.sales == null || computed.ebitda == null) {
+      return NextResponse.json(
+        {
+          error:
+            `entries[${i}] is incomplete: Sales and EBITDA are required ` +
+            "before writeback.",
+        },
+        { status: 422 },
+      );
+    }
+
     const values: Partial<Record<MetricKey, number>> = {};
     for (const metric of WRITABLE_METRICS) {
-      const v = o[metric];
-      if (v == null) continue;
-      if (typeof v !== "number" || !Number.isFinite(v)) {
+      const supplied = o[metric];
+      const serverValue = computed[metric];
+      if (
+        supplied != null &&
+        (typeof supplied !== "number" || !Number.isFinite(supplied))
+      ) {
         return NextResponse.json(
           { error: `entries[${i}].${metric} must be a finite number or null.` },
           { status: 400 },
         );
       }
-      values[metric] = v;
+      if (supplied !== undefined && supplied !== serverValue) {
+        return NextResponse.json(
+          {
+            error:
+              `entries[${i}].${metric}=${String(supplied)} does not match ` +
+              `server recomputation ${String(serverValue)}.`,
+          },
+          { status: 422 },
+        );
+      }
+      if (serverValue != null) values[metric] = serverValue;
     }
-    if (Object.keys(values).length === 0) {
-      return NextResponse.json(
-        {
-          error:
-            `entries[${i}] has no metric values to write; ` +
-            "every metric was null. Drop the entry instead.",
-        },
-        { status: 400 },
-      );
-    }
+    const includedHashes = new Set(
+      merged.includedExtracts.map((extract) => extract.source_file_hash),
+    );
+    const exclusionReasons = new Map(
+      merged.excludedExtracts.map(({ extract, reason }) => [
+        extract.source_file_hash,
+        reason,
+      ]),
+    );
+    const sourceFiles: AuditSourceFile[] = packetExtracts.map((extract) => ({
+      filename: extract.source_filename,
+      file_hash: extract.source_file_hash,
+      source_entity: extract.source_entity,
+      source_period: extract.source_period,
+      source_units: extract.source_units,
+      source_units_evidence: extract.source_units_evidence,
+      document_type: extract.document_type,
+      source_scope: extract.source_scope,
+      source_scope_type: extract.source_scope_type,
+      source_scope_identifiers: extract.source_scope_identifiers,
+      period_selection: extract.period_selection,
+      level: extract.level,
+      included_in_compute: includedHashes.has(extract.source_file_hash),
+      exclusion_reason: exclusionReasons.get(extract.source_file_hash) ?? "",
+    }));
+    const excludedSourceFiles = asExcludedSourceFiles(o.excluded_files);
 
-    const calculations = (o.calculations ?? {}) as Record<string, unknown>;
+    const calculations = Object.fromEntries(
+      WRITABLE_METRICS.map((metric) => [
+        metric,
+        traceToAudit(computed.metrics[metric]),
+      ]),
+    ) as Record<MetricKey, AuditCalculationTrace>;
+    const computedMetrics = Object.fromEntries(
+      WRITABLE_METRICS.map((metric) => [metric, computed[metric]]),
+    ) as Record<MetricKey, number | null>;
     const audit: Parameters<typeof writeAuditRun>[0] = {
+      idempotency_key: "",
+      run_group_id: "",
       tenant_id: o.tenant_id,
       quarter: quarterId,
-      source_pdf_filename: asString(o.source_pdf_filename),
-      source_pdf_hash: asString(o.source_pdf_hash),
-      source_entity: asString(o.source_entity),
-      source_period: asString(o.source_period),
-      computed_sales: values.sales ?? 0,
-      computed_ebitda: values.ebitda ?? 0,
-      intercompany_observed: asObjectArray<AuditIntercompany>(
-        o.intercompany_observed,
-      ),
+      source_pdf_filename: sourceFiles.map((source) => source.filename).join(", "),
+      source_pdf_hash: sourceFiles.map((source) => source.file_hash).join(","),
+      source_entity: sourceFiles.map((source) => source.source_entity).join("; "),
+      source_period: sourceFiles.map((source) => source.source_period).join("; "),
+      source_units: [...new Set(sourceFiles.map((source) => source.source_units))].join(","),
+      source_units_evidence: sourceFiles
+        .map((source) => source.source_units_evidence)
+        .join("; "),
+      computed_sales: computed.sales,
+      computed_ebitda: computed.ebitda,
+      computed_metrics: computedMetrics,
+      source_files: sourceFiles,
+      excluded_source_files: excludedSourceFiles,
+      input_workbook_hash: "",
+      output_workbook_hash: "",
+      written_cells: [],
+      intercompany_observed: computed.intercompany_observed.map((observation) => ({
+        ...observation,
+        net_effect_on_ebitda_source: 0,
+      })),
       normalization_applied: asObjectArray<AuditNormalization>(
         o.normalization_applied,
       ),
-      passed_through: asStringArray(o.passed_through),
-      unused_labels: asStringArray(o.unused_labels),
-      line_items: asObjectArray<{ label: string; amount: number }>(
-        o.line_items,
+      passed_through: packetExtracts.flatMap((extract) =>
+        extract.line_items.map((item) => item.label),
       ),
-      calculations: {
-        sales: asCalculationTrace(calculations.sales),
-        ebitda: asCalculationTrace(calculations.ebitda),
-      },
-      status: "writeback_success",  // patched below per-tenant
-      worker_warnings: [],          // ditto
+      unused_labels: computed.unused_labels,
+      line_items: packetExtracts.flatMap((extract) =>
+        extract.line_items.map((item) => ({
+          ...item,
+          source_reference: `${extract.source_filename}: ${item.source_reference}`,
+          source_filename: extract.source_filename,
+          source_file_hash: extract.source_file_hash,
+          included_in_compute: includedHashes.has(extract.source_file_hash),
+        })),
+      ),
+      calculations,
+      status: "writeback_pending",
+      worker_warnings: [],
       error: null,
-      written_by: asString(o.written_by, DEFAULT_WRITTEN_BY),
-      written_filename: "",         // patched once we know the filename
+      written_by: writtenBy,
+      written_filename: "",
     };
     entries.push({
       tenant_id: o.tenant_id,
       tenant_display_name: o.tenant_display_name,
       tracker_row: o.tracker_row,
       values,
+      source_files: sourceFiles,
+      source_warnings: [
+        ...merged.excludedExtracts.map(({ extract, reason }) =>
+          `${extract.source_filename}: ${reason}`,
+        ),
+        ...merged.conflicts,
+        ...excludedSourceFiles.map(
+          (source) => `${source.filename}: excluded (${source.reason})`,
+        ),
+      ],
+      entity_override_reason: asString(o.entity_override_reason),
       audit,
     });
   }
 
-  const target = trackerColumnsForQuarter(quarterId);
-
-  // Parse the workbook once, apply every tenant's writes to it, then
-  // serialize once. ExcelJS's typings want a plain ArrayBuffer on
-  // load(), not the Node Buffer alias.
+  // ExcelJS validates the workbook and target cells. The output writer
+  // patches the original OOXML package so unsupported workbook parts are
+  // preserved rather than reserialized by ExcelJS.
   const xlsxBuffer = await trackerFile.arrayBuffer();
   const wb = new ExcelJS.Workbook();
   try {
-    await wb.xlsx.load(xlsxBuffer);
+    const sanitized = stripExcelCommentsForExcelJs(xlsxBuffer);
+    await wb.xlsx.load(sanitized);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return NextResponse.json(
@@ -387,14 +728,26 @@ export async function POST(req: Request) {
       { status: 400 },
     );
   }
-  const sheet = wb.getWorksheet(target.sheet_name);
+  const sheet = wb.getWorksheet(TARGET_SHEET_NAME);
   if (!sheet) {
     const seen = wb.worksheets.map((w) => `"${w.name}"`).join(", ");
     return NextResponse.json(
       {
         error:
-          `Tracker is missing the "${target.sheet_name}" sheet ` +
+          `Tracker is missing the "${TARGET_SHEET_NAME}" sheet ` +
           `(trailing space matters). Sheets seen: [${seen}].`,
+      },
+      { status: 422 },
+    );
+  }
+  let target: ReturnType<typeof resolveTrackerTarget>;
+  try {
+    target = resolveTrackerTarget(sheet, quarterId);
+  } catch (error) {
+    return NextResponse.json(
+      {
+        error:
+          error instanceof Error ? error.message : "Could not resolve tracker columns.",
       },
       { status: 422 },
     );
@@ -410,28 +763,45 @@ export async function POST(req: Request) {
     const reasons: string[] = [];
     const entryWarnings: string[] = [];
 
-    // Tenant identity check on column A. This only proves the picker and
-    // the CURRENT tracker upload agree with each other; it cannot catch
-    // the wrong PDF being attached to the right tenant row (see
+    // Tenant identity check on column A. This proves the picker and the
+    // CURRENT tracker upload still agree on the exact row target. It
+    // cannot catch the wrong PDF attached to the right tenant row (see
     // entityLooksLikeTenant below for that).
     const nameText = cellPlainText(sheet.getCell(entry.tracker_row, 1).value);
-    const needle = tenantNameSubstring(entry.tenant_display_name);
-    if (!nameText.toLowerCase().includes(needle.toLowerCase())) {
+    const actualSlug = tenantIdentity(nameText);
+    const expectedSlug = tenantIdentity(entry.tenant_display_name);
+    const payloadSlug = tenantIdentity(entry.tenant_id);
+    if (
+      actualSlug !== expectedSlug ||
+      (payloadSlug !== "" && payloadSlug !== expectedSlug)
+    ) {
       reasons.push(
-        `row ${entry.tracker_row} column A is "${nameText}", which does not ` +
-          `contain expected tenant substring "${needle}". The picker may be ` +
-          "out of sync with the uploaded tracker.",
+        `row ${entry.tracker_row} column A is "${nameText}", which normalizes ` +
+          `to "${actualSlug}", but the payload targets ` +
+          `"${entry.tenant_display_name}" (${expectedSlug}) with tenant_id ` +
+          `"${entry.tenant_id}" (${payloadSlug}). The picker may be out of ` +
+          "sync with the uploaded tracker.",
       );
     }
 
     // Source-entity check: the one defense against a mis-assigned file
     // in Triage. Soft (warning, not refusal) — see entityLooksLikeTenant.
-    const sourceEntity = entry.audit.source_entity;
-    if (sourceEntity && !entityLooksLikeTenant(sourceEntity, entry.tenant_display_name)) {
+    const mismatchedSources = entry.source_files.filter(
+      (source) =>
+        source.included_in_compute &&
+        !entityLooksLikeTenant(source.source_entity, entry.tenant_display_name),
+    );
+    if (mismatchedSources.length > 0 && !entry.entity_override_reason) {
+      reasons.push(
+        `Source entities ${mismatchedSources
+          .map((source) => `"${source.source_entity}" (${source.filename})`)
+          .join(", ")} do not match tenant "${entry.tenant_display_name}". ` +
+          "Review the assignment and explicitly approve the mismatch.",
+      );
+    } else if (mismatchedSources.length > 0) {
       entryWarnings.push(
-        `The extracted statement's entity ("${sourceEntity}") doesn't obviously ` +
-          `match tenant "${entry.tenant_display_name}". Double-check the right ` +
-          "file was attached to this row before trusting these numbers.",
+        `Entity mismatch approved: ${entry.entity_override_reason}. Sources: ` +
+          mismatchedSources.map((source) => source.source_entity).join(", "),
       );
     }
 
@@ -449,6 +819,13 @@ export async function POST(req: Request) {
         entryWarnings.push(headerCheck.message);
       }
       const targetCell = sheet.getCell(entry.tracker_row, cell.col);
+      if (targetCell.isMerged) {
+        reasons.push(
+          `${METRIC_LABELS[metric]} target cell ${targetCell.address} is merged. ` +
+            "Refusing ambiguous write.",
+        );
+        continue;
+      }
       if (isFormulaCell(targetCell)) {
         reasons.push(
           `${METRIC_LABELS[metric]} target cell ` +
@@ -493,89 +870,178 @@ export async function POST(req: Request) {
     );
   }
 
-  // Second pass: write. Every entry passed; this is the commit phase.
+  // Build a patch list from the validated target addresses. The patcher edits
+  // only worksheet values plus workbook recalculation flags; comments,
+  // external links, styles, drawings, and every other OOXML part stay intact.
+  const patches: OoxmlCellPatch[] = [];
   const writtenSummary: { tenant_id: string; cells: WrittenCells }[] = [];
+  const writtenAudit = new Map<string, AuditWrittenCell[]>();
   for (const entry of entries) {
     const cells: WrittenCells = {};
+    const auditCells: AuditWrittenCell[] = [];
     for (const metric of WRITABLE_METRICS) {
       const value = entry.values[metric];
       if (value == null) continue;
-      const target_cell = target.cells.find((c) => c.metric === metric);
-      if (!target_cell) continue;
-      const xlsxCell = sheet.getCell(entry.tracker_row, target_cell.col);
-      xlsxCell.value = value;
-      xlsxCell.numFmt = METRIC_NUMBER_FORMATS[metric];
+      const targetCell = target.cells.find((cell) => cell.metric === metric);
+      if (!targetCell) continue;
+      const workbookCell = sheet.getCell(entry.tracker_row, targetCell.col);
+      patches.push({ address: workbookCell.address, value });
       cells[metric] = value;
+      auditCells.push({
+        metric,
+        address: workbookCell.address,
+        previous_value: auditCellValue(workbookCell.value),
+        new_value: value,
+      });
     }
     writtenSummary.push({ tenant_id: entry.tenant_id, cells });
+    writtenAudit.set(entry.tenant_id, auditCells);
   }
 
-  const out = await wb.xlsx.writeBuffer();
-  const newXlsx = new Uint8Array(out);
-  const filename = `Corporate_Financials_and_P_Ls_${quarterId}_${timestamp()}.xlsx`;
-
-  // Audit each tenant's run BEFORE returning. Each entry gets its own
-  // tenant_tracker_runs document; warnings collected for the entry ride
-  // along on worker_warnings. These are NOT one atomic transaction across
-  // tenants (each is its own top-level Firestore document), so if one
-  // fails we cannot un-write the ones that already succeeded.
-  // Promise.allSettled runs them all concurrently (rather than stopping
-  // at the first failure) so a single bad write doesn't hide the rest,
-  // and if any fail, the error response names every tenant whose audit
-  // doc is now stale — written with status "writeback_success" even
-  // though the workbook was never delivered — so that's visible to
-  // whoever reads the failure, not silently true.
-  const auditSettled = await Promise.allSettled(
-    entries.map(async (entry) => {
-      const entryWarnings =
-        warnings.find((w) => w.entry.tenant_id === entry.tenant_id)?.messages ?? [];
-      const id = await writeAuditRun({
-        ...entry.audit,
-        worker_warnings: entryWarnings,
-        written_filename: filename,
-      });
-      return { id };
-    }),
-  );
-  const zipped = entries.map((entry, i) => ({ entry, result: auditSettled[i] }));
-  const auditFailures = zipped.filter(({ result }) => result.status === "rejected");
-
-  if (auditFailures.length > 0) {
-    const failedNames = auditFailures.map(({ entry }) => entry.tenant_display_name);
-    const staleSuccessNames = zipped
-      .filter(({ result }) => result.status === "fulfilled")
-      .map(({ entry }) => entry.tenant_display_name);
-    const reasons = auditFailures.map(({ result }) => {
-      const reason = (result as PromiseRejectedResult).reason;
-      return reason instanceof Error ? reason.message : String(reason);
-    });
+  let newXlsx: Uint8Array;
+  try {
+    newXlsx = patchWorkbookCells(xlsxBuffer, TARGET_SHEET_NAME, patches);
+  } catch (error) {
     return NextResponse.json(
       {
         error:
-          `Wrote ${filename} in memory, but the audit-log write to Firestore ` +
-          `failed for ${auditFailures.length} of ${entries.length} tenant(s) ` +
-          `(${failedNames.join(", ")}): ${reasons.join("; ")}. ` +
-          "The workbook was never sent to you, so your copy of the tracker is " +
-          "unchanged. Re-run after fixing Firestore." +
-          (staleSuccessNames.length > 0
-            ? ` NOTE: Firestore now has a "writeback_success" audit record from ` +
-              `this same failed attempt for ${staleSuccessNames.join(", ")} — those ` +
-              "records are stale (no file was ever delivered) and should be " +
-              "disregarded if reviewed later."
-            : ""),
+          "Workbook patch failed before any file was returned: " +
+          (error instanceof Error ? error.message : String(error)),
+      },
+      { status: 422 },
+    );
+  }
+
+  // Re-open the generated package and prove every requested address contains
+  // exactly the server-computed number before recording a successful audit.
+  try {
+    const verifyWorkbook = new ExcelJS.Workbook();
+    const verifyBytes = stripExcelCommentsForExcelJs(exactArrayBuffer(newXlsx));
+    await verifyWorkbook.xlsx.load(verifyBytes);
+    const verifySheet = verifyWorkbook.getWorksheet(TARGET_SHEET_NAME);
+    if (!verifySheet) throw new Error(`Output lost sheet "${TARGET_SHEET_NAME}".`);
+    for (const patch of patches) {
+      const cell = verifySheet.getCell(patch.address);
+      if (isFormulaCell(cell) || cell.value !== patch.value) {
+        throw new Error(
+          `${patch.address} verified as ${JSON.stringify(cell.value)}, ` +
+            `expected ${patch.value}.`,
+        );
+      }
+    }
+  } catch (error) {
+    return NextResponse.json(
+      {
+        error:
+          "Generated workbook failed post-write verification and was not returned: " +
+          (error instanceof Error ? error.message : String(error)),
       },
       { status: 500 },
     );
   }
 
-  const noAuditTrail = zipped.some(
-    ({ result }) => result.status === "fulfilled" && result.value.id === null,
+  const inputWorkbookHash = sha256(xlsxBuffer);
+  const outputWorkbookHash = sha256(newXlsx);
+  const runGroupId = sha256(
+    JSON.stringify({
+      version: 1,
+      quarter_id: quarterId,
+      input_workbook_hash: inputWorkbookHash,
+      entries: entries.map((entry) => ({
+        tenant_id: entry.tenant_id,
+        tracker_row: entry.tracker_row,
+        values: entry.values,
+        source_hashes: entry.source_files.map((source) => source.file_hash),
+      })),
+    }),
   );
+  const filename = `Corporate_Financials_and_P_Ls_${quarterId}_${timestamp()}.xlsx`;
+
+  // Persist every tenant as pending before the response is allowed to carry
+  // workbook bytes. Production treats missing Firestore configuration as a
+  // hard failure. A deterministic ID makes a client/network retry overwrite
+  // the same run rather than inventing duplicate audit history.
+  const pendingSettled = await Promise.allSettled(
+    entries.map(async (entry) => {
+      const entryWarnings =
+        warnings.find((warning) => warning.entry.tenant_id === entry.tenant_id)
+          ?.messages ?? [];
+      const idempotencyKey = sha256(`${runGroupId}:${entry.tenant_id}`);
+      entry.audit = {
+        ...entry.audit,
+        idempotency_key: idempotencyKey,
+        run_group_id: runGroupId,
+        input_workbook_hash: inputWorkbookHash,
+        output_workbook_hash: outputWorkbookHash,
+        written_cells: writtenAudit.get(entry.tenant_id) ?? [],
+        worker_warnings: [...entry.source_warnings, ...entryWarnings],
+        written_filename: filename,
+        status: "writeback_pending",
+      };
+      return { id: await writeAuditRun(entry.audit) };
+    }),
+  );
+  const auditedEntries = entries.map((entry, index) => ({
+    entry,
+    result: pendingSettled[index],
+  }));
+  const auditFailures = auditedEntries.filter(
+    ({ result }) => result.status === "rejected",
+  );
+
+  if (auditFailures.length > 0) {
+    const pendingIds = auditedEntries.flatMap(({ result }) =>
+      result.status === "fulfilled" && result.value.id ? [result.value.id] : [],
+    );
+    const reasons = auditFailures.map(({ entry, result }) => {
+      const cause = (result as PromiseRejectedResult).reason;
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      return `${entry.tenant_display_name}: ${detail}`;
+    });
+    try {
+      await finalizeAuditRuns(pendingIds, "writeback_failed", reasons.join("; "));
+    } catch {
+      // The parent documents remain visibly pending, never falsely successful.
+    }
+    return NextResponse.json(
+      {
+        error:
+          "Audit logging failed; the generated workbook was not returned and " +
+          `the uploaded tracker is unchanged. ${reasons.join("; ")}`,
+      },
+      { status: 500 },
+    );
+  }
+
+  const auditIds = auditedEntries.flatMap(({ result }) =>
+    result.status === "fulfilled" && result.value.id ? [result.value.id] : [],
+  );
+  const noAuditTrail = auditIds.length !== entries.length;
+  try {
+    await finalizeAuditRuns(auditIds, "writeback_success", null);
+  } catch (error) {
+    return NextResponse.json(
+      {
+        error:
+          "The audit records could not be finalized, so the workbook was not " +
+          "returned. Firestore records remain pending. " +
+          (error instanceof Error ? error.message : String(error)),
+      },
+      { status: 500 },
+    );
+  }
 
   // Aggregate warnings into the X-Worker-Warnings header so the
   // existing client-side toast logic still surfaces them.
   const headerWarnings = warnings.flatMap((w) =>
     w.messages.map((m) => `[${w.entry.tenant_display_name}] ${m}`),
+  );
+  headerWarnings.push(
+    ...entries.flatMap((entry) =>
+      entry.source_warnings.map(
+        (warning) => `[${entry.tenant_display_name}] ${warning}`,
+      ),
+    ),
   );
   if (noAuditTrail) {
     headerWarnings.push(
@@ -594,7 +1060,7 @@ export async function POST(req: Request) {
     headers.set("X-Worker-Warnings", JSON.stringify(headerWarnings));
   }
 
-  return new Response(newXlsx, { status: 200, headers });
+  return new Response(exactArrayBuffer(newXlsx), { status: 200, headers });
 }
 
 // ----------------------------------------------------------------------------
@@ -611,7 +1077,7 @@ function verifyHeader(
   headerRow: number,
   cell: MetricCell,
 ): HeaderCheck {
-  const actual = cellPlainText(sheet.getCell(headerRow, cell.col).value);
+  const actual = cellExactText(sheet.getCell(headerRow, cell.col).value);
   if (actual === cell.header_expected) return { kind: "ok" };
   if (cell.header_alternate !== null && actual === cell.header_alternate) {
     return {

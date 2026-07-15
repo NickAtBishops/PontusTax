@@ -1,10 +1,10 @@
 // Tab-survival persistence for the tenant-credit page.
 //
-// localStorage isn't enough on its own because File objects can't go
+// Browser storage JSON isn't enough on its own because File objects can't go
 // through JSON, and base64-encoding PDFs hits the ~5 MB localStorage
 // cap fast. We split the storage:
 //
-//   localStorage: the JSON snapshot of UI state (mode, quarter,
+//   sessionStorage: the per-tab JSON snapshot of UI state (quarter,
 //                 tenant assignments, compute results, file metadata).
 //                 Small, cheap to write on every change.
 //
