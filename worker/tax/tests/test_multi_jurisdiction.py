@@ -353,6 +353,198 @@ def test_grouping_buckets_discovery_placeholder_jobs_together():
     assert bucket_by_key[job_c.key] != bucket_by_key[job_a.key]
 
 
+# ---------------------------------------------------------------------------
+# Regression (2026-07-16, real "with_urls" tracker run): a legitimately-
+# real but blocked/inapplicable SUPPLEMENTARY jurisdiction link (a real
+# second portal that hit a CAPTCHA, or genuinely doesn't recognize this
+# property) must not drag an otherwise-good Website result down to
+# NEEDS_REVIEW — that was observed for real on row 10 of the actual run
+# ("1 Valpak Avenue": Website said PAID; Jurisdiction link primary
+# pointed at a different, real domain that came back CAPTCHA-blocked;
+# the row incorrectly reported NEEDS_REVIEW instead of PAID).
+# ---------------------------------------------------------------------------
+
+
+def test_blocked_supplementary_link_does_not_override_good_website_result(
+    ptax_master_workbook, monkeypatch,
+):
+    row = _row(
+        url="https://website.example-portal.com/tax",
+        jurisdiction_link_primary="https://blocked.example-portal.com/tax",
+    )
+    sheet = _sheet([row])
+    job = _job(row, sheet)
+    processor = _make_processor(ptax_master_workbook)
+
+    async def fake_check_account(
+        self, job, group, url, domain, taxonomy, roll_type, playbook,
+        multi_note, outcome,
+    ):
+        if "blocked" in url:
+            return AccountRecord(
+                account_searched=group.display, status="NEEDS_REVIEW",
+                confidence="LOW", evidence="portal blocked automated access",
+            ), False
+        return AccountRecord(
+            account_searched=group.display, status=PAID, confidence="HIGH",
+            evidence="paid in full", amount_paid=100.0,
+        ), False
+
+    monkeypatch.setattr(RowProcessor, "_check_account", fake_check_account)
+    outcome = asyncio.run(processor.process(job))
+
+    # The row reports PAID (Website's real result), not NEEDS_REVIEW —
+    # the blocked supplementary link doesn't win the aggregation.
+    assert outcome.row_status == PAID
+    assert outcome.confidence == "HIGH"
+    # Both records are still visible for audit — nothing is hidden.
+    assert len(outcome.accounts) == 2
+    # The blocked supplementary check is still visible in evidence.
+    assert "portal blocked automated access" in outcome.evidence
+    assert "[Jurisdiction link primary]" in outcome.evidence
+
+
+def test_excluded_supplementary_record_does_not_contaminate_written_amounts(
+    ptax_master_workbook, monkeypatch,
+):
+    # An excluded NEEDS_REVIEW supplementary record can still carry a
+    # contradictory figure (e.g. validate.py's ultimate>0-with-PAID
+    # cross-check) — it must not leak into write_amount_due /
+    # write_ultimate_payment_due for a row whose STATUS ignored it.
+    row = _row(
+        url="https://website.example-portal.com/tax",
+        jurisdiction_link_primary="https://blocked.example-portal.com/tax",
+    )
+    sheet = _sheet([row])
+    job = _job(row, sheet)
+    processor = _make_processor(ptax_master_workbook)
+
+    async def fake_check_account(
+        self, job, group, url, domain, taxonomy, roll_type, playbook,
+        multi_note, outcome,
+    ):
+        if "blocked" in url:
+            return AccountRecord(
+                account_searched=group.display, status="NEEDS_REVIEW",
+                confidence="LOW",
+                evidence="ultimate due $999 but reported PAID — flagged",
+                ultimate_payment_due=999.0, amount_due=999.0,
+            ), False
+        return AccountRecord(
+            account_searched=group.display, status=PAID, confidence="HIGH",
+            evidence="paid in full", amount_paid=100.0,
+            date_paid="2026-01-01", ultimate_payment_due=0.0,
+        ), False
+
+    monkeypatch.setattr(RowProcessor, "_check_account", fake_check_account)
+    outcome = asyncio.run(processor.process(job))
+
+    assert outcome.row_status == PAID
+    # Website's own (real) ultimate_payment_due of 0 is written; the
+    # excluded record's contradictory 999 must not be summed in.
+    assert outcome.write_ultimate_payment_due == 0.0
+    assert outcome.write_amount_due is None
+    assert outcome.write_payment_amount == 100.0
+
+
+def test_working_supplementary_link_still_wins_when_genuinely_worse(
+    ptax_master_workbook, monkeypatch,
+):
+    # A REAL second jurisdiction that genuinely found a worse bill must
+    # still win the aggregation — only a FAILED (NEEDS_REVIEW/UNREACHABLE)
+    # supplementary link gets excluded, not a successful one.
+    row = _row(
+        url="https://website.example-portal.com/tax",
+        jurisdiction_link_primary="https://district.example-portal.com/tax",
+    )
+    sheet = _sheet([row])
+    job = _job(row, sheet)
+    processor = _make_processor(ptax_master_workbook)
+
+    async def fake_check_account(
+        self, job, group, url, domain, taxonomy, roll_type, playbook,
+        multi_note, outcome,
+    ):
+        if "district" in url:
+            return AccountRecord(
+                account_searched=group.display, status=DELINQUENT,
+                confidence="HIGH", amount_due=500.0,
+                evidence="delinquent on special assessment",
+            ), False
+        return AccountRecord(
+            account_searched=group.display, status=PAID, confidence="HIGH",
+            evidence="paid in full",
+        ), False
+
+    monkeypatch.setattr(RowProcessor, "_check_account", fake_check_account)
+    outcome = asyncio.run(processor.process(job))
+
+    assert outcome.row_status == DELINQUENT
+
+
+def test_website_failure_does_not_block_a_genuine_supplementary_finding(
+    ptax_master_workbook, monkeypatch,
+):
+    row = _row(
+        url="https://website.example-portal.com/tax",
+        jurisdiction_link_primary="https://district.example-portal.com/tax",
+    )
+    sheet = _sheet([row])
+    job = _job(row, sheet)
+    processor = _make_processor(ptax_master_workbook)
+
+    async def fake_check_account(
+        self, job, group, url, domain, taxonomy, roll_type, playbook,
+        multi_note, outcome,
+    ):
+        if "district" in url:
+            return AccountRecord(
+                account_searched=group.display, status=UNPAID,
+                confidence="HIGH", amount_due=250.0,
+                evidence="owes on district",
+            ), False
+        return AccountRecord(
+            account_searched=group.display, status="NEEDS_REVIEW",
+            confidence="LOW", evidence="portal blocked automated access",
+        ), False
+
+    monkeypatch.setattr(RowProcessor, "_check_account", fake_check_account)
+    outcome = asyncio.run(processor.process(job))
+
+    # Website's own failure doesn't suppress a genuine, real finding from
+    # a supplementary jurisdiction link.
+    assert outcome.row_status == UNPAID
+
+
+def test_all_urls_failing_still_reports_needs_review(
+    ptax_master_workbook, monkeypatch,
+):
+    # Nothing usable anywhere — the fallback-to-everything path must
+    # still report NEEDS_REVIEW, not silently drop to some default.
+    row = _row(
+        url="https://website.example-portal.com/tax",
+        jurisdiction_link_primary="https://district.example-portal.com/tax",
+    )
+    sheet = _sheet([row])
+    job = _job(row, sheet)
+    processor = _make_processor(ptax_master_workbook)
+
+    async def fake_check_account(
+        self, job, group, url, domain, taxonomy, roll_type, playbook,
+        multi_note, outcome,
+    ):
+        return AccountRecord(
+            account_searched=group.display, status="NEEDS_REVIEW",
+            confidence="LOW", evidence="portal blocked automated access",
+        ), False
+
+    monkeypatch.setattr(RowProcessor, "_check_account", fake_check_account)
+    outcome = asyncio.run(processor.process(job))
+
+    assert outcome.row_status == "NEEDS_REVIEW"
+    assert len(outcome.accounts) == 2
+
+
 def test_grouping_is_deterministic_across_repeated_calls():
     sheet = _sheet([])
     rows = [

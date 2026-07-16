@@ -245,9 +245,32 @@ class RowProcessor:
             records.extend(await self._process_url(job, url, url_label, outcome))
 
         # ---- aggregate (§5.6) — across ALL urls checked -----------------
+        # A supplementary jurisdiction link (anything but Website) that
+        # came back NEEDS_REVIEW/UNREACHABLE is excluded from the STATUS
+        # aggregation: a reference URL that's stale, wrong, or simply
+        # doesn't apply to this property shouldn't drag an otherwise-good
+        # Website result down to NEEDS_REVIEW. It's still fully visible in
+        # outcome.accounts/evidence — this only changes what decides the
+        # row's status/confidence/note. Website's own result always
+        # counts regardless of status; a WORKING supplementary link (a
+        # real second jurisdiction with its own bill) still participates
+        # normally, including winning the row via the usual worst-status
+        # rule when it's genuinely worse than Website's. Single-URL rows
+        # are unaffected (every record's jurisdiction_label is None here,
+        # so all of them land in `primary`).
+        primary = [r for r in records if r.jurisdiction_label in (None, "Website")]
+        supplementary_ok = [
+            r for r in records
+            if r.jurisdiction_label not in (None, "Website")
+            and r.status not in (NEEDS_REVIEW, UNREACHABLE)
+        ]
+        aggregatable = primary + supplementary_ok
+        if not aggregatable:
+            aggregatable = records  # nothing usable — report what we have
+
         outcome.accounts = records
-        outcome.row_status = aggregate_status([r.status for r in records])
-        outcome.confidence = min_confidence([r.confidence for r in records])
+        outcome.row_status = aggregate_status([r.status for r in aggregatable])
+        outcome.confidence = min_confidence([r.confidence for r in aggregatable])
         outcome.evidence = " | ".join(
             (f"[{r.jurisdiction_label}] " if r.jurisdiction_label else "")
             + f"{r.account_searched}: {r.evidence}"
@@ -255,20 +278,28 @@ class RowProcessor:
         )[:3000]
         if outcome.row_status in (NEEDS_REVIEW, UNREACHABLE):
             outcome.needs_review_reason = next(
-                (r.evidence for r in records if r.status in (NEEDS_REVIEW, UNREACHABLE)),
+                (r.evidence for r in aggregatable if r.status in (NEEDS_REVIEW, UNREACHABLE)),
                 None,
             )
         outcome.status_note = build_row_note(
-            records, outcome.row_status, self.today
+            aggregatable, outcome.row_status, self.today
         )
         if outcome.discovered_url:
             outcome.status_note += f" | portal: {outcome.discovered_url}"
+        skipped = row.check_urls_skipped()
+        if skipped:
+            outcome.status_note += " | " + "; ".join(skipped)
 
         # ---- the Amount Due cell (gated by §7: verified rows only) ------
+        # Summed from `aggregatable`, not the full `records` — an excluded
+        # supplementary record (see above) may still carry a contradictory
+        # figure (e.g. the ultimate_payment_due>0-with-PAID cross-check in
+        # validate.py) even while flagged NEEDS_REVIEW; it must not leak
+        # into the written amounts for a row whose STATUS ignored it.
         if outcome.confidence != LOW and outcome.row_status not in (
             NEEDS_REVIEW, UNREACHABLE,
         ):
-            dues = [r.amount_due for r in records if r.amount_due]
+            dues = [r.amount_due for r in aggregatable if r.amount_due]
             if outcome.row_status in (UNPAID, PARTIAL, DELINQUENT) and dues:
                 outcome.write_amount_due = round(sum(dues), 2)
 
@@ -277,21 +308,21 @@ class RowProcessor:
             # is aggregated. PAID rows are valid here too: a paid bill
             # has ultimate=0 and a posted payment date/amount worth
             # writing into the template.
-            uds = [r.ultimate_payment_due for r in records
+            uds = [r.ultimate_payment_due for r in aggregatable
                    if r.ultimate_payment_due is not None]
             if uds:
                 outcome.write_ultimate_payment_due = round(sum(uds), 2)
-            paid_amts = [r.amount_paid for r in records if r.amount_paid is not None]
+            paid_amts = [r.amount_paid for r in aggregatable if r.amount_paid is not None]
             if paid_amts:
                 outcome.write_payment_amount = round(sum(paid_amts), 2)
             # Most recent posted payment date wins (max ISO string).
-            paid_dates = sorted(r.date_paid for r in records if r.date_paid)
+            paid_dates = sorted(r.date_paid for r in aggregatable if r.date_paid)
             if paid_dates:
                 outcome.write_payment_date = paid_dates[-1]
             # Earliest upcoming deadline wins (min ISO string), pulling
             # from each account's next_due_date and due_dates[*].
             upcoming: list[str] = []
-            for r in records:
+            for r in aggregatable:
                 if r.next_due_date:
                     upcoming.append(r.next_due_date)
                 upcoming.extend(r.due_dates or [])

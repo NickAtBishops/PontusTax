@@ -302,3 +302,44 @@ def test_check_urls_includes_jurisdiction_link_when_website_blank(
             "https://only-jurisdiction-link.county-taxes.net/public",
         )
     ]
+
+
+# Regression (2026-07-16): a real "with_urls" tracker had 29 of 80 rows
+# carrying "https://example.com/x/property-N" style placeholder URLs in
+# Jurisdiction Link secondary/tertiary — leftover sample data, not real
+# portals. Visiting them produced correct-but-useless "not a property tax
+# portal" results that dragged otherwise-good (Website-verified PAID)
+# rows down to NEEDS_REVIEW, and — because so many rows shared the
+# example.com domain — collapsed the run's domain-grouping from ~20
+# concurrent buckets down to one 49-row sequential mega-bucket (3x
+# slower run, worse portal-check reliability from jobs queued too long).
+def test_check_urls_skips_reserved_example_domains(ptax_master_workbook):
+    from openpyxl import load_workbook
+
+    wb = load_workbook(ptax_master_workbook)
+    ws = wb["Property Tax"]
+    website_url = "https://real-portal.county-taxes.net/public"
+    _clear_cell(ws, "R5")
+    _clear_cell(ws, "V5")
+    ws["R5"] = website_url
+    ws["W5"] = "https://example.com/x/property-7"
+    ws["X5"] = "https://www.example.org/y/property-7"
+    wb.save(ptax_master_workbook)
+
+    sheet = parse_workbook(ptax_master_workbook).sheets[0]
+    row5 = next(r for r in sheet.rows if r.row_number == 5)
+
+    # Only the real Website URL is checked; both example.com/.org
+    # placeholders are excluded entirely, not just deduped.
+    assert row5.check_urls() == [("Website", website_url)]
+
+    skipped = row5.check_urls_skipped()
+    assert len(skipped) == 2
+    assert any("example.com" in s and "secondary" in s.lower() for s in skipped)
+    assert any("example.org" in s and "tertiary" in s.lower() for s in skipped)
+
+
+def test_check_urls_skipped_empty_when_no_placeholders(ptax_master_workbook):
+    sheet = parse_workbook(ptax_master_workbook).sheets[0]
+    row5 = next(r for r in sheet.rows if r.row_number == 5)
+    assert row5.check_urls_skipped() == []

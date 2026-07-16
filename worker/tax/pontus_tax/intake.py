@@ -17,6 +17,27 @@ from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
 from .identifiers import AccountCandidates, split_accounts
+from .taxonomy import domain_of
+
+# IANA-reserved documentation/example domains (RFC 2606) plus localhost.
+# These show up as leftover sample/placeholder data in reference columns
+# an analyst didn't finish filling in (confirmed 2026-07-16: 29 of 80 rows
+# in a real "with_urls" tracker had "https://example.com/x/property-N"
+# style placeholders in Jurisdiction Link secondary/tertiary — visiting
+# them produced correct-but-useless "not a property tax portal" results
+# that dragged otherwise-good rows down to NEEDS_REVIEW). Never treat
+# these as real portals to check — same as if the cell were empty.
+_PLACEHOLDER_DOMAINS = {
+    "example.com", "example.org", "example.net", "example.edu",
+    "localhost", "test.com",
+}
+
+
+def _is_placeholder_domain(url: str) -> bool:
+    domain = domain_of(url)
+    if domain.startswith("www."):
+        domain = domain[4:]
+    return domain in _PLACEHOLDER_DOMAINS
 
 # (canonical field, synonyms, word_match) — word_match synonyms only match as
 # whole words (short tokens would otherwise fire inside unrelated headers).
@@ -137,6 +158,14 @@ class RowIntake:
         parts = [self.address, self.city, self.state, self.zip]
         return ", ".join(str(p).strip() for p in parts if p)
 
+    def _url_candidates(self) -> list[tuple[str, str]]:
+        return [
+            ("Website", self.url),
+            ("Jurisdiction link primary", self.jurisdiction_link_primary),
+            ("Jurisdiction link secondary", self.jurisdiction_link_secondary),
+            ("Jurisdiction link tertiary", self.jurisdiction_link_tertiary),
+        ]
+
     def check_urls(self) -> list[tuple[str, str]]:
         """Every portal URL this row should be checked against, as ordered
         (label, url) pairs: "Website" first (when non-empty — an empty
@@ -150,23 +179,36 @@ class RowIntake:
 
         Duplicate URLs (identical string, analyst pasted the same link into
         two columns) are checked only ONCE; the first-listed label wins.
+        Placeholder/example URLs (see `_is_placeholder_domain`) are never
+        checked at all — same as if the cell were empty; see
+        `check_urls_skipped()` for the human-readable reason.
         """
-        candidates = [
-            ("Website", self.url),
-            ("Jurisdiction link primary", self.jurisdiction_link_primary),
-            ("Jurisdiction link secondary", self.jurisdiction_link_secondary),
-            ("Jurisdiction link tertiary", self.jurisdiction_link_tertiary),
-        ]
         seen: set[str] = set()
         out: list[tuple[str, str]] = []
-        for label, url in candidates:
+        for label, url in self._url_candidates():
             if not url:
+                continue
+            if _is_placeholder_domain(url):
                 continue
             if url in seen:
                 continue
             seen.add(url)
             out.append((label, url))
         return out
+
+    def check_urls_skipped(self) -> list[str]:
+        """Human-readable reasons for any URL this row carried that was
+        NOT included in `check_urls()` because it looked like placeholder/
+        example data — surfaced in the row's evidence so a bad reference
+        link is visible to the analyst instead of silently vanishing."""
+        notes: list[str] = []
+        for label, url in self._url_candidates():
+            if url and _is_placeholder_domain(url):
+                notes.append(
+                    f'{label} ("{url}") looks like placeholder/example data '
+                    "(reserved example domain) — not a real portal, skipped"
+                )
+        return notes
 
 
 @dataclass
